@@ -1,0 +1,1 @@
+invoke-static {p0}, Limgui/il2cpp/tool/MainActivity;->startMain(Landroid/content/Context;)V
