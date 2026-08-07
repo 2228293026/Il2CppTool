@@ -1,6 +1,6 @@
 apply plugin: 'com.android.application'
 android {
-    namespace "imgui.il2cpp.tool"
+    namespace "com.hitmargin.tool"
     compileSdkVersion 30
     defaultConfig {
         minSdkVersion 19
@@ -31,8 +31,8 @@ android {
         }
     }
     packagingOptions {
-        pickFirst 'lib/arm64-v8a/libTool.so'
-        pickFirst 'lib/armeabi-v7a/libTool.so'
+        pickFirst 'lib/arm64-v8a/libIl2CppTool.so'
+        pickFirst 'lib/armeabi-v7a/libIl2CppTool.so'
         exclude '**/libdobby.so'
     }
     sourceSets {
@@ -154,7 +154,7 @@ task sendToPhone {
         def packagePath = getPackagePath(packageName)
         def packageLibPath = getPackageLibPath(packagePath)
         def flavor = project.hasProperty("release") ? "release" : "debug"
-        def libName = "libTool.so"
+        def libName = "libIl2CppTool.so"
         def libPath = new File("${layout.buildDirectory.dir("intermediates/stripped_native_libs/$flavor/out/lib").get().asFile.absolutePath}")
         if (!libPath.exists()) throw new GradleException("lib files not found")
         def libFiles = fileTree(libPath).matching {
@@ -192,7 +192,7 @@ task sendToPhoneAndRestart {
 tasks.configureEach { task ->
     if (task.name == "assembleDebug" || task.name == "assembleRelease") {
         def flavor = task.name.substring(8).toLowerCase()
-        def libName = "libTool.so"
+        def libName = "libIl2CppTool.so"
         def libPath = new File("${layout.buildDirectory.dir("intermediates/stripped_native_libs/$flavor/out/lib").get().asFile.absolutePath}")
         def dst = project.file("../out/${flavor}")
         task.doLast {

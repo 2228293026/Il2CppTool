@@ -1,1 +1,2 @@
-invoke-static {p0}, Limgui/il2cpp/tool/MainActivity;->startMain(Landroid/content/Context;)V
+const-string v0, "Il2CppTool"
+invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V

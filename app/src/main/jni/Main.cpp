@@ -55,7 +55,7 @@ constexpr std::array<float, 7> scaleFactors = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 
 
 ImGuiStyle initialStyle;
 
-const char *title = OBFUSCATE("libtool v0.9 | HitMargin");
+const char *title = OBFUSCATE("Il2CppTool v0.9 | HitMargin");
 void draw_thread()
 {
     static ImVec2 lastSize = ImVec2(0, 0);

@@ -7,7 +7,7 @@ LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/dobby/
 include $(PREBUILT_STATIC_LIBRARY)
 LOCAL_LDFLAGS := $(LOCAL_PATH)/Dobby/armeabi-v7a/libdobby.a
 include $(CLEAR_VARS)
-LOCAL_MODULE    := HitMargin
+LOCAL_MODULE := Il2CppTool
 
 LOCAL_CFLAGS := -w -s -Wno-error=format-security -fvisibility=hidden -fpermissive -fexceptions
 LOCAL_CPPFLAGS := -w -s -Wno-error=format-security -fvisibility=hidden -Werror -std=c++20
