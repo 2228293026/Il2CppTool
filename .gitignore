@@ -90,3 +90,6 @@ lint/tmp/
 
 compile_commands.json
 .cache/
+
+# ndk-build 原生构建产物（app/src/main/obj 已被上方 obj/ 覆盖，这里再加 libs/ 输出）
+app/src/main/libs/

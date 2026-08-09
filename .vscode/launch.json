@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Android 设备附加调试 (lldb)",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/app/src/main/libs/arm64-v8a/libIl2CppTool.so",
+            "targetArchitecture": "arm64",
+            "MIMode": "lldb",
+            "miDebuggerServerAddress": "127.0.0.1:5039",
+            "miDebuggerPath": "lldb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "cwd": "${workspaceFolder}/app/src/main",
+            "logging": { "engineLogging": false },
+            "externalConsole": false
+        }
+    ]
+}

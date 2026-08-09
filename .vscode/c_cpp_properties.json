@@ -1,0 +1,32 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "Android-NDK-arm64",
+      "compilerPath": "D:/android-ndk-r29/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android28-clang++.cmd",
+      "intelliSenseMode": "linux-gcc-arm64",
+      "cStandard": "c17",
+      "cppStandard": "c++20",
+      "cwd": "${workspaceFolder}/app/src/main",
+      "defines": [
+        "ANDROID",
+        "__ANDROID__",
+        "__ANDROID_API__=28",
+        "NDEBUG",
+        "_FORTIFY_SOURCE=2"
+      ],
+      "includePath": [
+        "${workspaceFolder}/app/src/main/jni",
+        "${workspaceFolder}/app/src/main/jni/imgui",
+        "${workspaceFolder}/app/src/main/jni/imgui/backends",
+        "${workspaceFolder}/app/src/main/jni/Frida/arm64-v8a",
+        "${workspaceFolder}/app/src/main/jni/asmjit/include",
+        "${workspaceFolder}/app/src/main/jni/dobby",
+        "D:/android-ndk-r29/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
+        "D:/android-ndk-r29/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/aarch64-linux-android",
+        "D:/android-ndk-r29/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1"
+      ],
+      "compilerArgs": []
+    }
+  ]
+}
