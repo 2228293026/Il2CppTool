@@ -603,7 +603,9 @@ namespace UnityVersion
 {
 
     int compare(const std::string &a, const std::string &b);
-    const std::regex pattern("(20\\d{2}|\\d)\\.(\\d)\\.(\\d{1,2})(?:[abcfp]|rc){0,2}\\d?");
+    // 兼容 Unity 5/6：版本号可能形如 "6000.3.16f1"（Unity 6 不再是 20xx 年号），
+    // 所以主号用 \d{1,4} 而不是只认 (20\d{2}|\d)。
+    const std::regex pattern(R"((20\d{2}|\d{1,4})\.(\d{1,2})\.(\d{1,3})(?:[abcfp]|rc){0,2}\d?)");
 
     std::string find(const std::string &str)
     {
@@ -628,6 +630,10 @@ namespace UnityVersion
 
         std::regex_search(a, aMatches, pattern);
         std::regex_search(b, bMatches, pattern);
+
+        // 解析不到版本号时不要 stoi("")：按"不旧于 2021.2"处理（走新版 API 分支）
+        if (aMatches.empty() || bMatches.empty())
+            return 0;
 
         for (int i = 1; i <= 3; ++i)
         {
@@ -1332,6 +1338,13 @@ namespace Il2cpp
             };
             if (unityVersionIsBelow202120)
             {
+                if (!il2cpp_unity_liveness_calculation_begin || !il2cpp_unity_liveness_calculation_from_statics ||
+                    !il2cpp_unity_liveness_calculation_end)
+                {
+                    // Unity 6 等新版本可能已改名/移除这些内部符号，缺了就直接空跑，别调空指针
+                    LOGE("GC::FindObjects: il2cpp_unity_liveness_* 符号缺失（Unity 版本不匹配），无法枚举对象");
+                    return objects;
+                }
 
                 // typedef void (*il2cpp_WorldChangedCallback)();
                 auto onWorld = []() {};
@@ -1342,6 +1355,14 @@ namespace Il2cpp
             }
             else
             {
+                if (!il2cpp_stop_gc_world || !il2cpp_start_gc_world || !il2cpp_unity_liveness_allocate_struct ||
+                    !il2cpp_unity_liveness_calculation_from_statics || !il2cpp_unity_liveness_finalize ||
+                    !il2cpp_unity_liveness_free_struct)
+                {
+                    LOGE("GC::FindObjects: stop_gc_world/liveness 符号缺失（Unity 6 等），无法枚举对象");
+                    return objects;
+                }
+
                 // typedef void *(*il2cpp_liveness_reallocate_callback)(void *ptr, size_t size, void *userdata);
                 auto realloc = [](void *ptr, size_t size, void *userdata) -> void *
                 {

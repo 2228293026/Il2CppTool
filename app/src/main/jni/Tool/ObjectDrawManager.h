@@ -44,6 +44,7 @@ public:
     static void Initialize();
     static void Shutdown(); // 添加声明
     static void UpdateGameObjects();
+    static void Tick(); // 每帧刷新（独立于 UI 是否打开），保证 ESP 持续更新
     static void DrawAll();
     static void DrawUI();
     
@@ -60,7 +61,6 @@ private:
     static void DrawLineToCenter(const DrawObject& drawObj);
     static void DrawBox(const DrawObject& drawObj);
     static void DrawCircle(const DrawObject& drawObj);
-    static void DrawObjectInfo(const GameObjectInfo& obj, ImVec2 screenPos);
 };
 
 extern ObjectDrawManager g_ObjectDrawManager;

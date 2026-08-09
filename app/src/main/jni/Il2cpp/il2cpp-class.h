@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <type_traits>
 // #include "And64InlineHook/And64InlineHook.hpp"
 #include "Dobby/dobby.h"
 #include "Includes/Logger.h"
@@ -417,13 +418,30 @@ template <typename T, typename... Args>
 T Il2CppObject::invoke_method(const char *methodName, Args... args)
 {
     MethodInfo *method = klass->getMethod(methodName);
+    if (method == nullptr || method->methodPointer == nullptr)
+    {
+        LOGW("invoke_method: '%s' not found / null methodPointer, skipped", methodName);
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     return invoke_method<T>(method, std::forward<Args>(args)...);
 }
 
 template <typename T>
 T Il2CppObject::invoke_method(const char *methodName)
 {
-    return invoke_method<T>(klass->getMethod(methodName));
+    MethodInfo *method = klass->getMethod(methodName);
+    if (method == nullptr || method->methodPointer == nullptr)
+    {
+        LOGW("invoke_method: '%s' not found / null methodPointer, skipped", methodName);
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
+    return invoke_method<T>(method);
 }
 
 template <typename T, typename... Args>
@@ -449,6 +467,14 @@ void *MethodInfo::replace(T func)
 template <typename T, typename... Args>
 T MethodInfo::invoke_static(Args... args)
 {
+    if (this == nullptr || this->methodPointer == nullptr)
+    {
+        LOGW("invoke_static: null methodPointer, skipped");
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     using Invoker = T (*)(Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
@@ -458,6 +484,14 @@ T MethodInfo::invoke_static(Args... args)
 template <typename T, typename... Args>
 T MethodInfo::invoke(Il2CppObject *instance)
 {
+    if (this == nullptr || this->methodPointer == nullptr)
+    {
+        LOGW("invoke: null methodPointer, skipped");
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     using Invoker = T (*)(Il2CppObject *, MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
@@ -467,6 +501,14 @@ T MethodInfo::invoke(Il2CppObject *instance)
 template <typename T, typename... Args>
 T MethodInfo::invoke(Il2CppObject *instance, Args &&...args)
 {
+    if (this == nullptr || this->methodPointer == nullptr)
+    {
+        LOGW("invoke: null methodPointer, skipped");
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     using Invoker = T (*)(Il2CppObject *, Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
@@ -505,5 +547,14 @@ Il2CppObject *ValueType<T>::box(Il2CppClass *klass)
 template <typename T, typename... Args>
 T Il2CppClass::invoke_static_method(const char *name, Args &&...args)
 {
-    return this->getMethod(name)->invoke_static<T>(std::forward<Args>(args)...);
+    auto method = this->getMethod(name);
+    if (method == nullptr || method->methodPointer == nullptr)
+    {
+        LOGW("invoke_static_method: '%s' not found / null methodPointer, skipped", name);
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
+    return method->invoke_static<T>(std::forward<Args>(args)...);
 }

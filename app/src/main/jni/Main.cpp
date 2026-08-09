@@ -238,6 +238,15 @@ void draw_thread()
             ImGui::EndTabItem();
         }
 
+        if (ImGui::BeginTabItem("对象绘制"))
+        {
+            if (ObjectDrawManager::showObjectManager)
+                ObjectDrawManager::DrawUI();
+            else
+                ImGui::Text("对象绘制管理器未启用（在「工具」页勾选开启）");
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("设置"))
         {
             ImGui::Separator();
@@ -362,11 +371,31 @@ void draw_thread()
     }
 #endif
 
-    // 对象绘制管理器：窗口 + 前景 ESP 绘制（仅开启时）
+    // 对象绘制管理器：ESP 刷新与绘制独立于配置 UI 是否打开/折叠。
+    // Tick 负责按节流刷新（内部含 il2cpp 调用），DrawAll 只画已算好的坐标；
+    // 即使配置页没打开，ESP 也会持续更新，不会再卡住不动。
     if (ObjectDrawManager::showObjectManager)
     {
-        ObjectDrawManager::DrawUI();
-        ObjectDrawManager::DrawAll();
+        try
+        {
+            ObjectDrawManager::Tick();
+        }
+        catch (const std::exception &e)
+        {
+            LOGW("ObjectDraw Tick exception: %s", e.what());
+        }
+        catch (...)
+        {
+            LOGW("ObjectDraw Tick unknown exception");
+        }
+        try
+        {
+            ObjectDrawManager::DrawAll();
+        }
+        catch (...)
+        {
+            LOGW("DrawAll exception");
+        }
     }
 
     ImGui::End();
