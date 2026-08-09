@@ -2,8 +2,6 @@
 
 **Unity (il2cpp) 游戏运行时注入分析工具** —— 将一个 `.so` 注入进目标 il2cpp 游戏进程，在游戏画面上叠加 ImGui 悬浮窗，提供 **il2cpp 类/方法/字段浏览、方法追踪、DUMP、对象可视化、方法补丁** 等能力。
 
-> 注意：仓库里原有的 README 是从 [LGLTeam/Android-Mod-Menu](https://github.com/LGLTeam/Android-Mod-Menu) 复制来的通用模板，与本仓库代码无关。本文按当前源码（v0.9）重新编写。
-
 ## 它是什么 / 不是什么
 
 - 它是**运行时工具**，不是离线逆向器。它注入游戏进程后，直接读取运行中进程的 il2cpp 元数据（类、方法、字段、对象），操作不会保存 `global-metadata.dat` 之外的东西。
