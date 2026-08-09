@@ -1,4 +1,17 @@
-qalse;
+#include "ObjectDrawManager.h"
+#include "Includes/Logger.h"
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <unordered_map>
+
+static std::mutex g_objectsMutex;
+static std::mutex g_drawMutex;
+
+std::vector<GameObjectInfo> ObjectDrawManager::gameObjects;
+std::vector<DrawObject> ObjectDrawManager::drawObjects;
+bool ObjectDrawManager::showObjectManager = false;
 ImVec2 ObjectDrawManager::screenCenter = ImVec2(0, 0);
 bool ObjectDrawManager::autoRefresh = true;
 
