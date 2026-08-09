@@ -13,8 +13,8 @@ struct Vector3 {
 };
 
 struct GameObjectInfo {
-    Il2CppObject* gameObject;
-    Il2CppObject* transform;
+    Il2CppObject* gameObject = nullptr;
+    Il2CppObject* transform = nullptr;
     Vector3 worldPosition;
     Vector3 screenPosition;
     std::string name;
@@ -24,7 +24,7 @@ struct GameObjectInfo {
 struct DrawObject {
     GameObjectInfo target;
     ImColor color;
-    float thickness;
+    float thickness = 2.0f;
     bool drawLine = true;
     bool drawBox = false;
     bool drawCircle = false;
@@ -32,16 +32,18 @@ struct DrawObject {
 
 class ObjectDrawManager {
 private:
-    static std::vector<GameObjectInfo> gameObjects;
-    static std::vector<DrawObject> drawObjects;
     static ImVec2 screenCenter;
     static bool autoRefresh;
 
-    static void RefreshDrawObjectsCoordinates();
-    static void ProcessObjectList();
     static void DrawLineToCenter(const DrawObject& drawObj);
     static void DrawBox(const DrawObject& drawObj);
     static void DrawCircle(const DrawObject& drawObj);
+
+    static void RefreshCamera();
+    static void CleanupInvalidDrawObjects();
+
+public:
+    static std::vector<DrawObject> drawObjects;
 
 public:
     static bool showObjectManager;
@@ -50,7 +52,7 @@ public:
     static void Tick();
     static void DrawAll();
     static void DrawUI();
-    
+
     static void SelectObject(const GameObjectInfo& obj);
     static void SelectObject(Il2CppObject* gameObject);
     static void DeselectAll();
@@ -58,7 +60,7 @@ public:
     static void RemoveDrawObject(Il2CppObject* gameObject);
     static void ClearAllDrawObjects();
     static void UpdateGameObjects();
-    
+
     static bool WorldToScreen(const Vector3& worldPos, Vector3& screenPos);
     static ImVec2 GetScreenCenter();
 };
