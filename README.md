@@ -131,10 +131,8 @@ build.bat APP_ABI=armeabi-v7a,arm64-v8a
 - [KittyMemory](https://github.com/MJx0/KittyMemory)——内存操作
 - [nlohmann/json](https://github.com/nlohmann/json) —— 配置 `tool_conf.json`
 - il2cpp 访问与 Dumper 借鉴了 [Perfree/Zygisk-Il2CppDumper](https://github.com/Perfree/Zygisk-Il2CppDumper) 的思路
-- 原项目作者 **HitMargin**（bilibili）的开发与维护
+- 项目开发与维护：**HitMargin**（bilibili：https://m.bilibili.com/space/1757946676 ）
 
 ## License
 
 [GNU General Public License v3.0](./LICENSE)
-
-*本 README 由项目代码整理而成；可能与上游（非 UP）作者意图不同，以代码为准。*
