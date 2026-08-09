@@ -3,9 +3,6 @@
 #include "imgui/imgui.h"
 #include <vector>
 #include <string>
-#include <functional>
-#include <atomic>
-#include <thread>
 
 struct Vector3 {
     float x, y, z;
@@ -36,17 +33,14 @@ class ObjectDrawManager {
 private:
     static std::vector<GameObjectInfo> gameObjects;
     static std::vector<DrawObject> drawObjects;
-    static bool showObjectManager;
     static ImVec2 screenCenter;
-    
-    // 添加缺失的成员变量
-    static bool isRunning;
+    // 自动刷新开关与间隔（在渲染线程按帧节流，不走后台线程）
     static bool autoRefresh;
     static float refreshInterval;
-    static std::atomic<bool> updating;
-    static std::thread updateThread;
-    
+
 public:
+    // 显示开关：由工具页的 Checkbox 读写
+    static bool showObjectManager;
     static void Initialize();
     static void Shutdown(); // 添加声明
     static void UpdateGameObjects();
@@ -63,9 +57,6 @@ public:
     static ImVec2 GetScreenCenter();
     
 private:
-    static void StartAutoRefresh(); // 添加声明
-    static void StopAutoRefresh();  // 添加声明
-    
     static void DrawLineToCenter(const DrawObject& drawObj);
     static void DrawBox(const DrawObject& drawObj);
     static void DrawCircle(const DrawObject& drawObj);

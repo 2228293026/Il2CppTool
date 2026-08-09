@@ -1,20 +1,14 @@
 #include "ObjectDrawManager.h"
 #include "Includes/Logger.h"
 #include <algorithm>
-#include <chrono>
-#include <thread>
 
 std::vector<GameObjectInfo> ObjectDrawManager::gameObjects;
 std::vector<DrawObject> ObjectDrawManager::drawObjects;
 bool ObjectDrawManager::showObjectManager = false;
 ImVec2 ObjectDrawManager::screenCenter = ImVec2(0, 0);
 
-// 初始化静态成员变量
-bool ObjectDrawManager::isRunning = false;
 bool ObjectDrawManager::autoRefresh = true;
 float ObjectDrawManager::refreshInterval = 0.1f;
-std::atomic<bool> ObjectDrawManager::updating(false);
-std::thread ObjectDrawManager::updateThread;
 
 ObjectDrawManager g_ObjectDrawManager;
 
@@ -26,8 +20,7 @@ static MethodInfo* g_IsNativeObjectAlive = nullptr;
 
 void ObjectDrawManager::Initialize() {
     LOGI("初始化对象绘制管理器");
-    isRunning = true;
-    
+
     // 初始化静态资源 - 基于你的 GameObjects() 函数
     auto GameObjectClass = Il2cpp::FindClass("UnityEngine.GameObject");
     if (GameObjectClass) {
@@ -49,35 +42,12 @@ void ObjectDrawManager::Initialize() {
     if (UnityObject) {
         g_IsNativeObjectAlive = UnityObject->getMethod("IsNativeObjectAlive");
     }
-    
-    StartAutoRefresh();
 }
 
 void ObjectDrawManager::Shutdown() {
     LOGI("关闭对象绘制管理器");
-    isRunning = false;
-    StopAutoRefresh();
-}
-
-void ObjectDrawManager::StartAutoRefresh() {
-    if (updateThread.joinable()) return;
-    
-    updateThread = std::thread([]() {
-        while (isRunning) {
-            if (autoRefresh && !updating) {
-                updating = true;
-                UpdateGameObjects();
-                updating = false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(refreshInterval * 1000)));
-        }
-    });
-}
-
-void ObjectDrawManager::StopAutoRefresh() {
-    if (updateThread.joinable()) {
-        updateThread.join();
-    }
+    g_AllGameObjects.clear();
+    drawObjects.clear();
 }
 
 void ObjectDrawManager::UpdateGameObjects() {
@@ -164,6 +134,14 @@ void ObjectDrawManager::DrawUI() {
     static bool showObjectDrawer = true;
     
     if (ImGui::Begin("对象绘制管理器", &showObjectDrawer)) {
+        // 节流自动刷新：在渲染线程按帧执行，避免后台线程调 il2cpp 造成崩溃
+        static float lastRefresh = 0.f;
+        float now = ImGui::GetTime();
+        if (autoRefresh && (now - lastRefresh) >= refreshInterval) {
+            lastRefresh = now;
+            UpdateGameObjects();
+        }
+
         ImGui::Text("对象绘制管理器");
         ImGui::Separator();
         

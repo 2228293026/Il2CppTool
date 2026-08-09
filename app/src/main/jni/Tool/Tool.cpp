@@ -3,6 +3,7 @@
 #include "Tool/Frida.h"
 #include "Tool/Keyboard.h"
 #include "Tool/Util.h"
+#include "Tool/ObjectDrawManager.h"
 #include "imgui/imgui.h"
 #include <future>
 #include <set>
@@ -190,6 +191,20 @@ namespace Tool
 
     void Draw()
     {
+        // 对象绘制管理器：开关位于工具页顶部，仅在状态变化时初始化/关闭
+        static bool objMgrRunning = false;
+        ImGui::Checkbox("对象绘制管理器", &ObjectDrawManager::showObjectManager);
+        if (ObjectDrawManager::showObjectManager && !objMgrRunning)
+        {
+            ObjectDrawManager::Initialize();
+            objMgrRunning = true;
+        }
+        else if (!ObjectDrawManager::showObjectManager && objMgrRunning)
+        {
+            ObjectDrawManager::Shutdown();
+            objMgrRunning = false;
+        }
+
         [[maybe_unused]] static auto _ = []
         {
             CalculateSomething();

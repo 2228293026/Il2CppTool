@@ -14,6 +14,7 @@
 #include "imgui/imgui_internal.h"
 #include "sstream"
 #include "Tool/Unity.h"
+#include "Tool/ObjectDrawManager.h"
 
 void logcatJson(nlohmann::ordered_json &json)
 {
@@ -360,6 +361,14 @@ void draw_thread()
         ImGui::ShowDemoWindow();
     }
 #endif
+
+    // 对象绘制管理器：窗口 + 前景 ESP 绘制（仅开启时）
+    if (ObjectDrawManager::showObjectManager)
+    {
+        ObjectDrawManager::DrawUI();
+        ObjectDrawManager::DrawAll();
+    }
+
     ImGui::End();
 }
 
