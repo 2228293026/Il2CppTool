@@ -18,7 +18,6 @@ bool ObjectDrawManager::showObjectManager = false;
 ImVec2 ObjectDrawManager::screenCenter = ImVec2(0, 0);
 
 bool ObjectDrawManager::autoRefresh = true;
-float ObjectDrawManager::refreshInterval = 0.1f;
 
 ObjectDrawManager g_ObjectDrawManager;
 
@@ -333,19 +332,11 @@ void ObjectDrawManager::DrawAll() {
 }
 
 void ObjectDrawManager::Tick() {
-    // 刷新与周期重扫与「配置 UI 是否打开/折叠」无关：绘制始终需要最新坐标，
-    // 故把刷新逻辑从 DrawUI 抽到这里，每帧调用（内部按 refreshInterval 节流）。
-    // 这样即使配置页没打开或被折叠，ESP 也会持续刷新，不会卡住不动。
-    static float lastRefresh = 0.f;
-    float now = ImGui::GetTime();
-    if (autoRefresh && (now - lastRefresh) >= refreshInterval) {
-        lastRefresh = now;
+    if (autoRefresh) {
         UpdateGameObjects();
     }
-    // 周期性后台重扫：切场景后旧对象指针会失效，且新生成的对象要尽快进绘制列表（否则会“漏画”）。
-    // 注意 FindObjects 是全堆 liveness 扫描、会短暂停 GC 世界，不能每帧跑（会卡），故取 0.5s 折中：
-    // 既能让生成/出现的对象在半秒内进列表，又不会频繁停世界导致卡顿。重扫本身有并发保护。
     static float nextRescan = 0.f;
+    float now = ImGui::GetTime();
     if (autoRefresh && now >= nextRescan) {
         nextRescan = now + 0.5f;
         RescanGameObjectsInBackground();
@@ -374,9 +365,6 @@ void ObjectDrawManager::DrawUI() {
         ImGui::Checkbox("自动刷新", &autoRefresh);
         ImGui::Checkbox("自动添加全部", &g_autoAddAll);
         ImGui::Checkbox("全对象动态绘制", &g_drawAllObjects);
-        ImGui::InputFloat("刷新间隔(s)", &refreshInterval, 0.0f, 0.1f, "%.2f");
-        if (refreshInterval < 0.0f) refreshInterval = 0.0f;   // 0 = 每帧刷新（实时）
-        if (refreshInterval > 1.0f) refreshInterval = 1.0f;
         
         ImGui::NextColumn();
         

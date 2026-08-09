@@ -36,7 +36,6 @@ private:
     static ImVec2 screenCenter;
     // 自动刷新开关与间隔（在渲染线程按帧节流，不走后台线程）
     static bool autoRefresh;
-    static float refreshInterval;
 
 public:
     // 显示开关：由工具页的 Checkbox 读写
