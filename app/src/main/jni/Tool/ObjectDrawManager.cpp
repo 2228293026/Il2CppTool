@@ -2,12 +2,21 @@
 #include "Includes/Logger.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <unordered_set>
 
 static std::mutex g_objectsMutex;
 static std::mutex g_drawMutex;
+
+// 单调时钟（秒）。后台扫描线程不能碰 ImGui 上下文，所以计时统一走这里，
+// 不再用 ImGui::GetTime()（它读的是 GImGui->Time，属于渲染线程状态）。
+static double NowSeconds()
+{
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
 
 std::vector<DrawObject> ObjectDrawManager::drawObjects;
 bool ObjectDrawManager::showObjectManager = false;
@@ -36,10 +45,27 @@ static std::atomic<bool> g_hasNewList{false};
 static std::atomic<bool> g_rescanBusy{false};
 static std::atomic<bool> g_rescanInProgress{false};
 static std::atomic<size_t> g_lastObjectCount{0};
-static std::atomic<float> g_rescanFinishTime{0.f};
+static std::atomic<double> g_rescanFinishTime{0.0};
+
+// 后台扫描线程由本文件持有，Shutdown 时 join，避免线程还活着时全局状态被清掉。
+static std::thread g_scanThread;
+static std::atomic<bool> g_shutdownRequested{false};
 
 // 场景切换检测阈值：对象数量变化超过50%认为发生场景切换
 static constexpr double SCENE_CHANGE_RATIO = 0.5;
+
+// 场景切换提示：在 UI 上告诉用户"有多少个对象因为场景切换被清掉了"
+static std::mutex g_noticeMutex;
+static size_t g_sceneChangeRemoved = 0;
+static double g_sceneChangeNoticeTime = 0.0;
+static constexpr double SCENE_CHANGE_NOTICE_SECONDS = 6.0;
+
+static void SetSceneChangeNotice(size_t removed)
+{
+    std::lock_guard<std::mutex> lock(g_noticeMutex);
+    g_sceneChangeRemoved = removed;
+    g_sceneChangeNoticeTime = NowSeconds();
+}
 
 // 安全的对象有效性检查
 // 先通过 IsNativeObjectAlive 验证原生对象存活（避免访问已释放内存）
@@ -71,20 +97,58 @@ void ObjectDrawManager::RefreshCamera() {
 
 // 后台线程执行对象扫描
 static void RescanGameObjectsInBackground() {
-    if (!g_GameObjectClass || g_rescanBusy.exchange(true))
+    if (!g_GameObjectClass || g_shutdownRequested.load())
         return;
+    if (g_rescanBusy.exchange(true))
+        return;
+
+    // 上一轮线程如果已经跑完，先回收再开新的（g_rescanBusy 保证同一时刻只有一个在跑）
+    if (g_scanThread.joinable())
+        g_scanThread.join();
+
     g_rescanInProgress.store(true);
-    std::thread([]() {
+    g_scanThread = std::thread([]() {
+        // 关键：这是新线程，il2cpp 不知道它。
+        // GC::FindObjects 走的是 stop_gc_world / liveness 那套，会遍历 GC 结构，
+        // 在未 attach 的线程上调用是崩溃或静默错数据的来源。
+        // 渲染线程的 EnsureAttached 管不到这里，必须自己挂。
+        //
+        // 每轮扫描都是一次性线程，所以 attach 之后必须配对 detach：
+        // 只挂不摘会在 il2cpp 的 attached-thread 表里留下悬空条目，
+        // GC 遍历线程表时会踩到已退出的线程。
+        const bool attachedHere = Il2cpp::EnsureAttached();
+        if (!attachedHere)
+        {
+            LOGE("对象扫描: 无法 attach 到 il2cpp VM，跳过本轮扫描");
+            g_rescanBusy.store(false);
+            g_rescanInProgress.store(false);
+            return;
+        }
+
         auto objs = Il2cpp::GC::FindObjects(g_GameObjectClass);
+
+        // 扫描结果先落地，再 detach（detach 之后不能再碰 il2cpp 对象）
+        const bool shuttingDown = g_shutdownRequested.load();
+        if (!shuttingDown)
         {
             std::lock_guard<std::mutex> lock(g_objectsMutex);
             g_cachedGameObjects = std::move(objs);
         }
-        g_rescanFinishTime.store(ImGui::GetTime());
+
+        Il2cpp::Detach();
+
+        if (shuttingDown)
+        {
+            // Shutdown 已经清过状态，别再往里写
+            g_rescanBusy.store(false);
+            g_rescanInProgress.store(false);
+            return;
+        }
+        g_rescanFinishTime.store(NowSeconds());
         g_hasNewList.store(true);
         g_rescanBusy.store(false);
         g_rescanInProgress.store(false);
-    }).detach();
+    });
 }
 
 // 处理扫描结果：构建UI用的对象列表，检测场景切换
@@ -105,10 +169,21 @@ static void ProcessScannedObjects() {
         size_t maxCount = std::max(prevCount, currCount);
         if (maxCount > 0 && (double)minCount / (double)maxCount < SCENE_CHANGE_RATIO) {
             LOGW("检测到场景切换: 对象数从 %zu 变为 %zu", prevCount, currCount);
-            // 场景切换时清理所有缓存的 Il2CppObject* 指针
+
+            // 只清理已经失效的 Il2CppObject*，不要整个 clear()。
+            // 旧实现把用户手动挑的对象全删了，只留一行 logcat，用户视角就是"我选的东西凭空消失"。
+            size_t before = 0, after = 0;
             {
                 std::lock_guard<std::mutex> lock(g_drawMutex);
-                ObjectDrawManager::drawObjects.clear();
+                before = ObjectDrawManager::drawObjects.size();
+                ObjectDrawManager::drawObjects.erase(
+                    std::remove_if(ObjectDrawManager::drawObjects.begin(),
+                                   ObjectDrawManager::drawObjects.end(),
+                                   [](const DrawObject& obj) {
+                                       return !IsValidGameObject(obj.target.gameObject);
+                                   }),
+                    ObjectDrawManager::drawObjects.end());
+                after = ObjectDrawManager::drawObjects.size();
             }
             {
                 std::lock_guard<std::mutex> lock(g_objectsMutex);
@@ -116,6 +191,11 @@ static void ProcessScannedObjects() {
             }
             g_lastObjectCount.store(0);
             g_MainCamera = nullptr;
+
+            // 给 UI 留个提示，别让用户以为工具坏了
+            if (before > after) {
+                SetSceneChangeNotice(before - after);
+            }
             return;
         }
     }
@@ -172,6 +252,27 @@ static void ProcessScannedObjects() {
     }
 }
 
+// 加锁读取缓存对象数。
+// 直接写 g_cachedGameObjects.size() 是数据竞争：后台线程会整体替换这个 vector，
+// 无锁读 size() 可能读到撕裂的值甚至已释放内存。
+static size_t CachedObjectCount() {
+    std::lock_guard<std::mutex> lock(g_objectsMutex);
+    return g_cachedGameObjects.size();
+}
+
+// 对 drawObjects 中匹配的条目做一次加锁修改。
+// UI 遍历的是快照，不能拿快照下标去索引原件（两者大小可能不同 → 越界写）。
+template <typename F>
+static void MutateDrawObject(Il2CppObject* gameObject, F&& fn) {
+    std::lock_guard<std::mutex> lock(g_drawMutex);
+    for (auto& d : ObjectDrawManager::drawObjects) {
+        if (d.target.gameObject == gameObject) {
+            fn(d);
+            return;
+        }
+    }
+}
+
 // 清理 drawObjects 中已失效的对象（场景切换后或对象被销毁）
 void ObjectDrawManager::CleanupInvalidDrawObjects() {
     std::lock_guard<std::mutex> lock(g_drawMutex);
@@ -188,15 +289,15 @@ void ObjectDrawManager::CleanupInvalidDrawObjects() {
 // 不做 FindObjects，不做字符串分配，只做坐标变换
 void ObjectDrawManager::Tick() {
     // 1. 低频后台重扫（5秒间隔或手动触发）
-    static float lastRescan = 0.f;
-    float now = ImGui::GetTime();
-    if (g_needsRescan.exchange(false) || (autoRefresh && now - lastRescan > 5.0f)) {
+    static double lastRescan = 0.0;
+    double now = NowSeconds();
+    if (g_needsRescan.exchange(false) || (autoRefresh && now - lastRescan > 5.0)) {
         lastRescan = now;
         RescanGameObjectsInBackground();
     }
 
     // 2. 处理后台扫描结果（延迟1秒执行，避免扫描刚完成时对象状态不稳定）
-    if (g_hasNewList.load() && (now - g_rescanFinishTime.load() > 1.0f)) {
+    if (g_hasNewList.load() && (now - g_rescanFinishTime.load() > 1.0)) {
         g_hasNewList.store(false);
         ProcessScannedObjects();
     }
@@ -367,6 +468,13 @@ void ObjectDrawManager::Initialize() {
 
 void ObjectDrawManager::Shutdown() {
     LOGI("关闭对象绘制管理器");
+
+    // 先置位并 join，确保扫描线程不再访问下面要清掉的全局状态。
+    // 旧实现直接 clear() 而线程仍 detach 在跑，属于 use-after-free 窗口。
+    g_shutdownRequested.store(true);
+    if (g_scanThread.joinable())
+        g_scanThread.join();
+
     {
         std::lock_guard<std::mutex> lock(g_objectsMutex);
         g_cachedGameObjects.clear();
@@ -377,9 +485,13 @@ void ObjectDrawManager::Shutdown() {
     }
     g_lastObjectCount.store(0);
     g_rescanInProgress.store(false);
+    g_rescanBusy.store(false);
     g_needsRescan.store(false);
     g_hasNewList.store(false);
     g_MainCamera = nullptr;
+
+    // 允许再次启用
+    g_shutdownRequested.store(false);
 }
 
 void ObjectDrawManager::SelectObject(const GameObjectInfo& obj) {
@@ -595,9 +707,20 @@ void ObjectDrawManager::DrawUI() {
     ImGui::Separator();
 
     ImGui::Text("统计信息:");
-    ImGui::Text("缓存对象: %zu", g_cachedGameObjects.size());
+    ImGui::Text("缓存对象: %zu", CachedObjectCount());
     ImGui::Text("屏幕内对象: %zu", gameSnapshot.size());
     ImGui::Text("已绘制对象: %zu", drawSnapshot.size());
+
+    // 场景切换提示（几秒后自动消失）
+    {
+        std::lock_guard<std::mutex> lock(g_noticeMutex);
+        if (g_sceneChangeRemoved > 0 && (NowSeconds() - g_sceneChangeNoticeTime) < SCENE_CHANGE_NOTICE_SECONDS) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f),
+                               "检测到场景切换，已清理 %zu 个失效对象（其余保留）", g_sceneChangeRemoved);
+        } else if (g_sceneChangeRemoved > 0) {
+            g_sceneChangeRemoved = 0;
+        }
+    }
 
     ImGui::Separator();
 
@@ -650,6 +773,10 @@ void ObjectDrawManager::DrawUI() {
         for (size_t i = 0; i < drawSnapshot.size(); i++) {
             ImGui::PushID(i);
 
+            // 注意：drawSnapshot 是副本，回写必须按 gameObject 定位，
+            // 不能用快照下标 i 去索引 drawObjects（两者大小可能不同 → 越界写）。
+            auto* go = drawSnapshot[i].target.gameObject;
+
             ImGui::Text("%s", drawSnapshot[i].target.name.c_str());
             ImGui::SameLine();
 
@@ -658,17 +785,27 @@ void ObjectDrawManager::DrawUI() {
 
             ImGui::SameLine();
             if (ImGui::Button("移除")) {
-                RemoveDrawObject(drawSnapshot[i].target.gameObject);
+                RemoveDrawObject(go);
                 ImGui::PopID();
                 break;
             }
 
             ImGui::SameLine();
-            ImGui::Checkbox("线", &ObjectDrawManager::drawObjects[i].drawLine);
+            bool drawLine = drawSnapshot[i].drawLine;
+            bool drawBox = drawSnapshot[i].drawBox;
+            bool drawCircle = drawSnapshot[i].drawCircle;
+
+            if (ImGui::Checkbox("线", &drawLine)) {
+                MutateDrawObject(go, [drawLine](DrawObject& d) { d.drawLine = drawLine; });
+            }
             ImGui::SameLine();
-            ImGui::Checkbox("框", &ObjectDrawManager::drawObjects[i].drawBox);
+            if (ImGui::Checkbox("框", &drawBox)) {
+                MutateDrawObject(go, [drawBox](DrawObject& d) { d.drawBox = drawBox; });
+            }
             ImGui::SameLine();
-            ImGui::Checkbox("圆", &ObjectDrawManager::drawObjects[i].drawCircle);
+            if (ImGui::Checkbox("圆", &drawCircle)) {
+                MutateDrawObject(go, [drawCircle](DrawObject& d) { d.drawCircle = drawCircle; });
+            }
 
             ImGui::PopID();
         }

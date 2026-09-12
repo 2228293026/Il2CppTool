@@ -736,29 +736,33 @@ namespace Il2cpp
     bool EnsureAttached()
     {
         auto curr = il2cpp_thread_current();
-        if (!curr)
-        {
-            LOGI("Foreign thread!");
-        }
-        else
+        if (curr)
         {
             LOGI("Already Attached -> %p", curr);
             return true;
         }
-        LOGI("Attaching Thread");
+        LOGI("Foreign thread! Attaching");
         auto *thread = il2cpp_thread_attach(il2cpp_domain_get());
-        while (!il2cpp_is_vm_thread(thread))
-        {
-            LOGI("Waiting...");
-            sleep(1);
-        }
         if (!thread)
         {
             LOGE("Attaching Failed");
             return false;
         }
-        LOGI("Thread Attached");
-        return true;
+        // 有界等待：attach 之后 VM 线程标志需要一小段时间才可见。
+        // 旧代码在这里 while 死等，而且把 !thread 检查放在循环之后，
+        // 一旦标志迟迟不置位就会把调用线程永久挂死；后台扫描线程调这个尤其危险。
+        constexpr int kMaxWaitMs = 2000;
+        for (int waited = 0; waited < kMaxWaitMs; waited += 10)
+        {
+            if (il2cpp_is_vm_thread(thread))
+            {
+                LOGI("Thread Attached");
+                return true;
+            }
+            usleep(10 * 1000);
+        }
+        LOGE("Attaching Timed Out after %dms", kMaxWaitMs);
+        return false;
     }
 
     void Detach()
