@@ -1590,6 +1590,7 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
     if (hooked)
     {
         auto &backtraced = it->second.backtraced;
+#ifdef USE_FRIDA
         if (!it->second.backtracing)
         {
             if (ImGui::Button("Backtrace"))
@@ -1597,10 +1598,31 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
                 it->second.backtracing = true;
             }
         }
+#else
+        // 没有 USE_FRIDA 时这个按钮是个陷阱：点下去 backtracing 会被置成 true，
+        // 但没有任何消费者（Frida::Init() 负责起 gummp 的 invocation listener，
+        // 而它在 #ifdef USE_FRIDA 里），于是 backtraced 永远是空的 ——
+        // 用户点了没反应也没报错，只能一直等。
+        //
+        // 宁可明确不可用，也不给一个看起来能用、实际什么都不做的按钮。
+        ImGui::BeginDisabled();
+        ImGui::Button("Backtrace");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        {
+            ImGui::SetTooltip("当前构建未启用 Frida 回溯。\n"
+                              "它在 app/src/main/jni/Android.mk 的 LOCAL_CFLAGS 里，\n"
+                              "加上 -DUSE_FRIDA 重新编译后可用。");
+        }
+#endif
 
         if (backtraced.empty())
         {
+#ifdef USE_FRIDA
             ImGui::Text("Method has not been called");
+#else
+            ImGui::TextDisabled("回溯未启用（未定义 USE_FRIDA）");
+#endif
         }
         else
         {

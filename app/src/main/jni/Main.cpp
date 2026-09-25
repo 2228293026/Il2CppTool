@@ -573,6 +573,19 @@ void on_init()
 {
     LOGD(__FUNCTION__);
 
+    // 这段跑在渲染线程（on_init 是被 eglSwapBuffers 钩子同步调进来的），
+    // 所以这里的每一毫秒都是用户看到的画面卡顿。分段计时是为了在真机上
+    // 能直接看出钱花在哪 —— 之前完全没有数据，只能靠猜。
+    const auto initStart = std::chrono::steady_clock::now();
+    auto markPhase = [&](const char *name) {
+        static auto prev = initStart;
+        const auto now = std::chrono::steady_clock::now();
+        LOGI("[启动] %-22s %4lld ms (累计 %4lld ms)", name,
+             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - prev).count(),
+             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - initStart).count());
+        prev = now;
+    };
+
     // 这段跑在渲染线程（on_init 是被 eglSwapBuffers 钩子同步调进来的）。
     // 原先这里 while + sleep(1) 死等：目标不是 il2cpp 游戏时首帧能卡 60 秒（ANR）。
     // 现在只探测一次，没就绪就返回 INIT_PENDING，由 setupMenu 在后续帧重试，
@@ -614,6 +627,7 @@ void on_init()
     }
 
     Keyboard::Init();
+    markPhase("Keyboard::Init");
 
     initialStyle = ImGui::GetStyle();
     ConfigInit();
@@ -624,6 +638,7 @@ void on_init()
         ConfigSet("selectedScale", selectedScale);
     }
     doChangeScale = true;
+    markPhase("配置");
 
     LOGD("HOOKING...");
 
@@ -655,46 +670,76 @@ void on_init()
         return;
     }
     Tool::Init(g_Image, images);
+    markPhase("Tool::Init (类枚举)");
 
     // 输入 hook 放在元数据校验之后：初始化一旦失败就返回，
     // 此时若已装上输入 hook，还得专门摘掉，否则它会摸到被销毁的 ImGui context。
 #ifndef LIB_INPUT
     Unity::HookInput();
 #endif
+    markPhase("输入 hook");
 
-    for (auto image : images)
+    // 收集全部方法的地址表。
+    //
+    // 这张表只有一个消费者：Frida.cpp 的地址反查（gummp 的 return-address
+    // 回溯）。而 Frida 那条路当前是**关着的** —— Android.mk 里既没有
+    // -DUSE_FRIDA，Tool::Init 里的 Frida::Init() 也在 #ifdef USE_FRIDA 之内。
+    // 也就是说这张表现在建完之后**永远没有人读**。
+    //
+    // 代价却不小：遍历所有 assembly × 所有类 × 所有方法，再对结果排序。
+    // 一个正常规模的 Unity 游戏是十万量级的 MethodInfo，每轮还要为每个类
+    // 分配一次 getMethods() 的 vector。这些全跑在渲染线程上
+    // （on_init ← eglSwapBuffers），是启动卡顿的另一个主因。
+    //
+    // 所以按 USE_FRIDA 门禁：真正启用 Frida 时照旧构建，不启用时完全跳过。
+    // 想启用就在 Android.mk 的 LOCAL_CFLAGS 里加 -DUSE_FRIDA。
+#ifdef USE_FRIDA
     {
-        for (auto klass : image->getClasses())
+        const auto methodsStart = std::chrono::steady_clock::now();
+        g_Methods.reserve(64 * 1024); // 预留，避免十几次 vector 翻倍
+        for (auto image : images)
         {
-            for (auto m : klass->getMethods())
+            for (auto klass : image->getClasses())
             {
-                if (!m->methodPointer)
-                    continue;
-                g_Methods.emplace_back(m);
+                for (auto m : klass->getMethods())
+                {
+                    if (!m->methodPointer)
+                        continue;
+                    g_Methods.emplace_back(m);
+                }
             }
         }
+        LOGD("%zu methods", g_Methods.size());
+        LOGD("SORTING");
+        std::sort(g_Methods.begin(), g_Methods.end(),
+                  [](const auto &a, const auto &b) { return a->methodPointer < b->methodPointer; });
+        // 元数据被裁剪过的游戏可能一个带 methodPointer 的方法都没有，
+        // 此时 front()/back() 是未定义行为。
+        if (!g_Methods.empty())
+        {
+            LOGPTR(g_Methods.front()->methodPointer);
+            LOGPTR(g_Methods.back()->methodPointer);
+        }
+        else
+        {
+            LOGW("未收集到任何带 methodPointer 的方法，地址反查/回溯将不可用");
+        }
+        LOGD("SORTED");
+        const auto methodsEnd = std::chrono::steady_clock::now();
+        LOGI("方法表构建完成: %zu 条，耗时 %lld ms", g_Methods.size(),
+             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(methodsEnd - methodsStart).count());
     }
-    LOGD("%zu methods", g_Methods.size());
-    LOGD("SORTING");
-    std::sort(g_Methods.begin(), g_Methods.end(),
-              [](const auto &a, const auto &b) { return a->methodPointer < b->methodPointer; });
-    // 元数据被裁剪过的游戏可能一个带 methodPointer 的方法都没有，
-    // 此时 front()/back() 是未定义行为。
-    if (!g_Methods.empty())
-    {
-        LOGPTR(g_Methods.front()->methodPointer);
-        LOGPTR(g_Methods.back()->methodPointer);
-    }
-    else
-    {
-        LOGW("未收集到任何带 methodPointer 的方法，地址反查/回溯将不可用");
-    }
-    LOGD("SORTED");
+#else
+    // 不启用 Frida：没人会读这张表，直接不构建。
+    // 日志里明确记一笔，否则以后有人看到 g_Methods 为空会以为功能坏了。
+    LOGD("未启用 USE_FRIDA，跳过方法表构建（仅 Frida 回溯功能需要）");
+#endif
     LOGD("HOOKED!");
 
     // 全部成功才算就绪。setupMenu 见到 INIT_READY 才会把菜单标记为可用并开始渲染。
     // （早前各个失败/未就绪分支已经把状态置成 INIT_FAILED / INIT_PENDING 并 return 了。）
     g_initState = INIT_READY;
+    markPhase("总计");
 }
 
 // we will run our hacks in a new thread so our while loop doesn't block process main thread
