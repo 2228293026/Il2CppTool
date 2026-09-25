@@ -382,8 +382,12 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
     // ImGui::Separator();
 
     {
-        char buffer[128];
-        sprintf(buffer, "Inherited from %s", klass->getName());
+        // 类名长度不受控（混淆过的 il2cpp 元数据可以很长，中文名又是
+        // UTF-8 三倍字节），固定 128 字节 + 无界 sprintf 就是栈溢出。
+        // snprintf 截断即可 —— 这里只是给个折叠标题，截短不影响功能。
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer), "Inherited from %s",
+                 klass->getName() ? klass->getName() : "?");
         if (ImGui::CollapsingHeader(buffer))
         {
             ImGui::SetNextWindowSizeConstraints(ImVec2(-1, 0), ImVec2(-1, height / 3));
@@ -1249,14 +1253,21 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
     {
         ImGui::Text("Change return value");
         ImGui::PushID(type);
-        char label[64]{0};
+        // 类型名长度不受控 —— 128 字节固定缓冲 + 无界 sprintf 就是栈溢出。
+        // 顺带把 '#' 换掉：按钮标签同时是 ImGui ID，用户/元数据里出现
+        // "##" 会让 ID 变化、交互错乱。
+        char label[256]{0};
         if (!o.bytes.empty())
         {
-            sprintf(label, "%s", "Restore");
+            snprintf(label, sizeof(label), "Restore");
         }
         else
         {
-            sprintf(label, "%s", type->getName());
+            const char *typeName = type->getName() ? type->getName() : "?";
+            for (size_t i = 0; i + 1 < sizeof(label) && typeName[i] != '\0'; i++)
+            {
+                label[i] = (typeName[i] == '#') ? '_' : typeName[i];
+            }
         }
         if (ImGui::Button(label))
         {
@@ -1901,13 +1912,25 @@ void ClassesTab::Draw(int index, bool closeable)
     char tabLabel[256];
     if (filter.empty())
     {
-        sprintf(tabLabel, "Classes");
         if (index >= 0)
-            sprintf(tabLabel, "Classes [%d]", index + 1);
+            snprintf(tabLabel, sizeof(tabLabel), "Classes [%d]", index + 1);
+        else
+            snprintf(tabLabel, sizeof(tabLabel), "Classes");
     }
     else
     {
-        sprintf(tabLabel, "%s", filter.c_str());
+        // filter 是用户输入，长度不受控 —— 旧代码 sprintf 进 256 字节，
+        // 而中文是 UTF-8（字节数 ≈ 3× 字符数），很容易写穿。
+        //
+        // 顺带把 '#' 换成 '_'：tabLabel 同时是 ImGui 的控件 ID，
+        // 用户输入里出现 "##" 会让 ID 随输入变化，交互直接错乱。
+        std::string safe;
+        safe.reserve(filter.size());
+        for (char c : filter)
+        {
+            safe.push_back(c == '#' ? '_' : c);
+        }
+        snprintf(tabLabel, sizeof(tabLabel), "%s", safe.c_str());
     }
 
     if ((currentlyOpened = ImGui::BeginTabItem(tabLabel, closeable ? &opened : nullptr,
@@ -1942,9 +1965,52 @@ void ClassesTab::Draw(int index, bool closeable)
             FilterClasses(filter);
         }
 
-        char filterBuffer[256];
-        sprintf(filterBuffer, "Filter : %s | %zu of %zu", filter.empty() ? "(none)" : filter.c_str(),
-                filteredClasses.size(), classes.size());
+        // 搜索框。
+        //
+        // 旧实现是「一个显示当前 filter 的按钮 + 弹软键盘」：
+        //   sprintf(filterBuffer, "Filter : %s | %zu of %zu", filter.c_str(), ...)
+        //   → char filterBuffer[256]
+        // filter 来自软键盘的用户输入，长度完全不受控 —— 这是栈溢出。
+        // 而且中文是 UTF-8，字节数远大于字符数，更容易踩到。
+        //
+        // 现在给一个真正的输入框（能直接打字，比弹键盘快得多）+ 保留原按钮。
+        // 标签用 snprintf 截断，并且**不含用户输入**：把用户文本放进
+        // ImGui 的按钮标签还要额外考虑 "##" 这种 ID 分隔符会截断显示。
+        {
+            ImGui::SetNextItemWidth(-1.0f);
+            char inputBuf[256] = {0};
+            // filter 是 std::string，输入框需要 char*。长度截断到 255，
+            // 保证 snprintf 一定有终止。
+            snprintf(inputBuf, sizeof(inputBuf), "%s", filter.c_str());
+            if (ImGui::InputText("##filterinput", inputBuf, sizeof(inputBuf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue))
+            {
+                filter = inputBuf;
+                FilterClasses(filter);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("直接输入即可筛选。留空显示全部。\n"
+                                  "下方 Filter Options 可以限定搜索范围。");
+            }
+        }
+
+        char filterBuffer[320];
+        {
+            // 按钮标签同时充当 ImGui 的控件 ID。ImGui 用 "##" 之后的内容
+            // 作为 ID、把之前的内容作为显示文本 —— 所以 filter 里只要有
+            // "##"，控件 ID 就会随输入变化，交互直接错乱。
+            // 这里把 '#' 替换掉再拼进标签，显示效果不受影响。
+            std::string safeFilter;
+            safeFilter.reserve(filter.size());
+            for (char c : filter)
+            {
+                safeFilter.push_back(c == '#' ? '_' : c);
+            }
+            snprintf(filterBuffer, sizeof(filterBuffer), "Filter : %s | %zu of %zu##filterbtn",
+                     safeFilter.empty() ? "(none)" : safeFilter.c_str(), filteredClasses.size(),
+                     classes.size());
+        }
         if (ImGui::Button(filterBuffer, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)) && !Keyboard::IsOpen())
         {
             Keyboard::Open(
@@ -2079,29 +2145,34 @@ void ClassesTab::Draw(int index, bool closeable)
             {
                 FilterClasses(filter);
             }
-            ImGui::Text("Filter by ");
+            ImGui::Text("搜索范围（可多选）");
+            ImGui::SetItemTooltip("旧版本这三个是互斥单选，必须先决定搜什么才能输关键词。\n"
+                                  "现在可以同时勾选：一次就能搜出「类名匹配 或 方法名匹配」的结果。\n"
+                                  "都不勾 = 只按类名筛选。");
+            ImGui::Checkbox("##byClass", &filterByClass);
             ImGui::SameLine();
-            if (ImGui::RadioButton("Class", filterByClass == true))
+            ImGui::TextUnformatted("类名");
+            ImGui::SameLine();
+            ImGui::Checkbox("##byMethod", &filterByMethod);
+            ImGui::SameLine();
+            ImGui::TextUnformatted("方法名");
+            ImGui::SameLine();
+            ImGui::Checkbox("##byField", &filterByField);
+            ImGui::SameLine();
+            ImGui::TextUnformatted("字段名");
+            if (ImGui::IsItemHovered())
             {
-                filterByClass = true;
-                filterByMethod = false;
-                filterByField = false;
-                FilterClasses(filter);
+                ImGui::SetTooltip("搜索字段名");
             }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Method", filterByMethod == true))
+
+            if (ImGui::Button("应用搜索范围"))
             {
-                filterByClass = false;
-                filterByMethod = true;
-                filterByField = false;
-                FilterClasses(filter);
-            }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Field", filterByField == true))
-            {
-                filterByClass = false;
-                filterByMethod = false;
-                filterByField = true;
+                if (!filterByClass && !filterByMethod && !filterByField)
+                {
+                    // 一个都不勾就没有任何东西可搜，会显示空列表，
+                    // 用户会以为「搜索坏了」。落到最合理的默认：按类名。
+                    filterByClass = true;
+                }
                 FilterClasses(filter);
             }
             if (ImGui::Checkbox("Show All Classes", &showAllClasses))
@@ -2126,7 +2197,10 @@ void ClassesTab::Draw(int index, bool closeable)
                     pushedColor++;
                 }
                 bool collapsingHeader = ImGui::CollapsingHeader(klass->getFullName().c_str());
-                if (filterByMethod && ImGui::IsItemHeld(0.7f))
+                // 长按类名 → 开一个新 tab 并按这个类名筛选。
+                // 只在「按类名搜索」时有意义：按方法/字段搜出来的结果，
+                // 类名未必包含关键词，填进新 tab 只会得到空列表。
+                if ((filterByClass || (!filterByMethod && !filterByField)) && ImGui::IsItemHeld(0.7f))
                 {
                     auto name = Util::extractClassNameFromTypename(klass->getFullName().c_str());
                     auto &tab = Tool::OpenNewTab();
@@ -2154,6 +2228,28 @@ void ClassesTab::Draw(int index, bool closeable)
             ImGui::ScrollWhenDraggingOnVoid();
             ImGui::EndChild();
         }
+        else if (!filter.empty())
+        {
+            // 空结果时明确说明是「没匹配上」，而不是让用户面对一片空白
+            // 去猜是不是界面坏了。同时给出最可能的原因和下一步。
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "没有匹配 \"%s\" 的结果", filter.c_str());
+            ImGui::BulletText("当前范围: %s",
+                              (filterByMethod && filterByField) ? "方法名 / 字段名"
+                              : filterByMethod                ? "方法名"
+                              : filterByField                 ? "字段名"
+                                                              : "类名");
+            ImGui::BulletText("共扫描了 %zu 个类", classes.size());
+            if (!caseSensitive)
+            {
+                ImGui::BulletText("当前不区分大小写");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("试试区分大小写"))
+            {
+                caseSensitive = !caseSensitive;
+                FilterClasses(filter);
+            }
+        }
         ImGui::EndTabItem();
     }
 }
@@ -2163,7 +2259,9 @@ void ClassesTab::DrawTabMap()
     {
         auto &[object, visible] = *it;
         char buff[32]{0};
-        sprintf(buff, "[%p]", object);
+        // 64 位下 %p 最长 18 个十六进制字符 + "0x" + 两个方括号 + NUL = 23，
+        // 32 够用；用 snprintf 明确表达「接受截断」而不是靠算。
+        snprintf(buff, sizeof(buff), "[%p]", static_cast<void *>(object));
 
         if (!visible)
         {
@@ -2672,19 +2770,56 @@ void ClassesTab::FilterClasses(const std::string &filter)
         classes = selectedImage->getClasses();
     }
 
-    auto finderCaseSensitive = [](const std::string &a, const std::string &b)
-    { return a.find(b) != std::string::npos; };
-
-    auto finderCaseInsensitive = [](const std::string &a, const std::string &b)
+    // 大小写不敏感包含匹配。
+    //
+    // 旧实现是 `auto newA = a; auto newB = b; transform(tolower); find`
+    // —— 每比较一次就**分配两个完整副本**。这个比较在
+    // 「每个类 × 每个方法 × 每个字段」上跑一遍：5000 个类、平均 20 个方法
+    // 就是十万次比较、二十万次堆分配，而且全在渲染线程上、每敲一个字符触发一次。
+    // 用户体验就是「输入框卡住」。
+    //
+    // 现在只转换**模式串**（filter 长度固定，几百字节）并预先算好，
+    // 遍历 haystack 时用 std::tolower 逐字符比较，全程零分配。
+    std::string loweredFilter;
+    if (!caseSensitive && !filter.empty())
     {
-        auto newA = a;
-        auto newB = b;
-        std::transform(newA.begin(), newA.end(), newA.begin(), ::tolower);
-        std::transform(newB.begin(), newB.end(), newB.begin(), ::tolower);
-        return newA.find(newB) != std::string::npos;
-    };
+        loweredFilter.resize(filter.size());
+        std::transform(filter.begin(), filter.end(), loweredFilter.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
 
-    auto finder = caseSensitive ? finderCaseSensitive : finderCaseInsensitive;
+    auto finder = [&](const char *haystack) -> bool
+    {
+        if (haystack == nullptr)
+        {
+            return false;
+        }
+        if (caseSensitive)
+        {
+            return std::strstr(haystack, filter.c_str()) != nullptr;
+        }
+        if (loweredFilter.empty())
+        {
+            return true;
+        }
+        // 朴素子串搜索。用 std::search + 逐字符 tolower 同样零分配。
+        const size_t n = loweredFilter.size();
+        const char *start = haystack;
+        for (const char *p = start; *p != '\0'; ++p)
+        {
+            size_t i = 0;
+            while (i < n && p[i] != '\0' &&
+                   static_cast<char>(std::tolower(static_cast<unsigned char>(p[i]))) == loweredFilter[i])
+            {
+                ++i;
+            }
+            if (i == n)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (int i = 0; i < classes.size() && filteredClasses.size() < (showAllClasses ? classes.size() : MAX_CLASSES); i++)
     {
@@ -2693,54 +2828,69 @@ void ClassesTab::FilterClasses(const std::string &filter)
         if (/* Il2cpp::GetClassIsStatic(klass) || */ Il2cpp::GetClassIsEnum(klass))
             continue;
 
-        if (filterByClass)
+        // 三种范围现在是「或」关系：类名/方法名/字段名命中任意一个都算。
+        // 旧版本是互斥单选，用户必须先想清楚搜什么才能输关键词 ——
+        // 而实际使用中「类名或者方法名里有这个字符串」才是最自然的问法。
+        //
+        // 都不勾时回退到只按类名筛（UI 上也会兜底，这里再兜一层，
+        // 因为 ConfigSave/Load 能从旧配置里读出三者皆 false 的状态）。
+        const bool searchClass = filterByClass || (!filterByMethod && !filterByField);
+        const bool searchMethod = filterByMethod;
+        const bool searchField = filterByField;
+
+        bool found = false;
+        // 命中的类需要把方法列表填进 methodMap（UI 展开时才用）。
+        // 先攒着，确认命中之后再填 —— 否则没命中的类也白填一遍。
+        std::vector<MethodInfo *> matchedMethods;
+
+        if (searchClass && finder(klass->getFullName().c_str()))
         {
-            // if (klass->getFullName().find(filter) != std::string::npos)
-            if (finder(klass->getFullName(), filter))
-            {
-                filteredClasses.push_back(klass);
-                for (auto m : klass->getMethods())
-                {
-                    auto paramsInfo = m->getParamsInfo();
-                    methodMap[klass].push_back({m, paramsInfo});
-                }
-            }
+            found = true;
         }
-        else if (filterByMethod)
+
+        if (searchMethod)
         {
-            bool found = false;
             for (auto m : klass->getMethods())
             {
-                // if (std::string(m->getName()).find(filter) != std::string::npos)
-                if (finder(m->getName(), filter))
+                if (finder(m->getName()))
                 {
                     found = true;
-                    auto paramsInfo = m->getParamsInfo();
-                    methodMap[klass].push_back({m, paramsInfo});
+                    matchedMethods.push_back(m);
                 }
             }
-            if (found)
-                filteredClasses.push_back(klass);
         }
-        else if (filterByField)
+
+        if (searchField && !found)
         {
-            bool found = false;
             for (auto f : klass->getFields())
             {
-                // if (std::string(f->getName()).find(filter) != std::string::npos)
-                if (finder(f->getName(), filter))
+                if (finder(f->getName()))
                 {
                     found = true;
+                    break;
                 }
             }
-            if (found)
+        }
+
+        if (!found)
+            continue;
+
+        filteredClasses.push_back(klass);
+
+        // 按方法名命中时只保留命中的方法（这正是「按方法搜索」的语义：
+        // 展开这个类只该看到相关方法）。否则填全部方法。
+        if (!matchedMethods.empty())
+        {
+            for (auto m : matchedMethods)
             {
-                filteredClasses.push_back(klass);
-                for (auto m : klass->getMethods())
-                {
-                    auto paramsInfo = m->getParamsInfo();
-                    methodMap[klass].push_back({m, paramsInfo});
-                }
+                methodMap[klass].push_back({m, m->getParamsInfo()});
+            }
+        }
+        else
+        {
+            for (auto m : klass->getMethods())
+            {
+                methodMap[klass].push_back({m, m->getParamsInfo()});
             }
         }
     }
