@@ -16,6 +16,10 @@ namespace Il2cpp
     // 返回 false 表示 il2cpp 尚未就绪（API 表没解析出来，或等待 il2cpp_init 超时）。
     // 调用方必须检查并放弃后续初始化，否则会在空指针上继续往下走。
     bool Init();
+    // 区分 Init() 失败的两种原因：
+    // - true  = API 表已经解析出来了，只是运行时尚未就绪 → 值得稍后重试
+    // - false = 连符号都没解析出来（版本不匹配等）→ 重试也没用
+    bool ApiResolved();
     // void Dump(JavaVM *jvm);
     void Dump(JNIEnv *env);
     bool EnsureAttached();

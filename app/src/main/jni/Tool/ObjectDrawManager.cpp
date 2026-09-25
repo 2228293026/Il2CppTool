@@ -115,7 +115,7 @@ static void RescanGameObjectsInBackground() {
         //
         // 每轮扫描都是一次性线程，所以 attach 之后必须配对 detach：
         // 只挂不摘会在 il2cpp 的 attached-thread 表里留下悬空条目，
-        // GC 遍历线程表时会踩到已退出的线程。
+        // GC 遍历线程表时会踩到已退出的线程。用 RAII 保证异常路径也不会漏。
         const bool attachedHere = Il2cpp::EnsureAttached();
         if (!attachedHere)
         {
@@ -124,25 +124,37 @@ static void RescanGameObjectsInBackground() {
             g_rescanInProgress.store(false);
             return;
         }
-
-        auto objs = Il2cpp::GC::FindObjects(g_GameObjectClass);
-
-        // 扫描结果先落地，再 detach（detach 之后不能再碰 il2cpp 对象）
-        const bool shuttingDown = g_shutdownRequested.load();
-        if (!shuttingDown)
+        struct DetachGuard
         {
-            std::lock_guard<std::mutex> lock(g_objectsMutex);
-            g_cachedGameObjects = std::move(objs);
+            ~DetachGuard() { Il2cpp::Detach(); }
+        } detachGuard;
+
+        // FindObjects 内部要分配 vector；一旦 bad_alloc 抛出来，
+        // 没有 DetachGuard 就会带着「已挂载」的线程直接 terminate。
+        std::vector<Il2CppObject *> objs;
+        try
+        {
+            objs = Il2cpp::GC::FindObjects(g_GameObjectClass);
+        }
+        catch (const std::exception &e)
+        {
+            LOGE("对象扫描失败: %s", e.what());
+        }
+        catch (...)
+        {
+            LOGE("对象扫描未知异常");
         }
 
-        Il2cpp::Detach();
-
-        if (shuttingDown)
+        if (g_shutdownRequested.load())
         {
             // Shutdown 已经清过状态，别再往里写
             g_rescanBusy.store(false);
             g_rescanInProgress.store(false);
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_objectsMutex);
+            g_cachedGameObjects = std::move(objs);
         }
         g_rescanFinishTime.store(NowSeconds());
         g_hasNewList.store(true);

@@ -156,14 +156,32 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 // 后台线程是 il2cpp 的 foreign thread：GC::FindObjects 会 stop_gc_world
                 // 并遍历 GC 结构，不 attach 就是崩溃/静默错数据；用完必须 detach，
                 // 否则 il2cpp 的 attached-thread 表里会留下悬空条目。
-                if (Il2cpp::EnsureAttached())
+                if (!Il2cpp::EnsureAttached())
+                {
+                    LOGE("对象扫描: 无法 attach 到 il2cpp VM");
+                    keepAlive->store(false);
+                    return;
+                }
+                // RAII：FindObjects 内部 vector 扩容失败会抛异常，
+                // 没有守卫就会带着已挂载的线程直接 terminate。
+                struct DetachGuard
+                {
+                    ~DetachGuard() { Il2cpp::Detach(); }
+                } detachGuard;
+
+                try
                 {
                     auto objs = Il2cpp::GC::FindObjects(klass);
-                    {
-                        std::lock_guard<std::mutex> lock(g_scanResultMutex);
-                        g_pendingScanResults[klass] = std::move(objs);
-                    }
-                    Il2cpp::Detach();
+                    std::lock_guard<std::mutex> lock(g_scanResultMutex);
+                    g_pendingScanResults[klass] = std::move(objs);
+                }
+                catch (const std::exception &e)
+                {
+                    LOGE("FindObjects(%s) 失败: %s", klass ? klass->getName() : "?", e.what());
+                }
+                catch (...)
+                {
+                    LOGE("FindObjects 未知异常");
                 }
                 keepAlive->store(false);
             },
@@ -1346,14 +1364,18 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
 
     bool methodIsStatic = Il2cpp::GetIsMethodStatic(method);
 
+    // 512 字节对「返回类型 + 方法名 + 参数个数 + 前缀」来说不宽裕，
+    // 而这些字符串全部来自 il2cpp 元数据（混淆过的名字可以很长），
+    // 旧代码是无界 sprintf + 无容量 prepend，栈溢出只是时间问题。
     char treeLabel[512]{0};
-    sprintf(treeLabel, "%s %s(%zu)###", method->getReturnType()->getName(), method->getName(), paramsInfo.size());
+    snprintf(treeLabel, sizeof(treeLabel), "%s %s(%zu)###", method->getReturnType()->getName(), method->getName(),
+             paramsInfo.size());
     int pushedColor = 0;
     if (methodIsStatic)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 100, 255));
         pushedColor++;
-        Util::prependStringToBuffer(treeLabel, "static ");
+        Util::prependStringToBuffer(treeLabel, sizeof(treeLabel), "static ");
     }
     bool patched = oMap[method].bytes.empty() == false;
     bool hooked = hookerMap.find(method->methodPointer) != hookerMap.end();
@@ -1369,10 +1391,11 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
         pushedColor++;
         if (hooked)
         {
+            std::lock_guard guard(hookerMtx);
             int hitCount = hookerMap[method->methodPointer].hitCount;
             char hitLabel[64]{0};
-            sprintf(hitLabel, "Hit Count %d | ", hitCount);
-            Util::prependStringToBuffer(treeLabel, hitLabel);
+            snprintf(hitLabel, sizeof(hitLabel), "Hit Count %d | ", hitCount);
+            Util::prependStringToBuffer(treeLabel, sizeof(treeLabel), hitLabel);
         }
         else if (patched)
         {
@@ -1380,8 +1403,8 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
             if (!text.empty())
             {
                 char buff[64]{0};
-                sprintf(buff, "Returns %s | ", text.c_str());
-                Util::prependStringToBuffer(treeLabel, buff);
+                snprintf(buff, sizeof(buff), "Returns %s | ", text.c_str());
+                Util::prependStringToBuffer(treeLabel, sizeof(treeLabel), buff);
             }
         }
     }

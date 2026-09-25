@@ -549,20 +549,32 @@ Il2CppType *MethodInfo::getReturnType()
     return Il2cpp::GetMethodReturnType(this);
 }
 
+// 记录「被 hook 过的方法 → 原函数地址」。
+// 这张表会被游戏线程上的 hook 回调（invoke 时查原地址）和 UI 线程
+// （装/卸 hook）同时访问，没有任何同步 —— unordered_map 并发 rehash
+// 就是堆破坏。
+static std::mutex g_hookedMutex;
 std::unordered_map<uintptr_t, intptr_t> alreadyHooked{};
 
 bool MethodInfo::_isAlreadyHooked(uintptr_t ptr)
 {
-    if (alreadyHooked.find(ptr) != alreadyHooked.end())
-    {
-        return true;
-    }
-    return false;
+    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    return alreadyHooked.find(ptr) != alreadyHooked.end();
 }
 
 void MethodInfo::_addToHookedMap(uintptr_t ptr, uintptr_t oPtr)
 {
+    std::lock_guard<std::mutex> guard(g_hookedMutex);
     alreadyHooked[ptr] = oPtr;
+}
+
+// 卸 hook 时必须把登记摘掉：只 DobbyDestroy 而留着这条记录的话，
+// 之后重新 hook 同一个方法会被 _isAlreadyHooked 挡掉并返回 nullptr，
+// 而 invoke 依然按旧记录跳向已经失效的 trampoline。
+void MethodInfo::_removeFromHookedMap(uintptr_t ptr)
+{
+    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    alreadyHooked.erase(ptr);
 }
 
 std::vector<std::pair<const char *, Il2CppType *>> MethodInfo::getParamsInfo()

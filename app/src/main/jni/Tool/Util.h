@@ -5,7 +5,10 @@
 
 namespace Util
 {
-    void prependStringToBuffer(char *buffer, const char *string);
+    // capacity 是 buffer 的总字节数（含结尾 '\0'），必须有。
+    // 旧版本没有容量参数：调用方是 512 字节的 treeLabel，而里面的
+    // 类名/方法名/返回值文本长度都不受控，连续 prepend 几次就栈溢出。
+    void prependStringToBuffer(char *buffer, size_t capacity, const char *string);
     std::string extractClassNameFromTypename(const char *typeName);
 
     class FileWriter

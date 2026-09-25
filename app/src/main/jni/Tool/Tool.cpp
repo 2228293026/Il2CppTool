@@ -341,8 +341,7 @@ namespace Tool
                 LOGPTR(M->methodPointer);
             else
                 LOGE("找不到 WorldToScreenPoint(Vector3)");
-            return M;
-        }();
+            return M;        }();
 
         static MethodInfo *IsNativeObjectAlive = []()
         {
@@ -412,10 +411,12 @@ namespace Tool
     static auto printHex = [](void *ptr, int row = 1) {
         if (row < 1) row = 1;
         for (int i = 0; i < row; i++) {
-            char buffer[512]{0};
-            std::span<uint8_t> bytes((uint8_t *)ptr + i * 16, 16);
-            for (int j = 0; j < bytes.size(); j++) {
-                sprintf(buffer + j * 3, "%02X ", bytes[j]);
+            // 每行 16 字节 = 48 个字符，加结尾 '\0'。用 size_t 做偏移算术，
+            // 避免 int 乘法溢出/隐式加宽到 ptrdiff_t 的歧义。
+            char buffer[16 * 3 + 1]{0};
+            const auto *base = (const uint8_t *)ptr + (size_t)i * 16;
+            for (size_t j = 0; j < 16; j++) {
+                snprintf(buffer + j * 3, 4, "%02X ", base[j]);
             }
             LOGD("%s", buffer);
         }

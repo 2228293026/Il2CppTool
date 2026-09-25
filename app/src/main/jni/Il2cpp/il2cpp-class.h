@@ -207,6 +207,12 @@ struct MethodInfo
     template <typename T, typename... Args>
     T invoke(Il2CppObject *instance);
 
+  public:
+    // 卸 hook 时必须配对调用，否则这张表会留下失效的 trampoline 记录，
+    // 导致同一个方法之后无法重新 hook（_isAlreadyHooked 会挡掉并返回 nullptr）。
+    static void _removeFromHookedMap(uintptr_t ptr);
+
+  private:
     static bool _isAlreadyHooked(uintptr_t ptr);
 
     static void _addToHookedMap(uintptr_t ptr, uintptr_t oPtr);

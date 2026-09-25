@@ -150,13 +150,24 @@ namespace Unity
         g_uiContextAlive = false;
         if (Input)
         {
-            if (auto *m = Input->getMethod("get_touchCount"))
+            // 摘钩子的同时要把 alreadyHooked 里的登记清掉。
+            // 只 DobbyDestroy 的话这张表还留着失效的 trampoline 记录，
+            // 之后再 hook 同一个方法会被 _isAlreadyHooked 挡掉并返回 nullptr。
+            for (const char *name : {"get_touchCount", "GetMouseButton"})
             {
-                DobbyDestroy((void *)m->methodPointer);
-            }
-            if (auto *m = Input->getMethod("GetMouseButton"))
-            {
-                DobbyDestroy((void *)m->methodPointer);
+                auto *m = Input->getMethod(name);
+                if (!m || !m->methodPointer)
+                {
+                    continue;
+                }
+                if (DobbyDestroy((void *)m->methodPointer) == 0)
+                {
+                    MethodInfo::_removeFromHookedMap((uintptr_t)m->methodPointer);
+                }
+                else
+                {
+                    LOGE("卸载 %s 失败", name);
+                }
             }
         }
         o_get_touchCount = nullptr;

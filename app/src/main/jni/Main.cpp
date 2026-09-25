@@ -522,18 +522,29 @@ void on_init()
 
     // il2cpp 没就绪就到此为止：后面的 GetAssembly / GetImages / Unity::HookInput
     // 全都要在解析好的 API 表上跑，强行继续只会一路空指针崩掉。
+    //
+    // 这里区分「还没就绪」和「彻底失败」：
+    // - 还没就绪（渲染线程暂时不是 VM 线程）→ INIT_PENDING，下一帧重试。
+    //   这条路径绝不能 sleep 等待，否则会把渲染线程冻住。
+    // - 彻底失败（API 表解析不出来）→ INIT_FAILED，不再重试。
     if (!Il2cpp::Init())
     {
-        LOGE("il2cpp 初始化失败，工具不启动");
-        g_initState = INIT_FAILED;
+        if (Il2cpp::ApiResolved())
+        {
+            g_initState = INIT_PENDING;
+        }
+        else
+        {
+            LOGE("il2cpp API 表解析失败，放弃初始化");
+            g_initState = INIT_FAILED;
+        }
         return;
     }
-    // attach 失败（超时/拿不到 thread）就不要再往下走了：后面的 Keyboard/Unity/
-    // Tool/Application 全都要在已挂载的 il2cpp 线程上调用。
+    // attach 失败同样可能只是时机问题：下一帧重试，不要一上来就放弃。
     if (!Il2cpp::EnsureAttached())
     {
-        LOGE("无法 attach 到 il2cpp VM，工具不启动");
-        g_initState = INIT_FAILED;
+        LOGI("暂未 attach 到 il2cpp VM，稍后重试");
+        g_initState = INIT_PENDING;
         return;
     }
 

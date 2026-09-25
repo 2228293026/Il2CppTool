@@ -7,10 +7,27 @@
 namespace Util
 {
     // https://stackoverflow.com/a/2328191
-    void prependStringToBuffer(char *buffer, const char *string)
+    void prependStringToBuffer(char *buffer, size_t capacity, const char *string)
     {
+        if (!buffer || capacity == 0 || !string)
+        {
+            return;
+        }
         size_t string_length = strlen(string);
-        size_t buffer_length = strlen(buffer);
+        size_t buffer_length = strnlen(buffer, capacity);
+
+        // 放不下就整体截断，而不是写出缓冲区。
+        // 写完还要保证以 '\0' 结尾 —— 旧实现 memcpy 之后不补结尾，
+        // 后续按 C 字符串用它就会读过界。
+        if (string_length >= capacity || buffer_length + 1 > capacity - string_length)
+        {
+            if (capacity >= 1)
+            {
+                buffer[0] = '\0';
+            }
+            return;
+        }
+
         memmove(buffer + string_length, buffer, buffer_length + 1);
         memcpy(buffer, string, string_length);
     }

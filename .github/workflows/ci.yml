@@ -1,0 +1,117 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 与本地开发一致：Windows + ndk-build.cmd
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 解析 runner 上已有的 NDK，避免依赖第三方 action 和 ~1GB 下载。
+      # 优先环境变量，其次 Android SDK 的 ndk/ 目录（取版本号最大的一个）。
+      - name: Resolve Android NDK
+        id: ndk
+        shell: pwsh
+        run: |
+          $candidates = @()
+          foreach ($envName in 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT') {
+            $value = [Environment]::GetEnvironmentVariable($envName)
+            if ($value) { $candidates += $value }
+          }
+
+          if (-not $candidates) {
+            $sdk = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) |
+              Where-Object { $_ } | Select-Object -First 1
+            if ($sdk) {
+              $ndkRoot = Join-Path $sdk 'ndk'
+              if (Test-Path $ndkRoot) {
+                $candidates += Get-ChildItem $ndkRoot -Directory |
+                  Sort-Object Name -Descending | ForEach-Object { $_.FullName }
+              }
+            }
+          }
+
+          $ndk = $candidates |
+            Where-Object { $_ -and (Test-Path (Join-Path $_ 'ndk-build.cmd')) } |
+            Select-Object -First 1
+
+          if (-not $ndk) {
+            throw "Runner 上没有找到可用的 Android NDK（需要 ndk-build.cmd）。"
+          }
+
+          Write-Host "Using NDK: $ndk"
+          Get-Content (Join-Path $ndk 'source.properties') -ErrorAction SilentlyContinue
+          "ANDROID_NDK_HOME=$ndk" >> $env:GITHUB_ENV
+          "NDK_PATH=$ndk" >> $env:GITHUB_ENV
+
+      - name: Build arm64-v8a
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          $so = 'app/src/main/libs/arm64-v8a/libIl2CppTool.so'
+          if (-not (Test-Path $so)) { throw "构建产物不存在: $so" }
+          $size = (Get-Item $so).Length
+          Write-Host "libIl2CppTool.so = $size bytes"
+          if ($size -lt 1MB) { throw "构建产物异常小（$size bytes），构建可能没真正成功" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libIl2CppTool-arm64-v8a
+          path: app/src/main/libs/arm64-v8a/libIl2CppTool.so
+          if-no-files-found: error
+
+  # 静态检查。工具本体是注入到别的进程里跑的崩溃型代码：
+  # 一个越界写或者空指针解引用，受害的是用户的游戏进程而不是我们。
+  # 纯编译能过不代表安全，这一层专门抓 bugprone / cert 类问题。
+  #
+  # 只检查我们自己写的源文件；imgui / asmjit / frida-gum / xdl 等
+  # 第三方代码不纳入（它们的告警既多又不由我们修）。
+  static-analysis:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve Android NDK
+        id: ndk
+        shell: pwsh
+        run: |
+          $candidates = @()
+          foreach ($envName in 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT') {
+            $value = [Environment]::GetEnvironmentVariable($envName)
+            if ($value) { $candidates += $value }
+          }
+          if (-not $candidates) {
+            $sdk = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) |
+              Where-Object { $_ } | Select-Object -First 1
+            if ($sdk) {
+              $ndkRoot = Join-Path $sdk 'ndk'
+              if (Test-Path $ndkRoot) {
+                $candidates += Get-ChildItem $ndkRoot -Directory |
+                  Sort-Object Name -Descending | ForEach-Object { $_.FullName }
+              }
+            }
+          }
+          $ndk = $candidates |
+            Where-Object { $_ -and (Test-Path (Join-Path $_ 'ndk-build.cmd')) } |
+            Select-Object -First 1
+          if (-not $ndk) { throw "没有找到可用的 Android NDK" }
+          "NDK_PATH=$ndk" >> $env:GITHUB_ENV
+
+      - name: Run clang-tidy on project sources
+        shell: pwsh
+        run: .\.ci\run-clang-tidy.ps1
+

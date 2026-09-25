@@ -573,22 +573,23 @@ bool il2cpp_api_init(void *handle)
         LOGE("il2cpp_is_vm_thread 符号缺失（Unity 版本不匹配），放弃初始化");
         return false;
     }
-    constexpr int kMaxWaitSeconds = 10;
-    for (int i = 0; i < kMaxWaitSeconds; i++)
+    // 等游戏自己完成 il2cpp_init。
+    //
+    // 这里只探测一次，不 sleep：整条链最终是在 eglSwapBuffers 钩子里（游戏的渲染线程）
+    // 同步跑下来的，任何 sleep 都是实打实的画面卡顿。旧代码在这里 while+sleep(1)
+    // 死等 10 秒，只要渲染线程不是 VM 线程就是一次 10 秒冻结（外加未定义行为：
+    // 未挂载的线程上调 il2cpp）。
+    //
+    // 没就绪就返回 false：调用方 on_init 会把状态置成 INIT_PENDING，
+    // 由 setupMenu 在后续帧重试（游戏照常出画面），所以不需要在这里等。
+    if (!il2cpp_is_vm_thread(nullptr))
     {
-        if (il2cpp_is_vm_thread(nullptr))
-        {
-            //    auto domain = il2cpp_domain_get();
-            //    il2cpp_thread_attach(domain);
-            return true;
-        }
-        LOGI("Waiting for il2cpp_init... (%d/%d)", i + 1, kMaxWaitSeconds);
-        sleep(1);
+        LOGI("渲染线程尚未成为 il2cpp VM 线程，稍后重试");
+        return false;
     }
-    // 超时后必须让调用方知道：il2cpp 还没就绪，继续往下走 GetImages /
-    // GetAssembly / Unity::HookInput 全是空指针起步，不如直接放弃初始化。
-    LOGE("il2cpp_init not ready after %ds; 渲染线程不是 VM 线程，放弃初始化以免崩溃", kMaxWaitSeconds);
-    return false;
+    //    auto domain = il2cpp_domain_get();
+    //    il2cpp_thread_attach(domain);
+    return true;
 }
 
 bool g_DoLog = true;
@@ -681,6 +682,17 @@ namespace Il2cpp
         bool ok = il2cpp_api_init(handle);
         xdl_close(handle);
         return ok;
+    }
+
+    bool ApiResolved()
+    {
+        // init_il2cpp_api 对 xdl_sym 返回空是静默忽略的，所以这里用几个关键
+        // 符号是否解析出来，判断「符号没找到（版本不匹配，重试无用）」还是
+        // 「运行时尚未就绪（值得稍后重试）」。
+        // 必须包含 il2cpp_is_vm_thread —— il2cpp_api_init 缺它就直接判失败，
+        // 漏掉它会把版本不匹配误判成「还没就绪」，白白重试 3600 帧。
+        return il2cpp_domain_get_assemblies != nullptr && il2cpp_class_from_name != nullptr &&
+               il2cpp_thread_current != nullptr && il2cpp_is_vm_thread != nullptr;
     }
 
     void Dump(JNIEnv *env)
