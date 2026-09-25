@@ -1477,6 +1477,49 @@ namespace Il2cpp
             static auto SystemGC = FindClass("System.GC");
             SystemGC->invoke_static_method<void>("KeepAlive", object);
         }
+
+        uint32_t NewHandle(Il2CppObject *object, bool pinned)
+        {
+            if (object == nullptr)
+            {
+                return 0;
+            }
+            if (!il2cpp_gchandle_new)
+            {
+                // 符号缺失（老版本 il2cpp）时不能返回 0 假装成功：
+                // 调用方会以为「已加根」，实际没有，问题会延后到随机崩溃才暴露。
+                LOGE("GC::NewHandle: il2cpp_gchandle_new 符号缺失，无法加根");
+                return 0;
+            }
+            // pinned=true 会让 GC 永不移动该对象（仅在需要稳定地址时用，
+            // 默认 false 避免让本就不紧凑的堆更碎片化）。
+            auto handle = il2cpp_gchandle_new(object, pinned);
+            if (handle == 0)
+            {
+                LOGE("GC::NewHandle: 分配 gchandle 失败");
+            }
+            return handle;
+        }
+
+        Il2CppObject *GetHandleTarget(uint32_t handle)
+        {
+            if (handle == 0 || !il2cpp_gchandle_get_target)
+            {
+                return nullptr;
+            }
+            // 对象若已被回收，il2cpp 返回 nullptr —— 这正是我们要的：
+            // 可以安全判空，而不是拿着野指针去解引用。
+            return il2cpp_gchandle_get_target(handle);
+        }
+
+        void FreeHandle(uint32_t handle)
+        {
+            if (handle == 0 || !il2cpp_gchandle_free)
+            {
+                return;
+            }
+            il2cpp_gchandle_free(handle);
+        }
     } // namespace GC
 #ifdef USE_FRIDA
     #include "gumpp.hpp"

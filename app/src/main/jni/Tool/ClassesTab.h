@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Il2cpp/Il2cpp.h"
 #include "Il2cpp/il2cpp-class.h"
 #include "Includes/circular_buffer.h"
 #include "Tool/PopUpSelector.h"
@@ -47,8 +48,14 @@ struct ClassesTab
     std::vector<Il2CppClass *> tracer{};
     std::vector<MethodInfo *> tracedMethods;
 
-    static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> objectMap;
-    static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> newObjectMap;
+    // 扫描结果缓存。
+    //
+    // 用 RootedObjectList 而不是裸 vector：这些对象会被 UI 长期持有（用户可能
+    // 在列表里翻看几分钟），期间游戏侧完全可能销毁它们、GC 回收，裸指针就变野了。
+    // RootedObjectList 给每个对象挂一个强句柄，条目存活期间 GC 不回收它。
+    static std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> objectMap;
+    static std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> newObjectMap;
+    // 已保存（用户标记）的对象，同样要保活。
     static std::unordered_map<Il2CppClass *, std::set<Il2CppObject *>> savedSet;
     std::unordered_map<MethodInfo *, std::unordered_map<std::string, ParamValue>> paramMap{};
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};

@@ -23,6 +23,53 @@ extern Il2CppImage *g_Image;
 static std::mutex g_scanResultMutex;
 static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> g_pendingScanResults;
 
+// savedSet 里是「用户手动保存、要长期留着」的对象，同样必须保活：
+// 它们在列表里可能挂很久，游戏侧随时可能销毁对应实体。
+// 因为是 set（按指针去重），用一个并行的句柄表来管 GC 根。
+static std::unordered_map<Il2CppObject *, uint32_t> g_savedHandles;
+
+static void SaveObjectWithRoot(Il2CppObject *obj)
+{
+    if (!obj)
+    {
+        return;
+    }
+    if (g_savedHandles.find(obj) == g_savedHandles.end())
+    {
+        auto handle = Il2cpp::GC::NewHandle(obj);
+        if (handle == 0)
+        {
+            LOGW("保存对象加根失败: %p", static_cast<void *>(obj));
+        }
+        g_savedHandles[obj] = handle;
+    }
+}
+
+static void UnsaveObjectWithRoot(Il2CppObject *obj)
+{
+    auto it = g_savedHandles.find(obj);
+    if (it != g_savedHandles.end())
+    {
+        Il2cpp::GC::FreeHandle(it->second);
+        g_savedHandles.erase(it);
+    }
+}
+
+// 已保存集合里取出的对象，走句柄确认仍然有效。
+static Il2CppObject *ResolveSaved(Il2CppObject *obj)
+{
+    if (!obj)
+    {
+        return nullptr;
+    }
+    auto it = g_savedHandles.find(obj);
+    if (it != g_savedHandles.end() && it->second)
+    {
+        return Il2cpp::GC::GetHandleTarget(it->second);
+    }
+    return obj;
+}
+
 constexpr int MAX_CLASSES = 500;
 
 int maxLine{5};
@@ -198,7 +245,9 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
         {
             for (auto &[pendingKlass, pending] : g_pendingScanResults)
             {
-                objectMap[pendingKlass] = std::move(pending);
+                // 旧条目（及其句柄）在这里被 RootedObjectList 的赋值运算符释放，
+                // 新的一批同时加根。
+                objectMap[pendingKlass].reset(std::move(pending));
             }
             g_pendingScanResults.clear();
         }
@@ -235,30 +284,57 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
             }
             else
             {
-                if (objects.size() > 100)
+                // liveObjects() 会剔除已被 GC 回收的条目（并释放其句柄），
+                // 下面遍历的是仍然有效的对象 —— 之后 object->klass 才安全。
+                auto live = objects.liveObjects();
+                if (live.size() > 100)
                 {
-                    ImGui::Text("Showing 100 of %zu objects", objects.size());
+                    ImGui::Text("Showing 100 of %zu objects", live.size());
                 }
-                for (auto it = objects.begin(); it != (objects.size() > 100 ? objects.begin() + 100 : objects.end());)
+                size_t limit = live.size() > 100 ? 100 : live.size();
+                for (size_t i = 0; i < limit;)
                 {
-                    auto object = *it;
-                    char buff[64];
-                    sprintf(buff, "%s [%p]", prefix, object->klass->getName());
+                    auto object = live[i];
+                    if (object == nullptr || object->klass == nullptr)
+                    {
+                        ++i;
+                        continue;
+                    }
+                    const char *className = object->klass->getName();
+                    char buff[256];
+                    snprintf(buff, sizeof(buff), "%s [%p]", prefix, static_cast<void *>(object));
                     auto size = ImGui::GetWindowSize();
                     if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                     {
                         onSelect(object);
                     }
-                    ImGui::SetItemTooltip("%s", object->klass->getName());
+                    ImGui::SetItemTooltip("%s", className ? className : "?");
                     ImGui::SameLine();
                     ImGui::PushID(buff);
                     if (ImGui::Button("Remove"))
                     {
-                        it = objects.erase(it);
+                        // live[i] 与 objects[i] 的下标不一定对应（live 剔除了
+                        // 失效项），所以按指针找原始下标再删。
+                        const auto &raw = objects.raw();
+                        for (size_t k = 0; k < raw.size(); k++)
+                        {
+                            if (raw[k] == object)
+                            {
+                                objects.removeAt(k);
+                                break;
+                            }
+                        }
+                        live.erase(live.begin() + i);
+                        // 不递增：删掉后同一位置换成下一个
+                        limit = live.size() > 100 ? 100 : live.size();
+                        if (i >= limit)
+                        {
+                            break;
+                        }
                     }
                     else
                     {
-                        ++it;
+                        ++i;
                     }
                     ImGui::PopID();
                 }
@@ -311,19 +387,30 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                         for (auto it = objects.begin(); it != objects.end();)
                         {
                             empty = false;
-                            auto object = *it;
-                            char buff[64];
-                            sprintf(buff, "%s [%p]", setKlass->getName(), object);
+                            // 经句柄确认对象还在。直接解引用集合里的裸指针是危险的：
+                            // 对象一旦被回收，那块内存可能已被复用，->klass 读到的
+                            // 是别人的东西或随机值。
+                            auto object = ResolveSaved(*it);
+                            if (object == nullptr || object->klass == nullptr)
+                            {
+                                UnsaveObjectWithRoot(*it);
+                                it = objects.erase(it);
+                                continue;
+                            }
+                            char buff[256];
+                            snprintf(buff, sizeof(buff), "%s [%p]",
+                                     setKlass->getName() ? setKlass->getName() : "?", static_cast<void *>(object));
                             auto size = ImGui::GetWindowSize();
                             if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                             {
                                 onSelect(object);
                             }
-                            ImGui::SetItemTooltip("%s", object->klass->getName());
+                            ImGui::SetItemTooltip("%s", object->klass->getName() ? object->klass->getName() : "?");
                             ImGui::SameLine();
                             ImGui::PushID(buff);
                             if (ImGui::Button("Remove"))
                             {
+                                UnsaveObjectWithRoot(object);
                                 it = objects.erase(it);
                             }
                             else
@@ -387,19 +474,30 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 {
                     for (auto it = objects.begin(); it != objects.end();)
                     {
-                        auto object = *it;
-                        char buff[64];
-                        sprintf(buff, "%s [%p]", klass->getName(), object);
+                        // 经句柄确认对象还在。直接解引用集合里的裸指针是危险的：
+                        // 对象一旦被回收，那块内存可能已被复用，->klass 读到的
+                        // 是别人的东西或随机值。
+                        auto object = ResolveSaved(*it);
+                        if (object == nullptr || object->klass == nullptr)
+                        {
+                            UnsaveObjectWithRoot(*it);
+                            it = objects.erase(it);
+                            continue;
+                        }
+                        char buff[256];
+                        snprintf(buff, sizeof(buff), "%s [%p]", klass->getName() ? klass->getName() : "?",
+                                 static_cast<void *>(object));
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
                             onSelect(object);
                         }
-                        ImGui::SetItemTooltip("%s", object->klass->getName());
+                        ImGui::SetItemTooltip("%s", object->klass->getName() ? object->klass->getName() : "?");
                         ImGui::SameLine();
                         ImGui::PushID(buff);
                         if (ImGui::Button("Remove"))
                         {
+                            UnsaveObjectWithRoot(object);
                             it = objects.erase(it);
                         }
                         else
@@ -455,19 +553,30 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 {
                     for (auto it = objects.begin(); it != objects.end();)
                     {
-                        auto object = *it;
-                        char buff[64];
-                        sprintf(buff, "%s [%p]", klass->getName(), object);
+                        // 经句柄确认对象还在。直接解引用集合里的裸指针是危险的：
+                        // 对象一旦被回收，那块内存可能已被复用，->klass 读到的
+                        // 是别人的东西或随机值。
+                        auto object = ResolveSaved(*it);
+                        if (object == nullptr || object->klass == nullptr)
+                        {
+                            UnsaveObjectWithRoot(*it);
+                            it = objects.erase(it);
+                            continue;
+                        }
+                        char buff[256];
+                        snprintf(buff, sizeof(buff), "%s [%p]", klass->getName() ? klass->getName() : "?",
+                                 static_cast<void *>(object));
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
                             onSelect(object);
                         }
-                        ImGui::SetItemTooltip("%s", object->klass->getName());
+                        ImGui::SetItemTooltip("%s", object->klass->getName() ? object->klass->getName() : "?");
                         ImGui::SameLine();
                         ImGui::PushID(buff);
                         if (ImGui::Button("Remove"))
                         {
+                            UnsaveObjectWithRoot(object);
                             it = objects.erase(it);
                         }
                         else
@@ -528,26 +637,41 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 }
                 else
                 {
-                    for (auto it = objects.begin(); it != objects.end();)
+                    auto live = objects.liveObjects();
+                    for (size_t i = 0; i < live.size();)
                     {
-                        auto object = *it;
-                        char buff[64];
-                        sprintf(buff, "%s [%p]", prefix, object);
+                        auto object = live[i];
+                        if (object == nullptr || object->klass == nullptr)
+                        {
+                            ++i;
+                            continue;
+                        }
+                        char buff[256];
+                        snprintf(buff, sizeof(buff), "%s [%p]", prefix, static_cast<void *>(object));
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
                             onSelect(object);
                         }
-                        ImGui::SetItemTooltip("%s", object->klass->getName());
+                        ImGui::SetItemTooltip("%s", object->klass->getName() ? object->klass->getName() : "?");
                         ImGui::SameLine();
                         ImGui::PushID(buff);
                         if (ImGui::Button("Remove"))
                         {
-                            it = objects.erase(it);
+                            const auto &raw = objects.raw();
+                            for (size_t k = 0; k < raw.size(); k++)
+                            {
+                                if (raw[k] == object)
+                                {
+                                    objects.removeAt(k);
+                                    break;
+                                }
+                            }
+                            live.erase(live.begin() + i);
                         }
                         else
                         {
-                            ++it;
+                            ++i;
                         }
                         ImGui::PopID();
                     }
@@ -557,13 +681,21 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                     if (ImGui::Button("New"))
                     {
                         auto newObject = klass->New();
-                        newObjectMap[klass].push_back(newObject);
-                        if (Il2cpp::GetClassType(klass)->isValueType())
+                        if (newObject == nullptr)
                         {
-                            // Il2cpp::GC::KeepAlive(newObject);
-                            newObject = (Il2CppObject *)Il2cpp::GetUnboxedValue(newObject);
+                            LOGE("klass->New() 返回空（抽象类/无默认构造?）");
                         }
-                        onSelect(newObject);
+                        else
+                        {
+                            newObjectMap[klass].add(newObject);
+                            // 注意：这里必须传**装箱后的对象**。
+                            // 旧代码对值类型把 newObject 换成 GetUnboxedValue 的
+                            // 载荷指针再交给 onSelect，而 onSelect 之后会读
+                            // obj->klass / 调方法 —— 载荷指针根本不是 Il2CppObject，
+                            // 那是把别处的内存当对象头解引用。
+                            // 值类型的字段编辑路径会自己走 ensureIfValueType 拆箱。
+                            onSelect(newObject);
+                        }
                     }
                 }
             }
@@ -2011,6 +2143,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                               ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x, 0)))
             {
                 savedSet[currentObj->klass].insert(currentObj);
+                SaveObjectWithRoot(currentObj);
             }
             if (ImGui::IsItemHovered())
             {
@@ -2477,8 +2610,8 @@ void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
     }
 }
 
-std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> ClassesTab::objectMap;
-std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> ClassesTab::newObjectMap;
+std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> ClassesTab::objectMap;
+std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> ClassesTab::newObjectMap;
 std::unordered_map<Il2CppClass *, std::set<Il2CppObject *>> ClassesTab::savedSet;
 std::unordered_map<MethodInfo *, ClassesTab::OriginalMethodBytes> ClassesTab::oMap;
 std::unordered_map<Il2CppClass *, bool> ClassesTab::states;

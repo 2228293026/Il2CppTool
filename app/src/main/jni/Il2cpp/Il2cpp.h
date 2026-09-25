@@ -123,6 +123,226 @@ namespace Il2cpp
     {
         std::vector<Il2CppObject *> FindObjects(Il2CppClass *klass);
         void KeepAlive(Il2CppObject *object);
+
+        // ---- 强引用（GCHandle）----
+        //
+        // 工具会在很多地方长期缓存托管对象（选中要画 ESP 的 GameObject、
+        // 调用结果、扫描出来的实例……），但那些都是裸 Il2CppObject*。
+        // 托管侧一旦没有引用者，GC 就会回收它们，之后我们手上的指针是野的 ——
+        // 而且 IsNativeObjectAlive 这类检查本身也要先解引用指针才能调用，
+        // 所以「先判断再用」是防不住的。
+        //
+        // 正确做法是给缓存的对象加一个强 GCHandle：GC 会把它当作根，
+        // 只要我们不释放，对象就一直活着。get() 在对象已被回收时返回
+        // nullptr（而不是野指针），可以安全地判空。
+        //
+        // 注意：GCHandle 是「引用计数式资源」，必须与缓存一一对应释放，
+        // 否则对象永远收不掉（内存泄漏）。Release 之后再 get() 返回 null。
+        uint32_t NewHandle(Il2CppObject *object, bool pinned = false);
+        Il2CppObject *GetHandleTarget(uint32_t handle);
+        void FreeHandle(uint32_t handle);
+
+        // RAII 包装：析构时自动 FreeHandle。
+        // 适合「函数内临时保活」这类场景。
+        class ScopedHandle
+        {
+          public:
+            ScopedHandle() = default;
+            explicit ScopedHandle(Il2CppObject *object, bool pinned = false)
+            {
+                reset(object, pinned);
+            }
+            ScopedHandle(const ScopedHandle &) = delete;
+            ScopedHandle &operator=(const ScopedHandle &) = delete;
+            ScopedHandle(ScopedHandle &&other) noexcept
+                : m_handle(other.m_handle)
+            {
+                other.m_handle = 0;
+            }
+            ScopedHandle &operator=(ScopedHandle &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    release();
+                    m_handle = other.m_handle;
+                    other.m_handle = 0;
+                }
+                return *this;
+            }
+            ~ScopedHandle()
+            {
+                release();
+            }
+
+            void reset(Il2CppObject *object, bool pinned = false)
+            {
+                release();
+                m_handle = object ? NewHandle(object, pinned) : 0;
+            }
+            void release()
+            {
+                if (m_handle)
+                {
+                    FreeHandle(m_handle);
+                    m_handle = 0;
+                }
+            }
+            uint32_t get() const
+            {
+                return m_handle;
+            }
+            Il2CppObject *target() const
+            {
+                return m_handle ? GetHandleTarget(m_handle) : nullptr;
+            }
+            explicit operator bool() const
+            {
+                return m_handle != 0;
+            }
+
+          private:
+            uint32_t m_handle = 0;
+        };
+
+        // 一组被强引用的对象。
+        //
+        // 用于「工具会长期缓存一批对象」的场景：条目存活期间 GC 不会回收它们，
+        // 条目销毁时自动释放句柄。和 ScopedHandle 一样是 move-only ——
+        // 句柄只能有一个主人，浅拷贝会 double free 把 GC 句柄表写坏。
+        class RootedObjectList
+        {
+          public:
+            RootedObjectList() = default;
+            explicit RootedObjectList(std::vector<Il2CppObject *> objects)
+            {
+                reset(std::move(objects));
+            }
+            RootedObjectList(const RootedObjectList &) = delete;
+            RootedObjectList &operator=(const RootedObjectList &) = delete;
+            RootedObjectList(RootedObjectList &&other) noexcept
+            {
+                swap(other);
+            }
+            RootedObjectList &operator=(RootedObjectList &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset();
+                    swap(other);
+                }
+                return *this;
+            }
+            ~RootedObjectList()
+            {
+                reset();
+            }
+
+            // 接管一批对象并逐个加根。会先释放自己原有的句柄。
+            void reset(std::vector<Il2CppObject *> objects = {})
+            {
+                releaseHandles();
+                m_objects = std::move(objects);
+                m_handles.clear();
+                m_handles.reserve(m_objects.size());
+                for (auto *obj : m_objects)
+                {
+                    m_handles.push_back(obj ? NewHandle(obj) : 0);
+                }
+            }
+
+            // 丢掉所有对象和句柄
+            void releaseHandles()
+            {
+                for (auto handle : m_handles)
+                {
+                    if (handle)
+                    {
+                        FreeHandle(handle);
+                    }
+                }
+                m_handles.clear();
+                m_objects.clear();
+            }
+
+            // 只返回仍然有效的对象。
+            //
+            // 关键：有效性必须由**句柄**回答，不能直接看 m_objects 里的裸指针。
+            // 对象被回收后那个地址已经是野的，去解引用它就崩了。
+            // 顺带把已失效的条目就地剔除（并释放其句柄），避免列表无限膨胀。
+            std::vector<Il2CppObject *> liveObjects()
+            {
+                std::vector<Il2CppObject *> out;
+                out.reserve(m_objects.size());
+                for (size_t i = 0; i < m_objects.size(); i++)
+                {
+                    auto *obj = m_handles[i] ? GetHandleTarget(m_handles[i]) : m_objects[i];
+                    if (obj == nullptr)
+                    {
+                        if (m_handles[i])
+                        {
+                            FreeHandle(m_handles[i]);
+                        }
+                        continue;
+                    }
+                    // 句柄解析出的地址可能与缓存的原始地址不同（对象被移动过），
+                    // 同步更新，后续调用一律用新地址。
+                    m_objects[i] = obj;
+                    out.push_back(obj);
+                }
+                return out;
+            }
+
+            // 追加一个对象并为它加根。
+            void add(Il2CppObject *object)
+            {
+                m_objects.push_back(object);
+                m_handles.push_back(object ? NewHandle(object) : 0);
+            }
+
+            // 删除第 index 个对象并释放其句柄。
+            // 必须同时删两个数组 —— 句柄和对象一一对应，错位了就等于
+            // 拿 A 对象的句柄去保 B 对象（后者照样被回收）或重复释放。
+            void removeAt(size_t index)
+            {
+                if (index >= m_objects.size())
+                {
+                    return;
+                }
+                if (m_handles[index])
+                {
+                    FreeHandle(m_handles[index]);
+                }
+                m_objects.erase(m_objects.begin() + index);
+                if (index < m_handles.size())
+                {
+                    m_handles.erase(m_handles.begin() + index);
+                }
+            }
+
+            const std::vector<Il2CppObject *> &raw() const
+            {
+                return m_objects;
+            }
+            size_t size() const
+            {
+                return m_objects.size();
+            }
+            bool empty() const
+            {
+                return m_objects.empty();
+            }
+            void swap(RootedObjectList &other) noexcept
+            {
+                m_objects.swap(other.m_objects);
+                m_handles.swap(other.m_handles);
+            }
+
+          private:
+            std::vector<Il2CppObject *> m_objects;
+            // 与 m_objects 一一对应的句柄。拿不到句柄时（0）退化成裸指针并
+            // 照常工作 —— 不会因此崩，只是失去了 GC 保活保证。
+            std::vector<uint32_t> m_handles;
+        };
     } // namespace GC
 
     // other

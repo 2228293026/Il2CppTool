@@ -25,6 +25,51 @@ bool ObjectDrawManager::autoRefresh = true;
 
 ObjectDrawManager g_ObjectDrawManager;
 
+// 强引用句柄的归属跟着 GameObjectInfo 走。
+// 拷贝被禁止、只允许移动，是为了保证「一个 gchandle 恰好有一个主人」：
+// 浅拷贝会让两个条目共用同一个句柄，析构两次就 double free。
+GameObjectInfo::GameObjectInfo(GameObjectInfo &&other) noexcept
+    : gameObject(other.gameObject), transform(other.transform), worldPosition(other.worldPosition),
+      screenPosition(other.screenPosition), name(std::move(other.name)), isSelected(other.isSelected),
+      gameObjectHandle(other.gameObjectHandle), transformHandle(other.transformHandle)
+{
+    other.gameObjectHandle = 0;
+    other.transformHandle = 0;
+    other.gameObject = nullptr;
+    other.transform = nullptr;
+}
+
+GameObjectInfo &GameObjectInfo::operator=(GameObjectInfo &&other) noexcept
+{
+    if (this != &other)
+    {
+        // 先释放自己原有的句柄，否则会泄漏
+        Il2cpp::GC::FreeHandle(gameObjectHandle);
+        Il2cpp::GC::FreeHandle(transformHandle);
+
+        gameObject = other.gameObject;
+        transform = other.transform;
+        worldPosition = other.worldPosition;
+        screenPosition = other.screenPosition;
+        name = std::move(other.name);
+        isSelected = other.isSelected;
+        gameObjectHandle = other.gameObjectHandle;
+        transformHandle = other.transformHandle;
+
+        other.gameObjectHandle = 0;
+        other.transformHandle = 0;
+        other.gameObject = nullptr;
+        other.transform = nullptr;
+    }
+    return *this;
+}
+
+GameObjectInfo::~GameObjectInfo()
+{
+    Il2cpp::GC::FreeHandle(gameObjectHandle);
+    Il2cpp::GC::FreeHandle(transformHandle);
+}
+
 static MethodInfo* g_GetTransform = nullptr;
 static MethodInfo* g_GetPosition = nullptr;
 static MethodInfo* g_GetName = nullptr;
@@ -38,6 +83,48 @@ static bool g_autoAddAll = false;
 static Il2CppObject* g_MainCamera = nullptr;
 static MethodInfo* g_WorldToScreenPoint = nullptr;
 static MethodInfo* g_IsNativeObjectAlive = nullptr;
+
+// 给一个待绘制目标加根。
+//
+// 没有这个的时候，ESP 列表里的 GameObject 全是「悬着的裸指针」：一旦游戏侧
+// 不再引用它（例如切场景时销毁），GC 就会回收，我们手上的指针变野 ——
+// 而 IsValidGameObject 之类的检查必须先解引用指针才能调用，所以「先判断再用」
+// 根本防不住，只能靠强引用让它别被回收。
+static void RootGameObject(GameObjectInfo& info)
+{
+    if (info.gameObjectHandle == 0 && info.gameObject)
+    {
+        info.gameObjectHandle = Il2cpp::GC::NewHandle(info.gameObject);
+        if (info.gameObjectHandle == 0)
+        {
+            LOGW("GameObject 加根失败，ESP 目标可能在 GC 后失效");
+        }
+    }
+    if (info.transformHandle == 0 && info.transform)
+    {
+        info.transformHandle = Il2cpp::GC::NewHandle(info.transform);
+    }
+}
+
+// 通过句柄取回仍然有效的对象指针。对象已回收时返回 nullptr —— 此时绝不能
+// 去解引用 info.gameObject 那个旧地址。
+static Il2CppObject* ResolveGameObject(const GameObjectInfo& info)
+{
+    if (info.gameObjectHandle)
+    {
+        return Il2cpp::GC::GetHandleTarget(info.gameObjectHandle);
+    }
+    return info.gameObject;
+}
+
+static Il2CppObject* ResolveTransform(const GameObjectInfo& info)
+{
+    if (info.transformHandle)
+    {
+        return Il2cpp::GC::GetHandleTarget(info.transformHandle);
+    }
+    return info.transform;
+}
 
 static std::vector<Il2CppObject*> g_cachedGameObjects;
 static std::atomic<bool> g_needsRescan{false};
@@ -251,6 +338,9 @@ static void ProcessScannedObjects() {
                 newDrawObj.target.worldPosition = position;
                 newDrawObj.target.screenPosition = screen;
                 newDrawObj.target.name = std::move(name);
+                // 加根：自动添加的对象同样要保活，否则扫描列表一刷新
+                // （下一轮 FindObjects 之前）GC 就能把它收走
+                RootGameObject(newDrawObj.target);
                 newDrawObj.color = IM_COL32(rand() % 255, rand() % 255, rand() % 255, 255);
                 newDrawObj.thickness = 2.0f;
                 newDrawObj.drawLine = true;
@@ -291,10 +381,15 @@ void ObjectDrawManager::CleanupInvalidDrawObjects() {
     drawObjects.erase(
         std::remove_if(drawObjects.begin(), drawObjects.end(),
             [](const DrawObject& obj) {
-                return !IsValidGameObject(obj.target.gameObject);
+                // 先经句柄确认对象是否还在。直接拿 target.gameObject 去判活
+                // 是不行的：对象被回收后那个地址已经是野的，解引用它去读 klass
+                // 就崩了 —— 而这正是「清理失效对象」的代码本身最容易犯的错。
+                auto go = ResolveGameObject(obj.target);
+                return !IsValidGameObject(go);
             }),
         drawObjects.end()
     );
+    // erase 之后被移除的 GameObjectInfo 析构，句柄随之释放。
 }
 
 // 每帧调用：高频刷新 drawObjects 中对象的坐标
@@ -331,9 +426,11 @@ void ObjectDrawManager::Tick() {
     std::lock_guard<std::mutex> lock(g_drawMutex);
 
     for (auto& drawObj : drawObjects) {
-        auto go = drawObj.target.gameObject;
+        // 先经句柄取回对象。对象已被 GC 回收时句柄返回 nullptr，
+        // 这一步就是在「碰那个裸指针之前」拦住它 —— 之后的 klass/调用才安全。
+        auto go = ResolveGameObject(drawObj.target);
 
-        // 快速判活：先检查指针和 klass（比 IsNativeObjectAlive 快）
+        // 快速判活：句柄失效或指针/klass 为空就跳过
         if (!go || !go->klass) {
             drawObj.target.screenPosition.z = -1;
             continue;
@@ -341,10 +438,16 @@ void ObjectDrawManager::Tick() {
 
         try {
             // 获取 Transform（如果缓存的 transform 失效则重新获取）
-            Il2CppObject* transform = drawObj.target.transform;
+            // 同样走句柄：缓存的 transform 同样可能已被回收。
+            Il2CppObject* transform = ResolveTransform(drawObj.target);
             if (!transform || transform->klass != g_TransformClass) {
                 transform = go->invoke_method<Il2CppObject*>(g_GetTransform);
-                drawObj.target.transform = transform;
+                if (transform) {
+                    // 重新拿到的 transform 也要加根，否则下一帧它就可能消失
+                    Il2cpp::GC::FreeHandle(drawObj.target.transformHandle);
+                    drawObj.target.transformHandle = Il2cpp::GC::NewHandle(transform);
+                    drawObj.target.transform = transform;
+                }
             }
             if (!transform) {
                 drawObj.target.screenPosition.z = -1;
@@ -495,7 +598,15 @@ void ObjectDrawManager::Shutdown() {
     }
     {
         std::lock_guard<std::mutex> lock(g_drawMutex);
+        // clear() 析构每个 GameObjectInfo，句柄随之释放。
+        // 必须释放：句柄是 GC 的强根，漏掉就等于让游戏的对象永远回收不掉
+        // （反复开关菜单会持续泄漏）。
+        size_t before = drawObjects.size();
         drawObjects.clear();
+        if (before)
+        {
+            LOGI("释放 %zu 个已绘制对象的 GC 根", before);
+        }
     }
     g_lastObjectCount.store(0);
     g_rescanInProgress.store(false);
@@ -517,7 +628,16 @@ void ObjectDrawManager::SelectObject(const GameObjectInfo& obj) {
     }
 
     DrawObject newDrawObj;
-    newDrawObj.target = obj;
+    // obj 是 const 引用但 GameObjectInfo 现在禁止拷贝，所以要自己重建一个条目
+    // 并重新加根（不能直接搬 obj 的句柄过去：那会变成两个条目共用一个句柄，
+    // 析构两次就 double free）。
+    newDrawObj.target.gameObject = obj.gameObject;
+    newDrawObj.target.transform = obj.transform;
+    newDrawObj.target.worldPosition = obj.worldPosition;
+    newDrawObj.target.screenPosition = obj.screenPosition;
+    newDrawObj.target.name = obj.name;
+    newDrawObj.target.isSelected = obj.isSelected;
+    RootGameObject(newDrawObj.target);
     newDrawObj.color = IM_COL32(rand() % 255, rand() % 255, rand() % 255, 255);
     newDrawObj.thickness = 2.0f;
     newDrawObj.drawLine = true;
@@ -554,6 +674,8 @@ void ObjectDrawManager::SelectObject(Il2CppObject* gameObject) {
     DrawObject newDrawObj;
     newDrawObj.target.gameObject = gameObject;
     newDrawObj.target.name = std::move(name);
+    // 加根：只要这个条目在列表里，GC 就不能回收它。
+    RootGameObject(newDrawObj.target);
     newDrawObj.color = IM_COL32(rand() % 255, rand() % 255, rand() % 255, 255);
     newDrawObj.thickness = 2.0f;
     newDrawObj.drawLine = true;
@@ -675,6 +797,12 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
                 if (nameStr) info.name = nameStr->to_string();
             }
 
+            // 这个快照会被渲染线程拿着，直到用户点「添加」。那之前对象可能
+            // 被游戏销毁、被 GC 回收；点击时 SelectObject 会对这个裸指针加根，
+            // 而 NewHandle 传进去的若是已回收对象，GC 句柄表会被写坏。
+            // 所以在快照存活期间就加根，句柄随快照析构释放。
+            RootGameObject(info);
+
             result.push_back(std::move(info));
         } catch (...) {
             continue;
@@ -684,10 +812,14 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
 }
 
 void ObjectDrawManager::DrawUI() {
+    // 快照。GameObjectInfo 是 move-only（句柄只能有一个主人），
+    // 所以这里必须是 move 而不是拷贝 —— 拷贝的话两个 vector 共用同一批
+    // gchandle，析构时就会 double free，把 GC 的句柄表写坏。
+    // 锁的作用域正好到 move 为止，之后 drawSnapshot 与 drawObjects 无关。
     std::vector<DrawObject> drawSnapshot;
     {
         std::lock_guard<std::mutex> lock(g_drawMutex);
-        drawSnapshot = drawObjects;
+        drawSnapshot = std::move(drawObjects);
     }
 
     // UI 对象列表实时构建（只在打开UI时执行，不影响绘制性能）
@@ -724,6 +856,29 @@ void ObjectDrawManager::DrawUI() {
     ImGui::Text("缓存对象: %zu", CachedObjectCount());
     ImGui::Text("屏幕内对象: %zu", gameSnapshot.size());
     ImGui::Text("已绘制对象: %zu", drawSnapshot.size());
+
+    // GC 根数量。让「加根 / 释放」在界面上可见 —— 句柄只增不减意味着
+    // 游戏对象永远回收不掉（内存泄漏），这是加根实现最容易出的错。
+    {
+        size_t roots = 0;
+        size_t missing = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_drawMutex);
+            for (const auto &d : ObjectDrawManager::drawObjects)
+            {
+                if (d.target.gameObjectHandle)
+                    roots++;
+                else
+                    missing++;
+            }
+        }
+        ImGui::Text("GC 强引用: %zu%s", roots, missing ? " (!)" : "");
+        if (missing)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.2f, 1.f), "(%zu 个未加根)", missing);
+        }
+    }
 
     // 场景切换提示（几秒后自动消失）
     {
