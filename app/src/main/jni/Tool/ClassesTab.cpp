@@ -1515,7 +1515,32 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                                         }
                                         else if (isString)
                                         {
-                                            p.movPtr(Il2cpp::NewString(text.c_str()));
+                                            // 这个托管字符串会被**写进方法体**，
+                                            // 也就是说游戏每次调用这个方法都会拿到它。
+                                            // 不加 GC 根的话，游戏随时可能回收并复用这块内存 ——
+                                            // 用户的表现是「打上补丁之后，游戏在别的地方
+                                            // 莫名其妙地读到乱码/崩掉」，而且崩溃点离
+                                            // 真正的原因非常远。
+                                            //
+                                            // handle 放在 static 里**故意不释放**：
+                                            // 这个字符串的生命周期必须和补丁一样长，
+                                            // 而补丁可能被用户一直保留着。
+                                            // 一个 GCHandle 占几个字节，可以接受。
+                                            static std::vector<uint32_t> s_stringPatchHandles;
+                                            Il2CppString *patchString = Il2cpp::NewString(text.c_str());
+                                            if (patchString == nullptr)
+                                            {
+                                                LOGE("NewString 返回空，无法写入字符串补丁");
+                                                return false;
+                                            }
+                                            uint32_t handle = Il2cpp::GC::NewHandle(patchString);
+                                            if (handle == 0)
+                                            {
+                                                LOGE("字符串补丁加 GC 根失败，拒绝写入（否则可能被回收）");
+                                                return false;
+                                            }
+                                            s_stringPatchHandles.push_back(handle);
+                                            p.movPtr(patchString);
                                         }
                                         else
                                         {

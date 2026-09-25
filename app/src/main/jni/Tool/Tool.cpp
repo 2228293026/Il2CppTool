@@ -399,8 +399,17 @@ namespace Tool
         }
         g_dump.cancelRequested.store(false, std::memory_order_relaxed);
 
-        g_dump.worker = std::thread(
-            [](const std::string &path)
+        // std::thread 的构造函数**会抛** std::system_error（线程创建失败，
+        // 例如达到线程数上限、内存吃紧）。而 StartDump 是从 Tool::Dumper()
+        // → draw_thread 调进来的，那是**游戏的渲染线程**。
+        // 异常一路逃出去 = std::terminate = abort，用户看到的现象是
+        // 「点了一下 Dump，游戏直接没了」。
+        //
+        // 这里就地兜住：失败就报状态，UI 上显示「无法启动导出线程」。
+        try
+        {
+            g_dump.worker = std::thread(
+                [](const std::string &path)
             {
                 auto setState = [](DumpState s, const std::string &msg)
                 {
@@ -465,6 +474,23 @@ namespace Tool
                 }
             },
             outPath);
+        }
+        catch (const std::system_error &e)
+        {
+            std::lock_guard guard(g_dump.mutex);
+            g_dump.state = DumpState::Failed;
+            g_dump.message = std::string("无法启动导出线程: ") + e.what();
+            LOGE("StartDump: 创建 dump 线程失败: %s", e.what());
+            return false;
+        }
+        catch (const std::exception &e)
+        {
+            std::lock_guard guard(g_dump.mutex);
+            g_dump.state = DumpState::Failed;
+            g_dump.message = std::string("启动导出失败: ") + e.what();
+            LOGE("StartDump: %s", e.what());
+            return false;
+        }
 
         return true;
     }

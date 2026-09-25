@@ -6,7 +6,7 @@
 #include <chrono>
 #include <dlfcn.h>
 #include <cstdlib>
-#include <cstring>
+#include <filesystem>
 #include <cinttypes>
 #include <deque>
 #include <jni.h>
@@ -450,10 +450,23 @@ bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int,
     // 旧实现 open 失败时 outStream 处于 failbit 状态，后续所有 << 都静默
     // 什么都不做，最后照样打一条 "dump done!" —— 用户看到「完成」，
     // 但磁盘上一个字节都没有。
-    std::ofstream outStream(outDir, std::ios::out | std::ios::trunc);
+    // 直接 trunc 打开输出文件。
+    //
+    // 问题是导出过程**可能被用户中途取消**（进度界面有取消按钮），而
+    // 每次导出用的都是同一个文件名。于是「导到 40% 时取消」会把上一次
+    // 那份**完好的** .cs 截断掉 —— 用户白白重导一次，还可能没意识到
+    // 自己之前那份已经没了。
+    //
+    // 改成先写临时文件，成功结束时再改名替换：
+    //  - 取消/失败 → 临时文件被析构删除，原文件完好无损
+    //  - 成功     → rename 原子替换
+    const std::string finalPath{outDir};
+    const std::string tempPath{finalPath + ".part"};
+
+    std::ofstream outStream(tempPath, std::ios::out | std::ios::trunc);
     if (!outStream.is_open())
     {
-        LOGE("dump: 无法打开输出文件 %s", outDir);
+        LOGE("dump: 无法打开输出文件 %s", tempPath.c_str());
         return false;
     }
 
@@ -627,11 +640,30 @@ bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int,
     outStream.flush();
     if (!outStream.good())
     {
-        LOGE("dump: 写入 %s 时出错（存储空间不足?）", outDir);
+        LOGE("dump: 写入 %s 时出错（存储空间不足?）", tempPath.c_str());
         return false;
     }
     outStream.close();
-    LOGI("dump done! %s (%zu 个类)", outDir, doneClasses);
+
+    // 只有确认写完了，才把临时文件换成正式文件。
+    // 在此之前 cancel/失败/磁盘满，原来的 .cs 都还是完好的。
+    std::error_code ec;
+    std::filesystem::rename(tempPath, finalPath, ec);
+    if (ec)
+    {
+        // 目标已存在时 POSIX rename 是覆盖语义，不该失败；真失败就退回
+        // 「拷贝 + 删除」，再不行就报错。
+        std::filesystem::remove(finalPath, ec);
+        ec.clear();
+        std::filesystem::rename(tempPath, finalPath, ec);
+        if (ec)
+        {
+            LOGE("dump: 无法把 %s 改名为 %s: %s", tempPath.c_str(), finalPath.c_str(),
+                 ec.message().c_str());
+            return false;
+        }
+    }
+    LOGI("dump done! %s (%zu 个类)", finalPath.c_str(), doneClasses);
     return true;
 }
 

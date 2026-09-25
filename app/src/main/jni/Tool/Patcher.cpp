@@ -18,6 +18,50 @@ using namespace asmjit;
         }                                                                                                          \
     } while (0)
 
+// 在目标方法的原始字节里找出**第一条** ret 的偏移；找不到返回 -1。
+//
+// arm64 的 ret 只有一个标准编码：D65F03C0（小端字节序 C0 03 5F D6）。
+// 另有一族别名编码（ret xN 等价写法），这里不追求完备 —— 判不出来时
+// patch() 会保守地拒绝打补丁，宁可不给这个功能也不要悄悄改坏别的方法。
+#ifdef __aarch64__
+static long long FindFirstRetArm64(const uint8_t *p, size_t len)
+{
+    for (size_t i = 0; i + 3 < len; i += 4)
+    {
+        if (p[i] == 0xC0 && p[i + 1] == 0x03 && p[i + 2] == 0x5F && p[i + 3] == 0xD6)
+        {
+            return static_cast<long long>(i);
+        }
+    }
+    return -1;
+}
+#endif
+
+// 判断我们生成的 stub 是否**完整**。
+//
+// asmjit 的指令发射可能失败：分配器在内存吃紧的游戏里申请失败就是现实场景。
+// 而 CodeHolder 一旦进入错误状态，后续所有 emit 都会失败，于是缓冲区里可能
+// 只剩半条指令（比如光一个 movz），长度甚至比一条完整指令还短 —— 这种残缺
+// stub 被写进方法开头，方法既没有正确返回值也没有 ret，直接顺着自己的
+// 原始指令流跑下去，行为完全不可预测。
+//
+// 所以必须验证最后一条确实是 ret：一条「改返回值」的 stub 不可能不以 ret 收尾。
+static bool StubEndsWithRet(const std::vector<uint8_t> &bytes)
+{
+#ifdef __aarch64__
+    if (bytes.size() < 4)
+    {
+        return false;
+    }
+    const size_t last = bytes.size() - 4;
+    return bytes[last] == 0xC0 && bytes[last + 1] == 0x03 && bytes[last + 2] == 0x5F &&
+           bytes[last + 3] == 0xD6;
+#else
+    // arm32 未支持打补丁（见构造函数里的说明），保守判否。
+    return false;
+#endif
+}
+
 Patcher::Patcher(MethodInfo *method)
 {
     // 旧代码直接 method->methodPointer，method 或 methodPointer 为空就是空指针解引用。
@@ -234,6 +278,53 @@ std::vector<uint8_t> Patcher::patch()
         LOGE("Patcher::patch: asmjit 没产出任何指令，拒绝写入");
         return {};
     }
+
+    if (!StubEndsWithRet(bytes))
+    {
+        // 说明 emit 过程中出过错，缓冲区是残缺的。
+        // 写进去 = 方法没有正确的返回值也没有 ret，会顺着自己的原始指令流
+        // 一路跑下去。宁可拒绝。
+        LOGE("Patcher::patch: 生成的 stub 未以 ret 收尾（%zu 字节），"
+             "很可能 asmjit 发射失败，拒绝写入",
+             bytes.size());
+        return {};
+    }
+
+    // ---- 关键安全检查：stub 必须能装进这个方法里 ----
+    //
+    // il2cpp 把所有方法体**连续排布**在同一个 RX 段里，彼此紧挨着。
+    // arm64 上一个 stub 最长 20 字节（movPtr+ret / movInt64+ret），
+    // 而 il2cpp 里有大量 4~12 字节的方法体（ret / ldr w0,[x0,#8]; ret 这种）。
+    //
+    // 旧代码唯一的检查是 bytes.empty()，于是给一个 8 字节的方法打 20 字节的
+    // 补丁时，会把**下一个方法的序言**一起覆盖掉。用户当场看着补丁"生效了"，
+    // 然后在毫不相干的地方玩着玩着游戏就崩了 —— 崩点离真正的原因十万八千里。
+    //
+    // 做法是读原始字节，找到第一条 ret：原方法至少到那条 ret 为止。
+    // 我们的 stub 必须在那条 ret 结束之前或正好结束，否则就会溢出到邻居。
+#ifdef __aarch64__
+    {
+        constexpr size_t kScanWindow = 64; // 足够短，也不至于扫到无关代码
+        const size_t scanLen = std::min(kScanWindow, bytes.size());
+        const long long retOffset = FindFirstRetArm64((const uint8_t *)target, scanLen);
+        if (retOffset < 0)
+        {
+            LOGE("Patcher::patch: 在前 %zu 字节里找不到 ret，无法确认方法边界，拒绝写入", scanLen);
+            return {};
+        }
+        const long long methodEnd = retOffset + 4; // ret 自身占 4 字节
+        if (static_cast<long long>(bytes.size()) > methodEnd)
+        {
+            LOGE("Patcher::patch: stub(%zu 字节)装不下这个方法(到 ret 为止仅 %lld 字节)，"
+                 "写进去会覆盖下一个方法 —— 拒绝",
+                 bytes.size(), methodEnd);
+            return {};
+        }
+    }
+#else
+    LOGE("Patcher::patch: 非 arm64 平台不做方法边界校验，拒绝写入");
+    return {};
+#endif
 
     std::vector<uint8_t> originalBytes((uint8_t *)target, (uint8_t *)target + bytes.size());
     for (auto b : originalBytes)
