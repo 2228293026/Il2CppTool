@@ -1314,6 +1314,133 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             delete[] arrayParams;
     }
     ImGui::PopStyleColor(3);
+
+    // -----------------------------------------------------------------------
+    // 参数预设
+    //
+    // 反复调同一个方法、只改一两个值时，用软键盘重敲一遍非常折磨。
+    // 保存一次、之后一键载入。
+    //
+    // 只存**文本**。引用类型参数（对象）不存 —— 预设可能是几小时后才载入的，
+    // 那个对象早被 GC 回收了，复原陈旧指针就是 use-after-free。
+    // 载入时 object 一律清空，引用参数需要重新选一次（UI 上明确告知）。
+    // -----------------------------------------------------------------------
+    {
+        auto &presets = methodPresets[method];
+        auto &currentName = selectedPreset[method];
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("参数预设");
+
+        // 载入
+        if (presets.empty())
+        {
+            ImGui::TextDisabled("还没有预设。填好参数后点「存为预设」即可。");
+        }
+        else
+        {
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##preset", currentName.empty() ? "(未选择)" : currentName.c_str()))
+            {
+                for (const auto &p : presets)
+                {
+                    bool selected = (p.name == currentName);
+                    // 预设名是用户输入，同样要防 "##" 破坏控件 ID。
+                    std::string safeName;
+                    safeName.reserve(p.name.size());
+                    for (char c : p.name)
+                    {
+                        safeName.push_back(c == '#' ? '_' : c);
+                    }
+                    if (ImGui::Selectable((safeName + "##presetitem").c_str(), selected))
+                    {
+                        currentName = p.name;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("载入##presetload") && !currentName.empty())
+            {
+                const MethodPreset *found = nullptr;
+                for (const auto &p : presets)
+                {
+                    if (p.name == currentName)
+                    {
+                        found = &p;
+                        break;
+                    }
+                }
+                if (found && paramMap)
+                {
+                    auto &target = (*paramMap)[method];
+                    for (const auto &[key, text] : found->values)
+                    {
+                        auto &pv = target[key];
+                        pv.value = text;
+                        // 关键：清掉 object。预设里根本没存它（可能早就
+                        // 被 GC 回收了），留着旧的只会把野指针交给 VM。
+                        pv.object = nullptr;
+                    }
+                    LOGI("已载入参数预设 \"%s\"（%zu 个参数，引用类型需重新选择）",
+                         currentName.c_str(), found->values.size());
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("删除##presetdel") && !currentName.empty())
+            {
+                presets.erase(std::remove_if(presets.begin(), presets.end(),
+                                             [&currentName](const MethodPreset &p)
+                                             { return p.name == currentName; }),
+                              presets.end());
+                currentName.clear();
+            }
+        }
+
+        // 新建 / 覆盖
+        ImGui::SetNextItemWidth(-1.0f);
+        char nameBuf[64]{0};
+        // 预设名长度截断 —— 用户输入 + 软键盘，无界输入不能直接进固定缓冲。
+        snprintf(nameBuf, sizeof(nameBuf), "%s", newPresetName.c_str());
+        if (ImGui::InputTextWithHint("##presetname", "预设名（留空则用方法名）", nameBuf,
+                                     sizeof(nameBuf)))
+        {
+            newPresetName = nameBuf;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("存为预设##presetsave") && paramMap)
+        {
+            std::string name = newPresetName.empty() ? std::string(method->getName()) : newPresetName;
+            if (name.empty())
+            {
+                name = "(未命名)";
+            }
+            MethodPreset preset;
+            preset.name = name;
+            for (const auto &[key, pv] : (*paramMap)[method])
+            {
+                if (!pv.value.empty())
+                {
+                    // 只存文本。object 一律不存。
+                    preset.values[key] = pv.value;
+                }
+            }
+            auto &list = methodPresets[method];
+            auto existing = std::find_if(list.begin(), list.end(),
+                                         [&name](const MethodPreset &p) { return p.name == name; });
+            if (existing != list.end())
+            {
+                *existing = std::move(preset); // 同名覆盖
+            }
+            else
+            {
+                list.push_back(std::move(preset));
+            }
+            selectedPreset[method] = name;
+            newPresetName.clear();
+            Tool::ConfigSave();
+        }
+    }
     if (!callResults.at(method).empty())
     {
         ImGui::Separator();
@@ -3652,6 +3779,11 @@ bool ClassesTab::PollFilterResult()
     return true;
 }
 
+// 方法的稳定签名：类型全名 + 方法名 + 参数个数。
+// MethodInfo* 每次运行都不一样，只有签名能跨启动定位。
+// （to_json 在下面、定义在上面，所以需要先声明。）
+static std::string MethodSignature(MethodInfo *method);
+
 void to_json(nlohmann::ordered_json &j, const ClassesTab &p)
 {
     j["filter"] = p.filter;
@@ -3662,6 +3794,86 @@ void to_json(nlohmann::ordered_json &j, const ClassesTab &p)
     j["includeAllImages"] = p.includeAllImages;
     j["caseSensitive"] = p.caseSensitive;
     j["selectedImage"] = p.selectedImage->getName();
+
+    // 参数预设。
+    //
+    // **只写文本**，绝不写 ParamValue::object —— 那是托管对象指针，
+    // 反序列化时它早就失效了，写进去等于埋一个 use-after-free。
+    //
+    // 用 method 签名（类型全名 + 名字 + 参数个数）而不是 MethodInfo* 当 key：
+    // 指针在下次启动后没有意义，签名才有。
+    nlohmann::ordered_json presetsJson = nlohmann::ordered_json::object();
+    for (const auto &[method, list] : p.methodPresets)
+    {
+        if (list.empty() || method == nullptr)
+        {
+            continue;
+        }
+        nlohmann::ordered_json oneMethod = nlohmann::ordered_json::array();
+        for (const auto &preset : list)
+        {
+            nlohmann::ordered_json entry;
+            entry["name"] = preset.name;
+            entry["values"] = preset.values; // map<string,string>，安全
+            oneMethod.push_back(std::move(entry));
+        }
+        presetsJson[MethodSignature(method)] = std::move(oneMethod);
+    }
+    j["methodPresets"] = std::move(presetsJson);
+}
+
+// 方法的稳定签名：类型全名 + 方法名 + 参数个数。
+// MethodInfo* 每次运行都不一样，只有签名能跨启动定位。
+static std::string MethodSignature(MethodInfo *method)
+{
+    if (method == nullptr)
+    {
+        return {};
+    }
+    char buf[320]{0};
+    const char *owner = method->getClass() ? method->getClass()->getFullName().c_str() : "?";
+    snprintf(buf, sizeof(buf), "%s::%s/%zu", owner, method->getName() ? method->getName() : "?", method->getParamsInfo().size());
+    return buf;
+}
+
+// 按签名反查方法。读配置时用。
+//
+// 只在配置加载那一刻调用（那时 il2cpp 已就绪、类可枚举），不在热路径上。
+static MethodInfo *FindMethodBySignature(const std::string &signature)
+{
+    const size_t sep = signature.rfind('/');
+    const size_t colon = signature.rfind("::");
+    if (sep == std::string::npos || colon == std::string::npos || colon > sep)
+    {
+        return nullptr;
+    }
+    const std::string className = signature.substr(0, colon);
+    const std::string methodName = signature.substr(colon + 2, sep - colon - 2);
+    const std::string argCount = signature.substr(sep + 1);
+
+    for (auto image : g_Images)
+    {
+        if (image == nullptr)
+        {
+            continue;
+        }
+        for (auto klass : image->getClasses())
+        {
+            if (klass == nullptr || klass->getFullName() != className)
+            {
+                continue;
+            }
+            for (auto m : klass->getMethods())
+            {
+                if (m != nullptr && m->getName() == methodName &&
+                    std::to_string(m->getParamsInfo().size()) == argCount)
+                {
+                    return m;
+                }
+            }
+        }
+    }
+    return nullptr;
 }
 
 void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
@@ -3673,6 +3885,54 @@ void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
     j.at("showAllClasses").get_to(p.showAllClasses);
     j.at("includeAllImages").get_to(p.includeAllImages);
     j.at("caseSensitive").get_to(p.caseSensitive);
+
+    // 参数预设（可选字段，旧配置文件里没有 —— 用 find 而不是 at，
+    // at 找不到会抛 out_of_range，而 from_json 是在配置加载路径上调用的）。
+    if (auto it = j.find("methodPresets"); it != j.end() && it->is_object())
+    {
+        for (const auto &[signature, list] : it->items())
+        {
+            if (!list.is_array())
+            {
+                continue;
+            }
+            // 用签名反查方法。找不到就跳过 —— 游戏版本变了方法就没了，
+            // 这时丢掉预设比留着一条指向不存在方法的记录干净。
+            auto *method = FindMethodBySignature(signature);
+            if (method == nullptr)
+            {
+                continue;
+            }
+            std::vector<ClassesTab::MethodPreset> parsed;
+            for (const auto &entry : list)
+            {
+                ClassesTab::MethodPreset preset;
+                if (auto n = entry.find("name"); n != entry.end() && n->is_string())
+                {
+                    preset.name = n->get<std::string>();
+                }
+                if (auto v = entry.find("values"); v != entry.end() && v->is_object())
+                {
+                    for (const auto &[k, text] : v->items())
+                    {
+                        if (text.is_string())
+                        {
+                            preset.values[k] = text.get<std::string>();
+                        }
+                    }
+                }
+                if (!preset.name.empty())
+                {
+                    parsed.push_back(std::move(preset));
+                }
+            }
+            if (!parsed.empty())
+            {
+                p.methodPresets[method] = std::move(parsed);
+            }
+        }
+    }
+
     std::string selectedImage = j.at("selectedImage").get<std::string>();
     if (selectedImage.ends_with(".dll"))
     {

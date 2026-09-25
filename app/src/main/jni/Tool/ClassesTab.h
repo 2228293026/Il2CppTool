@@ -65,6 +65,29 @@ struct ClassesTab
     // 如果用户「打开软键盘的同时把标签页关掉」，tab 析构 → paramMap 析构 →
     // 回调里那个引用就是野的。shared_ptr 让回调持有一份，tab 先走也没事。
     std::shared_ptr<std::unordered_map<MethodInfo *, std::unordered_map<std::string, ParamValue>>> paramMap{};
+
+    // 方法调用参数「预设」。反复调同一个方法、只改一两个值时，
+    // 重新用软键盘敲一遍非常折磨；保存一次、之后一键载入。
+    //
+    // **只存文本，绝不存 Il2CppObject***。
+    // ParamValue::object 指向托管对象，而预设可能很久之后才被载入 ——
+    // 那个对象早被 GC 回收了。复原一个陈旧指针并交给 VM 就是
+    // use-after-free，而且会崩在毫不相干的地方。载入时会把 object 清成
+    // nullptr，引用类型参数需要用户重新选一次。这是有意的安全取舍：
+    // 宁可多一步，也不能复活野指针。
+    struct MethodPreset
+    {
+        std::string name;
+        // paramKey → 用户输入的文本
+        std::map<std::string, std::string> values;
+    };
+    // method → 该方法的若干预设（按保存顺序）
+    std::map<MethodInfo *, std::vector<MethodPreset>> methodPresets;
+    // 每个方法当前选中的预设名（供下拉框显示）
+    std::map<MethodInfo *, std::string> selectedPreset;
+    // UI 上正在输入的新预设名
+    std::string newPresetName;
+
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
     MethodList &buildMethodMap(Il2CppClass *klass);
