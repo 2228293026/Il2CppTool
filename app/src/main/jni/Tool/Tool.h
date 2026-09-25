@@ -56,6 +56,9 @@ namespace Tool
     void Hooker();
     void GameObjects();
     void Dumper();
+    // 停止并回收 dump 工作线程。必须在线程仍 joinable 时调用，
+    // 否则全局 std::thread 的析构会 std::terminate。
+    void ShutdownDumper();
     bool ToggleHooker(MethodInfo *method, int state = -1);
     void CalculateSomething();
     // 每帧在渲染线程调用：采样各 hook 的调用频率。

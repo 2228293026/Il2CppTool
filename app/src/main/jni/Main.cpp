@@ -779,6 +779,18 @@ void *hack_thread(void *)
     return nullptr;
 }
 
+// 在导出进行中时进程退出（用户强制停止游戏）也要安全收尾。
+// g_dump.worker 是全局 std::thread：析构时如果仍 joinable 就是
+// std::terminate —— 而这是我们**注入进别人游戏**的库，触发它等于
+// 让用户的游戏莫名其妙崩掉。
+//
+// atexit 在正常退出和 return/exit 时都会跑；配合进程被 SIGKILL 之外的
+// 终止路径，覆盖不到的情况就只能靠 OS 回收进程资源了。
+__attribute__((destructor)) void lib_cleanup()
+{
+    Tool::ShutdownDumper();
+}
+
 __attribute__((constructor)) void lib_main()
 {
     // Create a new thread so it does not block the main thread, means the game would not freeze

@@ -7,7 +7,15 @@
 
 #include "il2cpp-class.h"
 
-void il2cpp_dump(const char *outDir, const std::function<void(const char *, int, int)> &progress);
+// 导出 il2cpp 元数据到 outDir 指向的文件。
+//
+// progress(name, current, total) 每处理一个类回调一次，current/total 是
+// 跨 assembly 累计的类计数（所以进度条不会在某个大 assembly 上卡住不动）。
+// 回调返回 false 表示用户请求中止 —— 这也是唯一能在中途停下来的时机。
+//
+// 直接流式写盘，不在内存里累积整个 .cs 内容。
+// 返回 false 表示失败或被用户中止（此时文件里是**不完整**的内容）。
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress);
 
 namespace Il2cpp
 {

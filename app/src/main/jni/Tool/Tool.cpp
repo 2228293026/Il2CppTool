@@ -339,54 +339,80 @@ namespace Tool
 
     namespace
     {
-        // Dumper 的共享状态。旧实现里 currentDump 是渲染线程读、dump 线程写的
-        // std::string —— 并发读写 std::string 会破坏堆（realloc 时可能一边
-        // 释放一边被另一侧解引用）。
-        std::mutex g_dumpMutex;
-        std::string g_dumpProgress;
-        std::string g_dumpOutputPath;
+        // Dumper 的共享状态。
+        //
+        // 旧实现把进度放在渲染线程读、dump 线程写的 std::string 上 ——
+        // 并发读写 std::string 会破坏堆（realloc 时可能一边释放一边被
+        // 另一侧解引用）。
+        //
+        // 另一个旧问题：整个 Dumper 靠一堆函数内 static 来维持状态
+        // （static bool dumping / static future dump / static char outFile），
+        // 结果是**只能 dump 一次** —— 第一次跑完后 future 已经被消费，
+        // 再点 DUMP 什么也不会发生，但按钮看上去还是可点的。
+        // 现在换成显式的状态机。
+        enum class DumpState
+        {
+            Idle,
+            Running,
+            Done,
+            Failed,
+            Cancelled,
+        };
+
+        struct DumpStatus
+        {
+            std::mutex mutex;
+            DumpState state = DumpState::Idle;
+            std::string currentAssembly;
+            int current = 0;
+            int total = 0;
+            std::string message;
+            std::string outputPath;
+            // 渲染线程点「取消」时置位；dump 线程在每个类的进度回调里检查
+            std::atomic<bool> cancelRequested{false};
+            std::thread worker;
+        };
+        DumpStatus g_dump;
     } // namespace
 
-    void Dumper()
+    // 启动一次 dump。返回 false 表示已经有一次在跑。
+    static bool StartDump(const std::string &outPath)
     {
+        // 上一次已经结束的话，先把旧线程 join 掉再开新的。
+        // std::thread 析构时若仍 joinable 会直接 terminate —— 重复 dump
+        // 时这条路径必经。
+        if (g_dump.worker.joinable())
         {
-            std::lock_guard guard(g_dumpMutex);
-            if (!g_dumpProgress.empty())
-            {
-                ImGui::Text("Dumping %s", g_dumpProgress.c_str());
-            }
+            g_dump.worker.join();
         }
 
-        static bool dumping = false;
-        if (ImGui::Button("DUMP"))
         {
-            if (dumping)
-            {
-                std::lock_guard guard(g_dumpMutex);
-                g_dumpProgress = "are in progress or finished!";
-            }
-            else
-            {
-                dumping = true;
-            }
+            std::lock_guard guard(g_dump.mutex);
+            g_dump.state = DumpState::Running;
+            g_dump.currentAssembly.clear();
+            g_dump.current = 0;
+            g_dump.total = 0;
+            g_dump.message = "正在统计类数量…";
+            g_dump.outputPath = outPath;
         }
-        if (dumping)
-        {
-            // 路径长度不受控（包名 + 数据目录 + 版本号），固定缓冲 + 无界
-            // sprintf 就是栈溢出。std::string 让它自然增长。
-            static char outFile[1024];
-            snprintf(outFile, sizeof(outFile), "%s/%s_%s.cs", Il2cpp::getDataPath().c_str(),
-                     Il2cpp::getPackageName().c_str(), Il2cpp::getGameVersion().c_str());
+        g_dump.cancelRequested.store(false, std::memory_order_relaxed);
 
-            static bool dumped = false;
-            static std::future<void> dump = std::async(std::launch::async, [](const char *outPath) {
+        g_dump.worker = std::thread(
+            [](const std::string &path)
+            {
+                auto setState = [](DumpState s, const std::string &msg)
+                {
+                    std::lock_guard guard(g_dump.mutex);
+                    g_dump.state = s;
+                    g_dump.message = msg;
+                };
+
                 // dump 线程是 il2cpp 的 foreign thread：il2cpp_dump 会遍历
                 // domain / assembly / class，不 attach 到 VM 就是崩溃或错数据。
                 // 用完必须 detach，否则 attached-thread 表里留悬空条目。
                 if (!Il2cpp::EnsureAttached())
                 {
-                    std::lock_guard guard(g_dumpMutex);
-                    g_dumpProgress = "failed to attach to il2cpp VM";
+                    setState(DumpState::Failed, "无法 attach 到 il2cpp VM");
                     return;
                 }
                 struct DetachGuard
@@ -396,38 +422,166 @@ namespace Tool
 
                 try
                 {
-                    il2cpp_dump(outPath, [](const char *name, int i, int size) {
-                        std::lock_guard guard(g_dumpMutex);
-                        g_dumpProgress = name ? name : "";
-                    });
+                    bool ok = il2cpp_dump(
+                        path.c_str(),
+                        [](const char *name, int current, int total) -> bool
+                        {
+                            // 返回 false = 请求中止。
+                            if (g_dump.cancelRequested.load(std::memory_order_relaxed))
+                            {
+                                return false;
+                            }
+                            std::lock_guard guard(g_dump.mutex);
+                            g_dump.currentAssembly = name ? name : "";
+                            g_dump.current = current;
+                            g_dump.total = total;
+                            // 每 64 个类刷一次状态即可：进度回调是每个类
+                            // 都跑的，在里面抢锁没必要那么频繁。
+                            if (current % 64 == 0 || current == total)
+                            {
+                                g_dump.message = "正在导出…";
+                            }
+                            return true;
+                        });
+
+                    if (ok)
+                    {
+                        setState(DumpState::Done, "完成");
+                    }
+                    else
+                    {
+                        setState(DumpState::Cancelled, "已取消（文件内容不完整）");
+                    }
                 }
                 catch (const std::exception &e)
                 {
-                    std::lock_guard guard(g_dumpMutex);
-                    g_dumpProgress = std::string("dump failed: ") + e.what();
+                    setState(DumpState::Failed, std::string("导出失败: ") + e.what());
                 }
                 catch (...)
                 {
-                    std::lock_guard guard(g_dumpMutex);
-                    g_dumpProgress = "dump failed (unknown)";
+                    setState(DumpState::Failed, "导出失败（未知异常）");
                 }
             },
-                                               outFile);
-            if (!dumped && dump.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            outPath);
+
+        return true;
+    }
+
+    void ShutdownDumper()
+    {
+        // dump 线程必须 join：std::thread 析构时如果仍 joinable 会直接
+        // std::terminate —— 而 g_dump 是全局静态对象，进程退出时析构。
+        // 如果用户在导出中途关掉工具，这就是一条必崩的路径。
+        g_dump.cancelRequested.store(true, std::memory_order_relaxed);
+        if (g_dump.worker.joinable())
+        {
+            LOGI("等待 dump 线程退出…");
+            g_dump.worker.join();
+        }
+    }
+
+    void Dumper()
+    {
+        DumpState state;
+        std::string currentAssembly;
+        std::string message;
+        std::string outputPath;
+        int current = 0;
+        int total = 0;
+        {
+            std::lock_guard guard(g_dump.mutex);
+            state = g_dump.state;
+            currentAssembly = g_dump.currentAssembly;
+            message = g_dump.message;
+            outputPath = g_dump.outputPath;
+            current = g_dump.current;
+            total = g_dump.total;
+        }
+
+        switch (state)
+        {
+        case DumpState::Idle:
+            if (ImGui::Button("导出 .cs (DUMP)"))
             {
+                // 路径长度不受控（包名 + 数据目录 + 版本号），用 std::string
+                // 让它自然增长 —— 固定缓冲 + 无界 sprintf 就是栈溢出。
+                std::string outPath = Il2cpp::getDataPath() + "/" + Il2cpp::getPackageName() + "_" +
+                                      Il2cpp::getGameVersion() + ".cs";
+                if (outPath.find("unknown_") != std::string::npos)
                 {
-                    std::lock_guard guard(g_dumpMutex);
-                    g_dumpProgress = "Done";
+                    // 拿不到包名/版本时会退化成 unknown_*，那会写出一个
+                    // 用户根本认不出来的文件名。直接说明，不产出垃圾文件。
+                    LOGE("无法确定输出文件名（包名/版本读取失败）");
+                    std::lock_guard guard(g_dump.mutex);
+                    g_dump.state = DumpState::Failed;
+                    g_dump.message = "无法确定输出文件名：读不到包名或版本号";
                 }
-                dumped = true;
+                else
+                {
+                    StartDump(outPath);
+                }
             }
-            if (dumped)
+            break;
+
+        case DumpState::Running:
+        {
+            if (total > 0)
             {
-                if (ImGui::Button("复制路径"))
-                {
-                    Keyboard::Open(outFile, nullptr);
-                }
+                ImGui::ProgressBar((float)current / (float)total, ImVec2(-1, 0));
+                ImGui::Text("%d / %d 类 (%.1f%%)", current, total, 100.0f * current / (float)total);
             }
+            else
+            {
+                // 统计类数量本身也要走一遍元数据，这段期间 total 还是 0
+                ImGui::ProgressBar(0.f, ImVec2(-1, 0));
+            }
+            if (!currentAssembly.empty())
+            {
+                ImGui::TextDisabled("%s", currentAssembly.c_str());
+            }
+            if (!message.empty())
+            {
+                ImGui::TextDisabled("%s", message.c_str());
+            }
+            if (ImGui::Button("取消"))
+            {
+                g_dump.cancelRequested.store(true, std::memory_order_relaxed);
+            }
+            break;
+        }
+
+        case DumpState::Done:
+            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "导出完成");
+            if (ImGui::Button("复制路径"))
+            {
+                Keyboard::Open(outputPath.c_str(), nullptr);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("再导出一次"))
+            {
+                std::lock_guard guard(g_dump.mutex);
+                g_dump.state = DumpState::Idle;
+            }
+            break;
+
+        case DumpState::Cancelled:
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "已取消：%s", message.c_str());
+            ImGui::TextDisabled("文件里是**不完整**的内容，不适合直接使用");
+            if (ImGui::Button("再试一次"))
+            {
+                std::lock_guard guard(g_dump.mutex);
+                g_dump.state = DumpState::Idle;
+            }
+            break;
+
+        case DumpState::Failed:
+            ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "导出失败：%s", message.c_str());
+            if (ImGui::Button("重试"))
+            {
+                std::lock_guard guard(g_dump.mutex);
+                g_dump.state = DumpState::Idle;
+            }
+            break;
         }
     }
 

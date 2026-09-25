@@ -438,38 +438,114 @@ std::string dump_type(Il2CppType *type)
     return outPut.str();
 }
 
-void il2cpp_dump(const char *outDir, const std::function<void(const char *, int, int)> &progress)
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress)
 {
     LOGI("dumping...");
-    size_t size;
+    if (outDir == nullptr || *outDir == '\0')
+    {
+        LOGE("dump: 输出路径为空");
+        return false;
+    }
+    // 这里必须检查文件是否真的打开了。
+    // 旧实现 open 失败时 outStream 处于 failbit 状态，后续所有 << 都静默
+    // 什么都不做，最后照样打一条 "dump done!" —— 用户看到「完成」，
+    // 但磁盘上一个字节都没有。
+    std::ofstream outStream(outDir, std::ios::out | std::ios::trunc);
+    if (!outStream.is_open())
+    {
+        LOGE("dump: 无法打开输出文件 %s", outDir);
+        return false;
+    }
+
+    size_t size = 0;
     auto domain = il2cpp_domain_get();
+    if (domain == nullptr || il2cpp_domain_get_assemblies == nullptr)
+    {
+        LOGE("dump: 拿不到 il2cpp domain");
+        return false;
+    }
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
-    std::stringstream imageOutput;
-    // for (int i = 0; i < size; ++i)
-    // {
-    //     auto image = il2cpp_assembly_get_image(assemblies[i]);
-    //     imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
-    // }
-    std::vector<std::string> outPuts;
+    if (assemblies == nullptr || size == 0)
+    {
+        LOGE("dump: 没有可导出的 assembly");
+        return false;
+    }
+
+    // 先把每个 image 的类数量统计出来，作为进度条的分母。
+    //
+    // 旧实现的进度是「每个 assembly 报一次」，而一个 assembly（尤其是
+    // Assembly-CSharp）内部可能有好几千个类 —— 进度条会长时间卡在 0%，
+    // 然后突然跳到 100%，用户完全不知道它在干什么。
+    //
+    // 而且中途想中止也没法中止。
+    std::vector<size_t> classCounts(size, 0);
+    size_t totalClasses = 0;
+    for (size_t i = 0; i < size; ++i)
+    {
+        auto image = il2cpp_assembly_get_image(assemblies[i]);
+        if (image == nullptr)
+        {
+            continue;
+        }
+        if (il2cpp_image_get_class)
+        {
+            classCounts[i] = (size_t)il2cpp_image_get_class_count(image);
+        }
+        totalClasses += classCounts[i];
+    }
+
+    size_t doneClasses = 0;
+    // 进度回调返回 false 表示用户要求中止。
+    auto report = [&](const char *name) -> bool
+    {
+        if (progress)
+        {
+            return progress(name, (int)doneClasses, (int)totalClasses);
+        }
+        return true;
+    };
+
     if (il2cpp_image_get_class)
     {
         LOGI("Version greater than 2018.3");
         // 使用il2cpp_image_get_class
-        for (int i = 0; i < size; ++i)
+        for (size_t i = 0; i < size; ++i)
         {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
+            if (image == nullptr)
+            {
+                continue;
+            }
             std::stringstream imageStr;
             auto imageName = il2cpp_image_get_name(image);
-            progress(imageName, i, size);
-            imageStr << "\n// " << imageName << "\n";
-            auto classCount = il2cpp_image_get_class_count(image);
+            imageStr << "\n// " << (imageName ? imageName : "?") << "\n";
+
+            // 直接写文件，而不是攒在内存里最后再写。
+            //
+            // 旧实现把每个类的输出 push 进 outPuts，等全部跑完才落盘：
+            // 一次 dump 的全部 .cs 内容会同时驻留在内存里（大型游戏几百 MB），
+            // 而这个函数跑在后台线程、和游戏共享同一个进程 —— 挤占的是
+            // 用户的可用内存，OOM 时游戏先死。
+            outStream << imageStr.str();
+
+            auto classCount = (int)classCounts[i];
             for (int j = 0; j < classCount; ++j)
             {
+                // 每处理一个类就报一次进度并检查取消。
+                doneClasses++;
+                if (!report(imageName))
+                {
+                    LOGI("dump: 用户中止，已写入 %zu 个类", doneClasses);
+                    outStream.flush();
+                    return false;
+                }
                 auto klass = il2cpp_image_get_class(image, j);
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
-                // LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
+                outStream << dump_type(type);
             }
         }
     }
@@ -487,8 +563,8 @@ void il2cpp_dump(const char *outDir, const std::function<void(const char *, int,
         }
         else
         {
-            LOGI("miss Assembly::Load");
-            return;
+            LOGE("miss Assembly::Load");
+            return false;
         }
         if (assemblyGetTypes && assemblyGetTypes->methodPointer)
         {
@@ -496,50 +572,67 @@ void il2cpp_dump(const char *outDir, const std::function<void(const char *, int,
         }
         else
         {
-            LOGI("miss Assembly::GetTypes");
-            return;
+            LOGE("miss Assembly::GetTypes");
+            return false;
         }
         typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
-        // typedef _Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
         using Assembly_GetTypes_ftn = Il2CppArray<void *> *(*)(void *, void *);
-        for (int i = 0; i < size; ++i)
+        for (size_t i = 0; i < size; ++i)
         {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
-            std::stringstream imageStr;
+            if (image == nullptr)
+            {
+                continue;
+            }
             auto image_name = il2cpp_image_get_name(image);
-            imageStr << "\n// " << image_name;
-            // LOGD("image name : %s", image->name);
-            auto imageName = std::string(image_name);
-            auto pos = imageName.rfind('.');
-            auto imageNameNoExt = imageName.substr(0, pos);
+            outStream << "\n// " << (image_name ? image_name : "?");
+
+            std::string imageNameStr = image_name ? image_name : "";
+            auto pos = imageNameStr.rfind('.');
+            auto imageNameNoExt = imageNameStr.substr(0, pos);
             auto assemblyFileName = il2cpp_string_new(imageNameNoExt.data());
             auto reflectionAssembly =
                 ((Assembly_Load_ftn)assemblyLoad->methodPointer)(nullptr, assemblyFileName, nullptr);
+            if (reflectionAssembly == nullptr)
+            {
+                continue;
+            }
             auto reflectionTypes =
                 ((Assembly_GetTypes_ftn)assemblyGetTypes->methodPointer)(reflectionAssembly, nullptr);
+            if (reflectionTypes == nullptr)
+            {
+                continue;
+            }
             auto items = reflectionTypes->data;
             for (int j = 0; j < reflectionTypes->max_length; ++j)
             {
+                doneClasses++;
+                if (!report(image_name))
+                {
+                    LOGI("dump: 用户中止，已写入 %zu 个类", doneClasses);
+                    outStream.flush();
+                    return false;
+                }
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 auto type = il2cpp_class_get_type(klass);
-                // LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
-                outPuts.push_back(outPut);
+                outStream << dump_type(type);
             }
         }
     }
-    LOGI("write dump file");
-    // auto outPath = std::string(outDir).append("/dump.cs");
-    auto outPath = std::string(outDir);
-    std::ofstream outStream(outPath);
-    outStream << imageOutput.str();
-    auto count = outPuts.size();
-    for (int i = 0; i < count; ++i)
+
+    outStream.flush();
+    if (!outStream.good())
     {
-        outStream << outPuts[i];
+        LOGE("dump: 写入 %s 时出错（存储空间不足?）", outDir);
+        return false;
     }
     outStream.close();
-    LOGI("dump done! %s", outPath.c_str());
+    LOGI("dump done! %s (%zu 个类)", outDir, doneClasses);
+    return true;
 }
 
 bool il2cpp_api_init(void *handle)
