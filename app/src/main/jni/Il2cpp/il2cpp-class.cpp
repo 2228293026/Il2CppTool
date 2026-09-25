@@ -485,9 +485,22 @@ std::pair<Il2CppObject *, nlohmann::ordered_json> Il2CppObject::dump(const std::
     return {object, result};
 }
 
+// 元数据里的名字**可能**为 null —— getFullName() 里早就为此加过防护，
+// 注释写着「我确实遇到过 typeName 为 nullptr 的情况」。
+//
+// 但全代码库有 40 多处 `strcmp(type->getName(), "System.Int32")` 这种写法，
+// 逐个加判空既啰嗦又容易漏（漏一处就是一个空指针解引用）。
+//
+// 在**源头**兜住：取不到名字时返回 "?" 这个永不匹配任何真实类型名的哨兵。
+// strcmp 只会得到非 0，落到「未知类型」的兜底分支；
+// std::string(sentinel) 也合法，不再是 std::string(nullptr) 那种 UB。
+// 判断「名字是否有效」的地方仍可用 == "?" 来区分。
+static constexpr const char *kUnknownName = "?";
+
 const char *Il2CppClass::getName()
 {
-    return Il2cpp::GetClassName(this);
+    const char *name = (this != nullptr) ? Il2cpp::GetClassName(this) : nullptr;
+    return name != nullptr ? name : kUnknownName;
 }
 
 std::string Il2CppClass::getFullName()
@@ -626,7 +639,9 @@ std::vector<MethodInfo *> Il2CppClass::getMethods(const char *filter, bool inclu
 
 const char *MethodInfo::getName()
 {
-    return Il2cpp::GetMethodName(this);
+    // this 也可能是空（元数据被裁剪/解析失败）。
+    const char *name = (this != nullptr) ? Il2cpp::GetMethodName(this) : nullptr;
+    return name != nullptr ? name : kUnknownName;
 }
 
 Il2CppType *MethodInfo::getReturnType()
@@ -763,7 +778,8 @@ Il2CppImage *Il2CppClass::getImage()
 
 const char *Il2CppClass::getNamespace()
 {
-    return Il2cpp::GetClassNamespace(this);
+    const char *name = (this != nullptr) ? Il2cpp::GetClassNamespace(this) : nullptr;
+    return name != nullptr ? name : kUnknownName;
 }
 
 std::vector<FieldInfo *> Il2CppClass::getFields(bool includeParents)
@@ -805,16 +821,35 @@ std::vector<FieldInfo *> Il2CppClass::getFields(bool includeParents)
 
 MethodInfo *Il2CppClass::findMethod(const char *name, size_t idx)
 {
+    if (name == nullptr)
+    {
+        return nullptr;
+    }
     std::vector<MethodInfo *> found{};
     for (auto m : this->getMethods())
     {
-        const char *methodName = m->getName();
-        if (strstr(name, methodName) != nullptr)
+        const char *methodName = (m != nullptr) ? m->getName() : nullptr;
+        if (methodName == nullptr)
+        {
+            continue;
+        }
+        // 参数顺序原来反了：`strstr(name, methodName)` 是在**搜索串里找方法名**，
+        // 而 getMethods 的筛选（以及这个函数自己的意图）都是反过来 ——
+        // 「方法名里包含搜索串」。例如搜 "get" 时，反过来的写法会因为
+        // "get" 里没有 "get_Foo" 而**一个都匹配不上**，永远返回空。
+        if (strstr(methodName, name) != nullptr)
         {
             found.push_back(m);
         }
     }
 
+    if (found.empty())
+    {
+        // 旧代码这里是 `return found.back()` —— 空 vector 上调 back() 是 UB，
+        // 返回的是垃圾指针，调用方直接就解引用它了。
+        LOGE("findMethod: 类 %s 上没有匹配 \"%s\" 的方法", this->getName() ? this->getName() : "?", name);
+        return nullptr;
+    }
     if (idx >= found.size())
     {
         return found.back();
@@ -840,7 +875,8 @@ uintptr_t FieldInfo::getOffset()
 
 const char *FieldInfo::getName()
 {
-    return Il2cpp::GetFieldName(this);
+    const char *name = (this != nullptr) ? Il2cpp::GetFieldName(this) : nullptr;
+    return name != nullptr ? name : kUnknownName;
 }
 
 int64_t FieldInfo::getEnumStaticValue(FieldInfo *field)
@@ -990,7 +1026,8 @@ bool Il2CppType::isObject()
 
 const char *Il2CppType::getName()
 {
-    return Il2cpp::GetTypeName(this);
+    const char *name = (this != nullptr) ? Il2cpp::GetTypeName(this) : nullptr;
+    return name != nullptr ? name : kUnknownName;
 }
 
 Il2CppClass *Il2CppType::getClass()

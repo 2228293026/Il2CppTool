@@ -2495,7 +2495,16 @@ void ClassesTab::DrawTabMap()
     }
 }
 
-void ensureIfValueType(Il2CppObject *currentObj, std::vector<std::string> &paths, Il2CppObject *rootObj)
+// paths 是**只读**的（原签名是 vector&，但函数体只做复制和读取，从不写入）。
+// 这一点很重要：调用它的那些 lambda 之前用 &paths 捕获，而 paths 是
+// dataMap[rootObj].second —— DrawTabMap 里 `dataMap.erase(object)`
+// （用户关掉那个对象的标签页）会把它整个销毁，而 lambda 还躺在全局的
+// Keyboard::lastCallback 里等下一帧触发 → 对已销毁的 vector 取引用。
+//
+// 让签名变成 const& 就是在类型层面禁止这种别名捕获；调用处按值捕获即可
+// （一个几条短字符串的小 vector，每次交互复制一次，可忽略）。
+void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> &paths,
+                       Il2CppObject *rootObj)
 {
     // 这条路径把「被就地改写的值类型」写回它在父对象里的字段槽位。
     // 注意：il2cpp_field_set_value(obj, f, ptr) 是从 ptr 拷贝 f 长度的那几个字节
@@ -2974,7 +2983,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     std::string _, val;
                     iss >> _ >> val;
                     poper.Open("BooleanSelector",
-                               [currentObj, val, &paths, rootObj](const std::string &value)
+                               [currentObj, val, paths, rootObj](const std::string &value)
                                {
                                    bool b = value == "True";
                                    // split key by space
@@ -3003,7 +3012,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     // 预填值同样必须按声明类型格式化：预填对了，
                     // 「原样点确认」才是无损的。
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
-                                   [type, currentObj, val, &paths, rootObj](const std::string &text)
+                                   [type, currentObj, val, paths, rootObj](const std::string &text)
                                    {
                                        if (currentObj == nullptr)
                                        {
@@ -3031,7 +3040,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     std::string type, val;
                     iss >> type >> val;
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
-                                   [type, currentObj, val, &paths, rootObj](const std::string &text)
+                                   [type, currentObj, val, paths, rootObj](const std::string &text)
                                    {
                                        if (currentObj == nullptr)
                                        {
