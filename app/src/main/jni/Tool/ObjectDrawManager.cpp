@@ -80,12 +80,22 @@ static MethodInfo* g_GetName = nullptr;
 static Il2CppClass* g_CameraClass = nullptr;
 static Il2CppClass* g_GameObjectClass = nullptr;
 static Il2CppClass* g_TransformClass = nullptr;
+// 真实包围盒：GetComponent<Renderer>() 与 Renderer.get_bounds
+static MethodInfo* g_GetComponent = nullptr;
+static MethodInfo* g_GetBounds = nullptr;
+static Il2CppClass* g_RendererClass = nullptr;
+// 真实包围盒 → 屏幕矩形。定义在文件后面（挨着 DrawBox），这里先前置声明。
+static bool ComputeScreenBounds(Il2CppObject *gameObject, ImVec2 &outMin, ImVec2 &outMax);
 
 static bool g_drawAllObjects = false;
 static bool g_autoAddAll = false;
 // 是否在名字旁边显示到相机的距离。默认开：这是 ESP 里最有用的一个数值。
 static bool g_showDistance = true;
 static bool g_limitDistance = false;
+// 真实包围盒 vs 固定 ±20px。默认开真实包围盒 —— 固定尺寸让远处的
+// 大建筑和近处的小道具画出来一样大，完全没有尺寸信息。
+// 每个目标每帧要多 8 次投影 + 1 次 GetComponent，所以留开关。
+static bool g_useRealBounds = true;
 
 static Il2CppObject* g_MainCamera = nullptr;
 static MethodInfo* g_WorldToScreenPoint = nullptr;
@@ -506,6 +516,20 @@ void ObjectDrawManager::Tick() {
             screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
             drawObj.target.screenPosition = screen;
 
+            // 真实包围盒。拿不到就退回固定尺寸框（DrawBox 里处理）。
+            if (g_useRealBounds) {
+                ImVec2 bmin{}, bmax{};
+                if (ComputeScreenBounds(go, bmin, bmax)) {
+                    drawObj.target.screenBoundsMin = bmin;
+                    drawObj.target.screenBoundsMax = bmax;
+                    drawObj.target.hasScreenBounds = true;
+                } else {
+                    drawObj.target.hasScreenBounds = false;
+                }
+            } else {
+                drawObj.target.hasScreenBounds = false;
+            }
+
         } catch (...) {
             drawObj.target.screenPosition.z = -1;
         }
@@ -545,7 +569,12 @@ void ObjectDrawManager::DrawAll() {
         // 名称 + 距离画成两行。
         // 距离是判断「该不该打 / 打不打得到」最直接的信息，而屏幕坐标本身
         // 不含远近 —— 必须显式给出。
+        // 名字/距离跟着包围盒顶端走，而不是物体中心 —— 大物件的标签压在
+        // 中心很难对上，站在框上面才看得出这个标签属于哪个。
         ImVec2 namePos(x, y - 18);
+        if (drawObj.target.hasScreenBounds) {
+            namePos.y = drawObj.target.screenBoundsMin.y - 6.f;
+        }
         const bool showDist = g_showDistance && drawObj.target.hasDistance;
         if (showDist) {
             char distLabel[48];
@@ -643,6 +672,20 @@ void ObjectDrawManager::Initialize() {
     if (GameObjectClass) {
         g_GetTransform = GameObjectClass->getMethod("get_transform");
         g_GetName = GameObjectClass->getMethod("get_name");
+        // 拿 Renderer 组件用来算真实包围盒。
+        //
+        // GameObject.GetComponent<T>() 在 il2cpp 里是泛型方法，编译后名字是
+        // "GetComponent<Renderer>"（元数据里保留泛型参数）。这里必须用
+        // **泛型实例化后的名字**，用 "GetComponent" 单参版本拿到的是
+        // GetComponent(Type)，传错参数会取到 ScriptableObject/Component
+        // 之类的随便什么东西 —— 比拿不到更糟，因为它「成功」了。
+        g_GetComponent = GameObjectClass->getMethod("GetComponent<UnityEngine.Renderer>", 0);
+    }
+
+    auto RendererClass = Il2cpp::FindClass("UnityEngine.Renderer");
+    g_RendererClass = RendererClass;
+    if (RendererClass) {
+        g_GetBounds = RendererClass->getMethod("get_bounds");
     }
 
     auto TransformClass = Il2cpp::FindClass("UnityEngine.Transform");
@@ -670,9 +713,11 @@ void ObjectDrawManager::Initialize() {
         g_IsNativeObjectAlive = UnityObject->getMethod("IsNativeObjectAlive");
     }
 
-    LOGD("对象绘制管理器: 方法解析 -> transform=%p position=%p name=%p alive=%p w2s=%p",
+    LOGD("对象绘制管理器: 方法解析 -> transform=%p position=%p name=%p alive=%p w2s=%p "
+         "getComponent=%p bounds=%p",
          (void*)g_GetTransform, (void*)g_GetPosition, (void*)g_GetName,
-         (void*)g_IsNativeObjectAlive, (void*)g_WorldToScreenPoint);
+         (void*)g_IsNativeObjectAlive, (void*)g_WorldToScreenPoint,
+         (void*)g_GetComponent, (void*)g_GetBounds);
 }
 
 void ObjectDrawManager::Shutdown() {
@@ -836,10 +881,142 @@ void ObjectDrawManager::DrawLineToCenter(const DrawObject& drawObj) {
                      ImVec2(screenCenter.x, screenCenter.y + crossSize), drawObj.color, 2.0f);
 }
 
+// 算出对象的世界空间 AABB（轴对齐包围盒）在屏幕上的二维外接矩形。
+//
+// 为什么需要：旧的 DrawBox 是固定 ±20 像素 —— 一个远处的巨大建筑和一个
+// 近处的小道具画出来一样大，ESP 完全没有「这东西有多大」的信息。
+//
+// 做法：Renderer.bounds 给出世界空间的 center + extents（AABB），
+// 把 8 个角点逐个投影到屏幕，取 x/y 的最小/最大值。
+//
+// 一个必须处理的坑：WorldToScreenPoint 对 z<0（相机背后）的点返回的
+// x/y 是镜像的，直接参与 min/max 会得到一个横跨整个屏幕的假框。
+// 所以只采信相机前方的角点；一个都没采到就返回 false（物体整个在身后）。
+//
+// 返回 false 表示拿不到包围盒（没有 Renderer / 方法没解析 / 数值异常），
+// 调用方回退到固定尺寸。
+static bool ComputeScreenBounds(Il2CppObject *gameObject, ImVec2 &outMin, ImVec2 &outMax)
+{
+    if (!gameObject || !g_GetComponent || !g_GetBounds || !g_MainCamera || !g_WorldToScreenPoint)
+    {
+        return false;
+    }
+
+    Il2CppObject *renderer = nullptr;
+    try
+    {
+        renderer = gameObject->invoke_method<Il2CppObject *>(g_GetComponent);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (renderer == nullptr || renderer->klass != g_RendererClass)
+    {
+        // 没有渲染器（空物体、纯逻辑对象）—— 本来就画不出包围盒。
+        return false;
+    }
+
+    // UnityEngine.Bounds 是 struct（center + extents 两个 Vector3，24 字节）。
+    // il2cpp 的方法返回结构体走隐藏返回缓冲区，由 C++ 编译器按 sret 约定
+    // 处理，这里定义同样的布局即可。
+    struct UnityBounds
+    {
+        Vector3 center;
+        Vector3 extents;
+    };
+
+    UnityBounds bounds{};
+    try
+    {
+        bounds = renderer->invoke_method<UnityBounds>(g_GetBounds);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    // 数值校验：extents 非正、NaN、无穷 都说明这不是一个可用的包围盒。
+    // 拿着这种值去算 8 个角点会直接产出 NaN 屏幕坐标，画出乱线。
+    const Vector3 &c = bounds.center;
+    const Vector3 &e = bounds.extents;
+    const float coords[6] = {c.x, c.y, c.z, e.x, e.y, e.z};
+    for (float v : coords)
+    {
+        if (std::isnan(v) || std::isinf(v))
+        {
+            return false;
+        }
+    }
+    if (e.x < 0.f || e.y < 0.f || e.z < 0.f)
+    {
+        return false;
+    }
+
+    const float displayHeight = ImGui::GetIO().DisplaySize.y;
+    bool haveAny = false;
+    float minX = 0.f, maxX = 0.f, minY = 0.f, maxY = 0.f;
+
+    for (int i = 0; i < 8; ++i)
+    {
+        // 用位组合枚举 8 个角点：第 i 位为 1 就取 +extents，取 0 就取 -。
+        const Vector3 corner{c.x + ((i & 1) ? e.x : -e.x),
+                              c.y + ((i & 2) ? e.y : -e.y),
+                              c.z + ((i & 4) ? e.z : -e.z)};
+        Vector3 screen;
+        try
+        {
+            screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, corner);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        if (!(screen.z > 0.f) || std::isnan(screen.x) || std::isnan(screen.y) ||
+            std::isinf(screen.x) || std::isinf(screen.y))
+        {
+            continue;
+        }
+        const float sx = screen.x;
+        const float sy = displayHeight - screen.y;
+        if (!haveAny)
+        {
+            minX = maxX = sx;
+            minY = maxY = sy;
+            haveAny = true;
+        }
+        else
+        {
+            minX = std::min(minX, sx);
+            maxX = std::max(maxX, sx);
+            minY = std::min(minY, sy);
+            maxY = std::max(maxY, sy);
+        }
+    }
+
+    if (!haveAny)
+    {
+        return false;
+    }
+
+    outMin = ImVec2(minX, minY);
+    outMax = ImVec2(maxX, maxY);
+    return true;
+}
+
 void ObjectDrawManager::DrawBox(const DrawObject& drawObj) {
     auto drawList = ImGui::GetForegroundDrawList();
+
+    // 优先用真实包围盒；拿不到（没有 Renderer / 整个在相机背后 /
+    // 数值异常）时回退到固定尺寸。
+    if (drawObj.target.hasScreenBounds) {
+        drawList->AddRect(drawObj.target.screenBoundsMin, drawObj.target.screenBoundsMax,
+                          drawObj.color, 0.0f, 0, drawObj.thickness);
+        return;
+    }
+
     ImVec2 pos(drawObj.target.screenPosition.x, drawObj.target.screenPosition.y);
-    float boxSize = 20.0f;
+    const float boxSize = 20.0f;
     drawList->AddRect(ImVec2(pos.x - boxSize, pos.y - boxSize),
                      ImVec2(pos.x + boxSize, pos.y + boxSize),
                      drawObj.color, 0.0f, 0, drawObj.thickness);
@@ -932,6 +1109,19 @@ void ObjectDrawManager::DrawUI() {
     // 有了距离之后才可能有「只画近处」这种需求：场景里几百米外的东西
     // 画出来只是屏幕角落一堆看不清的点，还会遮挡视线。
     ImGui::Checkbox("显示距离", &g_showDistance);
+    if (ImGui::Checkbox("真实包围盒", &g_useRealBounds))
+    {
+        // GetComponent<Renderer>() 没解析出来时开这个也没用，直接告诉用户。
+        if (g_useRealBounds && !g_GetComponent)
+        {
+            LOGW("未解析到 GetComponent<UnityEngine.Renderer>，真实包围盒不可用");
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    {
+        ImGui::SetTooltip("用 Renderer.bounds 的真实大小画框，而不是固定像素。\n"
+                          "拿不到 Renderer（空物体/纯逻辑对象）时自动退回固定尺寸。");
+    }
     if (ImGui::Checkbox("限制最大距离", &g_limitDistance))
     {
         if (!g_limitDistance)

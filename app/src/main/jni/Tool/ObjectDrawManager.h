@@ -27,6 +27,14 @@ struct GameObjectInfo {
     float distance = 0.f;
     bool hasDistance = false;
 
+    // 真实包围盒投影到屏幕后的二维外接矩形（Renderer.bounds 的 8 个角点）。
+    // hasScreenBounds=false 时退回固定尺寸的框。
+    // 名字/距离文字画在 screenBoundsMin 的正上方，这样文字跟着框走，
+    // 而不是留在物体中心 —— 大物件的标签压在中心很难对上。
+    ImVec2 screenBoundsMin{0, 0};
+    ImVec2 screenBoundsMax{0, 0};
+    bool hasScreenBounds = false;
+
     // 强 GCHandle：只要我们还持有这个 GameObject，就给它加根，
     // 托管侧的 GC 就不会把它回收。gameObject/transform 这两个裸指针
     // 在此之前一直是被 GC 悬着的 —— 被回收后再拿去解引用就是随机崩溃。
