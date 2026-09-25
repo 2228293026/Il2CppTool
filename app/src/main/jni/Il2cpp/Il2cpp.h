@@ -13,7 +13,9 @@ namespace Il2cpp
 {
     //@formatter:off
 
-    void Init();
+    // 返回 false 表示 il2cpp 尚未就绪（API 表没解析出来，或等待 il2cpp_init 超时）。
+    // 调用方必须检查并放弃后续初始化，否则会在空指针上继续往下走。
+    bool Init();
     // void Dump(JavaVM *jvm);
     void Dump(JNIEnv *env);
     bool EnsureAttached();

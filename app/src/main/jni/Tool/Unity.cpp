@@ -17,6 +17,10 @@ extern bool fullScreen;
 
 bool Input_GetMouseButton(int n)
 {
+    // 同上：hook 失败时直通，绝不能调用空的原函数指针
+    if (!oInput_GetMouseButton)
+        return false;
+
     ImGuiIO &io = ImGui::GetIO();
 
     ImVec2 size{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
@@ -26,10 +30,14 @@ bool Input_GetMouseButton(int n)
 }
 int get_touchCount()
 {
+    // 输入 hook 没装成功时必须直通原函数，不能去调还为空的 o_get_touchCount
+    if (!o_get_touchCount)
+        return 0;
+
     ImGuiIO &io = ImGui::GetIO();
 
     auto count = o_get_touchCount();
-    if (count > 0)
+    if (count > 0 && Input)
     {
         // auto mousePresent = Input->invoke_static_method<bool>("get_mousePresent");
         // if (mousePresent)
@@ -74,12 +82,39 @@ int get_touchCount()
 namespace Unity
 {
     static Il2CppImage *g_Image; // REPLACE_* macro depends on g_Image
+
+    // 输入 hook 是否完整可用。false 时 get_touchCount / Input_GetMouseButton
+    // 必须直通，否则它们会调用还为空的原函数指针 → 跳进 0 地址。
+    static bool g_inputHooked = false;
+
     void HookInput()
     {
+        // 元数据没就绪 / 类名不存在时，直接放弃输入 hook，而不是硬着头皮解引用。
         g_Image = Il2cpp::GetImage("UnityEngine.InputLegacyModule"); // hack
+        if (!g_Image)
+        {
+            LOGE("找不到 UnityEngine.InputLegacyModule，跳过输入 hook");
+            return;
+        }
+        Input = g_Image->getClass("UnityEngine.Input");
+        if (!Input)
+        {
+            LOGE("找不到 UnityEngine.Input 类，跳过输入 hook");
+            return;
+        }
+
         REPLACE_NAME_ORIG("UnityEngine.Input", "get_touchCount", get_touchCount,
                           o_get_touchCount); // TODO: pass image to REPLACE macro
         REPLACE_NAME_ORIG("UnityEngine.Input", "GetMouseButton", Input_GetMouseButton, oInput_GetMouseButton);
-        Input = g_Image->getClass("UnityEngine.Input");
+
+        // 两个原函数指针都必须拿到，缺一个就不能接管输入
+        if (!o_get_touchCount || !oInput_GetMouseButton)
+        {
+            LOGE("输入 hook 安装不完整（touch=%p mouse=%p），直通原函数", (void *)o_get_touchCount,
+                 (void *)oInput_GetMouseButton);
+            g_inputHooked = false;
+            return;
+        }
+        g_inputHooked = true;
     }
 } // namespace Unity

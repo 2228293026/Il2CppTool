@@ -449,10 +449,12 @@ void ObjectDrawManager::Initialize() {
     if (CameraClass) {
         g_MainCamera = CameraClass->invoke_static_method<Il2CppObject*>("get_main");
         if (g_MainCamera) {
-            auto methods = g_MainCamera->klass->getMethods("WorldToScreenPoint");
-            if (methods.size() > 1) {
-                g_WorldToScreenPoint = methods[1];
-            }
+            // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有多个重载
+            // （含带 MonoOrStereoscopicEye 的两参版本），按下标取很容易挑错签名；
+            // 而 invoke 是按「尾部再塞一个 MethodInfo*」的约定直接 reinterpret 成函数指针调的，
+            // 签名一错就等于把隐藏参数喂到枚举参数的位置上 → 寄存器/栈错乱。
+            // 显式按名字 + 1 个参数找；找不到就留空，后面所有调用点都有判空。
+            g_WorldToScreenPoint = CameraClass->getMethod("WorldToScreenPoint", 1);
         }
     }
 

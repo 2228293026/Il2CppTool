@@ -5,6 +5,8 @@
 #include "Tool/Tool.h"
 #include "Tool/Util.h"
 #include "imgui/imgui.h"
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -12,6 +14,13 @@
 
 extern std::vector<Il2CppImage *> g_Images;
 extern Il2CppImage *g_Image;
+
+// 「Find Objects」后台扫描的结果交接：
+// 后台线程只往 g_pendingScanResults 写，真正并入 objectMap 由 UI 线程做。
+// objectMap 里的 vector 在 UI 里是被边遍历边 erase 的，如果让后台线程直接
+// objectMap[klass] = ...，UI 手上的引用会被整个换掉 → 迭代野指针 / UAF。
+static std::mutex g_scanResultMutex;
+static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> g_pendingScanResults;
 
 constexpr int MAX_CLASSES = 500;
 
@@ -30,8 +39,10 @@ void hookerHandler(void *address, DobbyRegisterContext *ctx)
         hookerData.time = 1.f;
 
         auto name = hookerData.method->getName();
-        char buffer[128]{0};
-        sprintf(buffer, "%p | %s", hookerData.method->getAbsAddress(), name);
+        // 方法名长度不受控（混淆过的 il2cpp 元数据可以很长），
+        // 128 字节固定缓冲 + 无界 sprintf 就是栈溢出。
+        char buffer[512]{0};
+        snprintf(buffer, sizeof(buffer), "%p | %s", (void *)hookerData.method->getAbsAddress(), name);
         if (!HookerData::visited.empty())
         {
             // auto &back = HookerData::visited.back();
@@ -98,7 +109,9 @@ ClassesTab::ClassesTab()
             break;
         }
     }
-    classes = selectedImage->getClasses();
+    // g_Image 为空时（il2cpp 还没就绪 / 没有可用 assembly）直接 getClasses() 是空指针解引用。
+    // 这里留空列表，让 UI 后续自己判空，而不是在构造期就崩。
+    classes = selectedImage ? selectedImage->getClasses() : std::vector<Il2CppClass *>{};
     filteredClasses = classes;
 }
 
@@ -125,21 +138,52 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                                      std::function<void(Il2CppObject *)> onSelect, bool canNew)
 {
     ImGui::PushID(id);
-    static std::unordered_map<void *, bool> scanState;
-    auto &scanning = scanState[klass];
+    // 扫描标记用 shared_ptr<atomic<bool>> 持有：后台线程拿到的地址必须稳定。
+    // 旧代码是 std::unordered_map<void*,bool> + 捕获 bool&，UI 往 map 里再插一个
+    // key 就会 rehash，那个引用当场悬空，后台线程再写就是堆破坏。
+    static std::unordered_map<void *, std::shared_ptr<std::atomic<bool>>> scanState;
+    std::shared_ptr<std::atomic<bool>> &scanFlag = scanState[klass];
+    if (!scanFlag)
+        scanFlag = std::make_shared<std::atomic<bool>>(false);
+    bool scanning = scanFlag->load();
     if (ImGui::Button("Find Objects"))
     {
-        scanning = true;
+        scanFlag->store(true);
+        auto keepAlive = scanFlag;
         std::thread(
-            [&scanning](Il2CppClass *klass)
+            [keepAlive](Il2CppClass *klass)
             {
-                objectMap[klass] = Il2cpp::GC::FindObjects(klass);
-                scanning = false;
+                // 后台线程是 il2cpp 的 foreign thread：GC::FindObjects 会 stop_gc_world
+                // 并遍历 GC 结构，不 attach 就是崩溃/静默错数据；用完必须 detach，
+                // 否则 il2cpp 的 attached-thread 表里会留下悬空条目。
+                if (Il2cpp::EnsureAttached())
+                {
+                    auto objs = Il2cpp::GC::FindObjects(klass);
+                    {
+                        std::lock_guard<std::mutex> lock(g_scanResultMutex);
+                        g_pendingScanResults[klass] = std::move(objs);
+                    }
+                    Il2cpp::Detach();
+                }
+                keepAlive->store(false);
             },
             klass)
             .detach();
     }
     ImGui::PopID();
+
+    // 把后台线程的结果并进来（objectMap 只在 UI 线程被改动）
+    {
+        std::lock_guard<std::mutex> lock(g_scanResultMutex);
+        if (!g_pendingScanResults.empty())
+        {
+            for (auto &[pendingKlass, pending] : g_pendingScanResults)
+            {
+                objectMap[pendingKlass] = std::move(pending);
+            }
+            g_pendingScanResults.clear();
+        }
+    }
     ImGuiIO &io = ImGui::GetIO();
     float width = io.DisplaySize.x;
     float height = io.DisplaySize.y;
@@ -551,13 +595,14 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
     if (!methodIsStatic && !thiz)
     {
         auto &thisParam = params["this"];
-        char thisLabel[128]{0};
-        sprintf(thisLabel, "%s this", Il2cpp::GetClassType(klass)->getName());
+        // 类名长度不受控，param.value 又是用户输入；固定 128 字节缓冲 + 无界 sprintf 会栈溢出。
+        // 另外旧写法 sprintf(dst, "%s = %s", dst, ...) 把 dst 同时当源和目标，是未定义行为。
+        std::string thisLabel = std::string(Il2cpp::GetClassType(klass)->getName()) + " this";
         if (!thisParam.value.empty())
         {
-            sprintf(thisLabel, "%s = %s", thisLabel, thisParam.value.c_str());
+            thisLabel += " = " + thisParam.value;
         }
-        if (ImGui::Button(thisLabel))
+        if (ImGui::Button(thisLabel.c_str()))
         {
             ImGui::OpenPopup("ThisObjectSelector");
         }
@@ -567,8 +612,10 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 ImGui::GetID("ThisObjectSelector"), klass, "this",
                 [&thisParam](Il2CppObject *object)
                 {
-                    char objStr[16]{0};
-                    sprintf(objStr, "%p", object);
+                    // 64 位下 "%p" 要 "0x" + 16 位十六进制 + '\0' = 19 字节，
+                    // 旧的 char[16] 必然溢出 3 字节。
+                    char objStr[32]{0};
+                    snprintf(objStr, sizeof(objStr), "%p", (const void *)object);
                     thisParam.value = objStr;
                     thisParam.object = object;
                     ImGui::CloseCurrentPopup();
@@ -581,18 +628,18 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
     {
         auto &[name, type] = paramsInfo[k];
 
-        char paramKey[64]{0};
-        sprintf(paramKey, "%p%s%d", method, name, k);
+        // paramKey 是 params 的键，必须完整唯一：方法地址 + 参数名 + 序号
+        char paramKey[256]{0};
+        snprintf(paramKey, sizeof(paramKey), "%p%s%d", (const void *)method, name, k);
         auto &param = params[paramKey];
 
-        char buttonLabel[128]{0};
-        sprintf(buttonLabel, "%s %s", type->getName(), name);
+        std::string buttonLabel = std::string(type->getName()) + " " + name;
         if (!param.value.empty())
         {
-            sprintf(buttonLabel, "%s = %s", buttonLabel, param.value.c_str());
+            buttonLabel += " = " + param.value;
         }
         ImGui::PushID(k);
-        if (ImGui::Button(buttonLabel))
+        if (ImGui::Button(buttonLabel.c_str()))
         {
             bool isString = strcmp(type->getName(), "System.String") == 0;
             if (type->isPrimitive() || isString)
@@ -635,8 +682,9 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             ImGuiObjectSelector(ImGui::GetID("ParamObjectSelector"), type->getClass(), name,
                                 [&param](Il2CppObject *object)
                                 {
-                                    char objStr[16]{0};
-                                    sprintf(objStr, "%p", object);
+                                    // 同上：64 位 %p 需要 19 字节，char[16] 必溢出
+                                    char objStr[32]{0};
+                                    snprintf(objStr, sizeof(objStr), "%p", (const void *)object);
                                     param.value = objStr;
                                     param.object = object;
                                     ImGui::CloseCurrentPopup();
@@ -677,8 +725,8 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
         {
             auto &[name, type] = paramsInfo[k];
 
-            char paramKey[64]{0};
-            sprintf(paramKey, "%p%s%d", method, name, k);
+            char paramKey[256]{0};
+            snprintf(paramKey, sizeof(paramKey), "%p%s%d", (const void *)method, name, k);
             auto &param = params[paramKey];
             LOGD("%s %s = %s", type->getName(), name, param.value.c_str());
             if (!param.value.empty())
@@ -814,8 +862,9 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                     }
                     else
                     {
-                        char resultStr[16]{0};
-                        sprintf(resultStr, "%p", result);
+                        // 64 位 "%p" 需要 19 字节，char[16] 必然溢出
+                        char resultStr[32]{0};
+                        snprintf(resultStr, sizeof(resultStr), "%p", (const void *)result);
                         callResults.at(method).push_back({resultStr, result});
                     }
                 }

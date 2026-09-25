@@ -5,14 +5,36 @@
 #define REPLACE_METHOD(methodInfo, to)                                                                                 \
     [&]                                                                                                                \
     {                                                                                                                  \
-        void *old = methodInfo->methodPointer;                                                                         \
-        void *n = methodInfo->replace(to);                                                                             \
-        LOGD(OBFUSCATE("%s::%s (%p -> %p) HOOKED"), methodInfo->getClass()->getFullName().c_str(),                     \
-             methodInfo->getName(), old, n);                                                                           \
+        if ((methodInfo) == nullptr || (methodInfo)->methodPointer == nullptr)                                           \
+        {                                                                                                              \
+            LOGE("REPLACE_METHOD: methodInfo 或 methodPointer 为空，跳过 hook");                                         \
+            return (void *)nullptr;                                                                                     \
+        }                                                                                                              \
+        void *old = (methodInfo)->methodPointer;                                                                        \
+        void *n = (methodInfo)->replace(to);                                                                            \
+        auto *_klass = (methodInfo)->getClass();                                                                        \
+        LOGD(OBFUSCATE("%s::%s (%p -> %p) HOOKED"), _klass ? _klass->getFullName().c_str() : "?",                       \
+             (methodInfo)->getName() ? (methodInfo)->getName() : "?", old, n);                                           \
         return n;                                                                                                      \
     }();
 // clang-format off
-#define REPLACE_NAME_METHOD_ORIG(methodInfo, to, orig)  orig = (decltype(orig))REPLACE_METHOD(methodInfo, to)
+// 只在 hook 真正成功时才写 orig。
+// 旧写法是无条件 `orig = (decltype(orig))REPLACE_METHOD(...)`，而 replace() 在
+// 「已经 hook 过」或「DobbyHook 失败」时会返回 nullptr —— 于是原函数指针被置成 0，
+// 游戏下一次调用这个方法就是跳进空地址。必须保留旧值。
+#define REPLACE_NAME_METHOD_ORIG(methodInfo, to, orig)                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        void *_new_orig = REPLACE_METHOD(methodInfo, to);                                                               \
+        if (_new_orig != nullptr)                                                                                      \
+        {                                                                                                              \
+            orig = (decltype(orig))_new_orig;                                                                          \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            LOGE("REPLACE_ORIG 失败(%s)：保留原函数指针不变", #to);                                                      \
+        }                                                                                                              \
+    } while (0)
 #define REPLACE_NAME_KLASS(klass, methodName, to)             REPLACE_METHOD(klass->getMethod(OBFUSCATE(methodName)), to)
 #define REPLACE_NAME_KLASS_ORIG(klass, methodName, to, orig)  REPLACE_NAME_METHOD_ORIG(klass->getMethod(OBFUSCATE(methodName)), to, orig)
 #define REPLACE_KLASS(klass, to)                        REPLACE_NAME_KLASS(klass, #to, to)

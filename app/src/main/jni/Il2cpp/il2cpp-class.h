@@ -411,6 +411,16 @@ struct BigDouble
 template <typename T>
 T Il2CppObject::invoke_method(MethodInfo *method)
 {
+    // 和按名字的重载保持一致：名字版会判空并返回 T{}，
+    // 这个 MethodInfo* 版以前直接 method->invoke<T>()，传 null 就是空指针解引用。
+    if (method == nullptr)
+    {
+        LOGW("invoke_method: null MethodInfo, skipped");
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     return method->invoke<T>(this);
 }
 
@@ -453,13 +463,25 @@ T Il2CppObject::invoke_method(MethodInfo *method, Args &&...args)
 template <typename T>
 void *MethodInfo::replace(T func)
 {
+    if (methodPointer == nullptr)
+    {
+        LOGE("replace: methodPointer 为空，拒绝 hook");
+        return nullptr;
+    }
     if (_isAlreadyHooked((uintptr_t)methodPointer))
     {
         LOGD("Already hooked");
         return nullptr;
     }
-    void *orig;
-    DobbyHook(methodPointer, (void *)func, &orig);
+    // 必须初始化并检查 DobbyHook 的返回值：旧代码忽略返回值，
+    // hook 失败时 orig 是未初始化值，还会把垃圾登记进 hooked map；
+    // 调用方再把 orig 赋给 o_xxx 原函数指针，游戏一调就跳进野地址。
+    void *orig = nullptr;
+    if (DobbyHook(methodPointer, (void *)func, &orig) != 0)
+    {
+        LOGE("replace: DobbyHook 失败 %s", getName() ? getName() : "?");
+        return nullptr;
+    }
     _addToHookedMap((uintptr_t)methodPointer, (uintptr_t)orig);
     return orig;
 }
@@ -518,17 +540,30 @@ T MethodInfo::invoke(Il2CppObject *instance, Args &&...args)
 template <typename T>
 T Il2CppObject::getField(const char *name)
 {
-    auto field = klass->getField(name);
+    auto field = klass ? klass->getField(name) : nullptr;
+    // 字段可能不存在（改名/裁剪过元数据），或者是继承自父类的字段
+    // （getField 是单类查找）。旧代码直接 field->getValue<T>() 就是空指针解引用。
+    if (field == nullptr)
+    {
+        LOGW("getField: 找不到字段 %s，返回默认值", name);
+        if constexpr (!std::is_void_v<T>)
+            return T{};
+        else
+            return;
+    }
     return field->getValue<T>(this);
-    //        auto offset = _getFieldOffset(name);
-    //        return (T) _getField(name);
-    //        return (T) (this + offset);
 }
 
 template <typename T>
 void Il2CppObject::setField(const char *name, T newValue)
 {
-    auto field = klass->getField(name);
+    auto field = klass ? klass->getField(name) : nullptr;
+    // 同 getField：字段不存在时不要解引用空 FieldInfo
+    if (field == nullptr)
+    {
+        LOGW("setField: 找不到字段 %s，写入被忽略", name);
+        return;
+    }
     return field->setValue<T>(this, newValue);
 }
 

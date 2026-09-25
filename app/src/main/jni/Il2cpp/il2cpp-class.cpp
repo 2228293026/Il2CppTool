@@ -136,16 +136,18 @@ nlohmann::ordered_json DumpObject(Il2CppObject *object, Il2CppType *type, std::v
         {
             LOGD("Unhandled primitive type: %s", type->getName());
             // Handle other primitive types here
-            auto str = object->invoke_method<Il2CppString *>("ToString")->to_string();
-            return str;
+            // 名字重载在方法缺失/指针为空时会返回 T{}（即 nullptr），
+            // 这里旧代码直接 ->to_string() 就是空指针解引用。
+            auto str = object->invoke_method<Il2CppString *>("ToString");
+            return str ? str->to_string() : std::string{};
         }
     }
     else if (type->isEnum())
     {
         if (object)
         {
-            auto str = object->invoke_method<Il2CppString *>("ToString")->to_string();
-            return str;
+            auto str = object->invoke_method<Il2CppString *>("ToString");
+            return str ? str->to_string() : std::string{};
         }
         else
         {

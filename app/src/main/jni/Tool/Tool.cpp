@@ -96,6 +96,17 @@ namespace Tool
             }
         }
         LOGINT(max);
+        // 必须夹紧：旧代码直接用 i-5，小屏/低分辨率时 i 很小 → max 变成 0 甚至负数。
+        // CircularBuffer(0) 之后内部 (_tail+1)%_max_size 直接除零崩掉；
+        // 负数转成 size_t 更是天文数字大小的分配。
+        max = std::clamp(max, 5, 200);
+
+        // 重建会整体换掉底层数组，而 hookerHandler 正在另一个线程往 visited 里 push。
+        // CircularBuffer 的移动赋值完全没加锁，并发重建就是 use-after-free。
+        // hookerHandler 持 hookerMtx，这里也持有即可与之串行化。
+        std::lock_guard guard(hookerMtx);
+        if (HookerData::visited.capacity() == static_cast<size_t>(max))
+            return; // 容量没变就别重建
         HookerData::visited = CircularBuffer<HookerTrace>(max);
     }
 
@@ -322,9 +333,14 @@ namespace Tool
         static MethodInfo *WorldToScreenPoint = []()
         {
             // public UnityEngine.Vector3 WorldToScreenPoint(UnityEngine.Vector3 position); // 0x28c04bc
-            auto M = cam->klass->getMethods("WorldToScreenPoint")[1];
+            // 不要用 getMethods(...)[1] 盲取下标：Camera.WorldToScreenPoint 有多个重载，
+            // 取错签名后 invoke 会把隐藏的 MethodInfo* 喂到枚举参数位置 → 栈/寄存器错乱。
+            auto M = cam ? cam->klass->getMethod("WorldToScreenPoint", 1) : nullptr;
             LOGPTR(M);
-            LOGPTR(M->methodPointer);
+            if (M)
+                LOGPTR(M->methodPointer);
+            else
+                LOGE("找不到 WorldToScreenPoint(Vector3)");
             return M;
         }();
 

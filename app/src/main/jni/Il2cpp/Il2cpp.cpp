@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <deque>
 #include <jni.h>
 #include <string>
 #include <vector>
@@ -541,11 +542,15 @@ void il2cpp_dump(const char *outDir, const std::function<void(const char *, int,
     LOGI("dump done! %s", outPath.c_str());
 }
 
-void il2cpp_api_init(void *handle)
+bool il2cpp_api_init(void *handle)
 {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies)
+    if (!il2cpp_domain_get_assemblies)
+    {
+        LOGE("Failed to initialize il2cpp api.");
+        return false;
+    }
     {
         Dl_info dlInfo;
         if (dladdr((void *)il2cpp_domain_get_assemblies, &dlInfo))
@@ -554,18 +559,36 @@ void il2cpp_api_init(void *handle)
         }
         LOGI("il2cpp_base: %" PRIx64 "", il2cpp_base);
     }
-    else
+
+    // 等游戏自己完成 il2cpp_init。必须有界：这条路径最终是在
+    // eglSwapBuffers 钩子里（即游戏的渲染线程）同步跑下来的，
+    // 原来的 while 死等一旦判断不成立就是游戏永久卡死 + ANR。
+    // 正常情况下第一次判断就该通过（能进 eglSwapBuffers 说明 il2cpp 已经起来了）。
+    //
+    // 还要先确认 il2cpp_is_vm_thread 这个符号真的解析出来了：
+    // init_il2cpp_api 对 xdl_sym 返回空是静默忽略的，Unity 版本对不上时
+    // 它可能是空函数指针，直接调用就是跳进 0 地址。
+    if (!il2cpp_is_vm_thread)
     {
-        LOGE("Failed to initialize il2cpp api.");
-        return;
+        LOGE("il2cpp_is_vm_thread 符号缺失（Unity 版本不匹配），放弃初始化");
+        return false;
     }
-    while (!il2cpp_is_vm_thread(nullptr))
+    constexpr int kMaxWaitSeconds = 10;
+    for (int i = 0; i < kMaxWaitSeconds; i++)
     {
-        LOGI("Waiting for il2cpp_init...");
+        if (il2cpp_is_vm_thread(nullptr))
+        {
+            //    auto domain = il2cpp_domain_get();
+            //    il2cpp_thread_attach(domain);
+            return true;
+        }
+        LOGI("Waiting for il2cpp_init... (%d/%d)", i + 1, kMaxWaitSeconds);
         sleep(1);
     }
-    //    auto domain = il2cpp_domain_get();
-    //    il2cpp_thread_attach(domain);
+    // 超时后必须让调用方知道：il2cpp 还没就绪，继续往下走 GetImages /
+    // GetAssembly / Unity::HookInput 全是空指针起步，不如直接放弃初始化。
+    LOGE("il2cpp_init not ready after %ds; 渲染线程不是 VM 线程，放弃初始化以免崩溃", kMaxWaitSeconds);
+    return false;
 }
 
 bool g_DoLog = true;
@@ -652,11 +675,12 @@ namespace UnityVersion
 
 namespace Il2cpp
 {
-    void Init()
+    bool Init()
     {
         auto handle = xdl_open("libil2cpp.so", 0);
-        il2cpp_api_init(handle);
+        bool ok = il2cpp_api_init(handle);
         xdl_close(handle);
+        return ok;
     }
 
     void Dump(JNIEnv *env)
@@ -793,6 +817,14 @@ namespace Il2cpp
 
     Il2CppImage *GetImage(Il2CppAssembly *assembly)
     {
+        // assembly 为空（模块名不对 / 元数据没就绪）时直接返回，
+        // 否则 il2cpp_assembly_get_image 会拿 0 当 this 解引用。
+        if (!assembly)
+        {
+            if (g_DoLog)
+                LOGE("GetImage: assembly 为空");
+            return nullptr;
+        }
         auto result = il2cpp_assembly_get_image(assembly);
         if (!result && g_DoLog)
             LOGE("GetImage return nullptr");
@@ -992,6 +1024,10 @@ namespace Il2cpp
         return classes;
     }
 
+    // 缓存必须自己持有那块内存。旧实现把局部 vector 的 data() 存进缓存，
+    // 函数一返回 vector 就析构，缓存里只剩野指针 —— 任何调用者一解引用就是 UAF。
+    // 用 deque 兜住：deque 增长不会让已有元素的引用失效，元素本身之后也不再改动。
+    static std::deque<std::vector<Il2CppClass *>> subClassesStorage;
     std::unordered_map<Il2CppClass *, std::tuple<Il2CppClass **, size_t>> subClassesCache;
     const std::tuple<Il2CppClass **, size_t> &GetSubClasses(Il2CppClass *klass)
     {
@@ -1006,8 +1042,11 @@ namespace Il2cpp
         {
             subClasses.push_back(subKlass);
         }
-        subClassesCache.insert(std::make_pair(klass, std::make_tuple(subClasses.data(), subClasses.size())));
-        return subClassesCache.at(klass);
+        subClassesStorage.push_back(std::move(subClasses));
+        auto &stored = subClassesStorage.back();
+        auto [pos, inserted] = subClassesCache.emplace(
+            klass, std::make_tuple(stored.data(), stored.size()));
+        return pos->second;
     }
 
     Il2CppType *GetClassType(Il2CppClass *klass)
@@ -1335,10 +1374,19 @@ namespace Il2cpp
 
             std::vector<Il2CppObject *> objects;
             // typedef void (*il2cpp_register_object_callback)(Il2CppObject **arr, int size, void *userdata);
+            // 这个回调是 il2cpp 通过 C 栈调进来的，绝不能让异常穿出去；
+            // 而且下面 stop_gc_world 之后一旦有异常逃出去，游戏的 GC 就永久停住（直接冻死）。
             auto callback = [](Il2CppObject **arr, int size, void *userdata)
             {
                 auto objects = reinterpret_cast<std::vector<Il2CppObject *> *>(userdata);
-                objects->insert(objects->end(), arr, arr + size);
+                try
+                {
+                    objects->insert(objects->end(), arr, arr + size);
+                }
+                catch (...)
+                {
+                    // 分配失败就少收一批，不能把异常抛回 il2cpp
+                }
             };
             if (unityVersionIsBelow202120)
             {
@@ -1380,11 +1428,32 @@ namespace Il2cpp
                         return il2cpp_alloc(size);
                     }
                 };
+                // RAII：stop_gc_world 之后必须保证 start_gc_world 一定被调用。
+                // 旧代码是顺序裸调，只要中间任何一步抛异常（分配失败、vector 扩容…）
+                // 就会带着「GC 已停」的状态退出，游戏的 GC 从此永久停摆 —— 直接冻死，
+                // 而且不会有任何报错。
+                struct GcWorldRestart
+                {
+                    bool stopped = false;
+                    ~GcWorldRestart()
+                    {
+                        if (stopped)
+                            il2cpp_start_gc_world();
+                    }
+                } worldGuard;
+
                 il2cpp_stop_gc_world();
+                worldGuard.stopped = true;
                 auto state = il2cpp_unity_liveness_allocate_struct(klass, 0, callback, &objects, realloc);
+                if (!state)
+                {
+                    LOGE("GC::FindObjects: liveness_allocate_struct 返回空");
+                    return objects; // 析构时自动重启 GC world
+                }
                 il2cpp_unity_liveness_calculation_from_statics(state);
                 il2cpp_unity_liveness_finalize(state);
                 il2cpp_start_gc_world();
+                worldGuard.stopped = false;
                 il2cpp_unity_liveness_free_struct(state);
             }
             LOGD("Found %lu objects", objects.size());

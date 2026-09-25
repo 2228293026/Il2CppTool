@@ -128,16 +128,22 @@ bool isLibraryLoaded(const char *libraryName)
     FILE *fp = fopen(OBFUSCATE("/proc/self/maps"), OBFUSCATE("rt"));
     if (fp != NULL)
     {
+        bool found = false;
         while (fgets(line, sizeof(line), fp))
         {
-            std::string a = line;
             if (strstr(line, libraryName))
             {
-                libLoaded = true;
-                return true;
+                found = true;
+                break;
             }
         }
+        // 旧代码在找到目标时就 return，漏掉 fclose —— 每次成功的库检测都泄漏一个 FILE。
         fclose(fp);
+        if (found)
+        {
+            libLoaded = true;
+            return true;
+        }
     }
     return false;
 }

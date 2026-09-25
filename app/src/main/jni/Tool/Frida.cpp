@@ -4,6 +4,7 @@
 #include "Il2cpp/Il2cpp.h"
 #include "Il2cpp/il2cpp-class.h"
 #include "Tool/Tool.h"
+#include <algorithm>
 
 // extern std::unordered_map<void *, HookerData> hookerMap;
 extern int maxLine;
@@ -11,28 +12,23 @@ extern std::vector<MethodInfo *> g_Methods;
 
 MethodInfo *binarySearchClosest(const uintptr_t addr)
 {
-    int left = 0;
-    int right = g_Methods.size() - 1;
+    // g_Methods 可能为空（游戏裁剪过元数据 / 还没构建完）。
+    // 旧实现是手写二分，退出时无条件 return g_Methods[right]：
+    // right 为 -1（表空，或 addr 小于所有方法）就是 g_Methods[-1] 越界读。
+    // 另外它把 (uintptr_t)methodPointer - addr 的结果截断进 int，64 位地址下也不可靠。
+    if (g_Methods.empty())
+        return nullptr;
 
-    while (left <= right)
-    {
-        int pivot = (left + right) / 2;
-        int comparison = (uintptr_t)g_Methods[pivot]->methodPointer - addr;
+    // g_Methods 按 methodPointer 升序。找第一个 >= addr 的位置，它的前一个就是最近的。
+    auto it = std::lower_bound(
+        g_Methods.begin(), g_Methods.end(), addr,
+        [](const MethodInfo *m, const uintptr_t &value) { return (uintptr_t)m->methodPointer < value; });
 
-        if (comparison == 0)
-        {
-            return g_Methods[pivot];
-        }
-        else if (comparison > 0)
-        {
-            right = pivot - 1;
-        }
-        else
-        {
-            left = pivot + 1;
-        }
-    }
-    return g_Methods[right];
+    if (it == g_Methods.end())
+        return g_Methods.back(); // addr 在所有方法之后
+    if (it == g_Methods.begin())
+        return *it; // addr 在所有方法之前
+    return *(it - 1);
 }
 namespace Frida
 {

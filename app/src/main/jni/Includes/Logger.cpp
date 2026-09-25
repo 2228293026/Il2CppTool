@@ -35,8 +35,11 @@ namespace logger
     void AddLog(const char *prefix, const char *fmt, ...)
     {
         int old_size = Buf.size();
+        // 需要 prefix + fmt + '\n' + '\0' 四部分。
+        // 旧代码只分配了 strlen(prefix)+strlen(fmt)+1，sprintf 必然多写 1 字节
+        // （'\n' 之后还要写 '\0'），等于每次打日志都堆溢出 1 字节。
         int modifiedFmtLength = strlen(prefix) + strlen(fmt);
-        char *modifiedBuf = new char[modifiedFmtLength + 1];
+        char *modifiedBuf = new char[modifiedFmtLength + 2];
 
         sprintf(modifiedBuf, "%s%s\n", prefix, fmt);
 
