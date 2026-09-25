@@ -5,6 +5,7 @@
 //
 
 #include <Includes/obfuscate.h>
+#include "Includes/NeverDestroyedMutex.h"
 #include "KittyMemory.h"
 #include <mutex>
 #include <vector>
@@ -19,7 +20,7 @@ struct mapsCache {
 };
 
 // 缓存会被渲染线程（找地址做补丁）和后台线程同时访问。
-static std::mutex g_mapsCacheMutex;
+static NeverDestroyedMutex g_mapsCacheMutex;
 
 static std::vector<mapsCache> __mapsCache;
 
@@ -29,7 +30,7 @@ static ProcMap findMapInCache(std::string id) {
     // 垃圾指针的 != NULL 判断会放行，getAbsoluteAddress 就算出
     // 「垃圾 + relativeAddr」返回给调用方了。现在 ProcMap 成员都有默认值。
     ProcMap ret;
-    std::lock_guard<std::mutex> guard(g_mapsCacheMutex);
+    std::lock_guard<NeverDestroyedMutex> guard(g_mapsCacheMutex);
     for (size_t i = 0; i < __mapsCache.size(); i++) {
         if (__mapsCache[i].identifier.compare(id) == 0) {
             ret = __mapsCache[i].map;
@@ -256,7 +257,7 @@ uintptr_t KittyMemory::getAbsoluteAddress(const char *libraryName, uintptr_t rel
     }
 
     if (useCache) {
-        std::lock_guard<std::mutex> guard(g_mapsCacheMutex);
+        std::lock_guard<NeverDestroyedMutex> guard(g_mapsCacheMutex);
         mapsCache cachedMap;
         cachedMap.identifier = libraryName;
         cachedMap.map        = libMap;

@@ -109,10 +109,25 @@ namespace ay
     // 所有 obfuscated_data 实例共用一把锁。
     // 单独给每个实例配一个 mutex 会让对象不能拷贝、且体积变大，
     // 而临界区只有几十字节的 XOR，没必要。
+    //
+    // 关键：这把锁**故意永不析构**。
+    //
+    // OBFUSCATE 宏展开成「函数内 static obfuscated_data」，它的析构函数
+    // 会在**库卸载**时（.fini_array / __cxa_atexit）运行，而析构里要拿这把锁。
+    // 如果锁本身是个普通 static，它的析构顺序和那些 obfuscated_data 之间的
+    // 先后是**不确定的**（跨翻译单元更没保证）。一旦锁先被析构，
+    // 之后再去 lock 一个已析构的 mutex 就是 UB —— 在 pthread 实现上
+    // 轻则死锁、重则崩溃。
+    //
+    // 而且现象极其难查：只在**游戏退出**时触发，表现为「退出时偶发卡死/崩溃」，
+    // 和工具功能毫无关联。
+    //
+    // 故意泄漏一个：整个进程生命周期内有效，进程退出时由内核回收。
+    // 代价是这一小块内存在进程结束前不归还 —— 可以忽略。
     inline std::mutex &obfuscateMutex()
     {
-        static std::mutex m;
-        return m;
+        static std::mutex *m = new std::mutex();
+        return *m;
     }
 
     template <size_type N, key_type KEY>

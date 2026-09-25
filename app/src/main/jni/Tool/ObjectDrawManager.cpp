@@ -1,4 +1,5 @@
 #include "ObjectDrawManager.h"
+#include "Includes/NeverDestroyedMutex.h"
 #include "Includes/Logger.h"
 #include <algorithm>
 #include <atomic>
@@ -7,8 +8,8 @@
 #include <mutex>
 #include <unordered_set>
 
-static std::mutex g_objectsMutex;
-static std::mutex g_drawMutex;
+static NeverDestroyedMutex g_objectsMutex;
+static NeverDestroyedMutex g_drawMutex;
 
 // 单调时钟（秒）。后台扫描线程不能碰 ImGui 上下文，所以计时统一走这里，
 // 不再用 ImGui::GetTime()（它读的是 GImGui->Time，属于渲染线程状态）。
@@ -159,14 +160,14 @@ static std::atomic<bool> g_shutdownRequested{false};
 static constexpr double SCENE_CHANGE_RATIO = 0.5;
 
 // 场景切换提示：在 UI 上告诉用户"有多少个对象因为场景切换被清掉了"
-static std::mutex g_noticeMutex;
+static NeverDestroyedMutex g_noticeMutex;
 static size_t g_sceneChangeRemoved = 0;
 static double g_sceneChangeNoticeTime = 0.0;
 static constexpr double SCENE_CHANGE_NOTICE_SECONDS = 6.0;
 
 static void SetSceneChangeNotice(size_t removed)
 {
-    std::lock_guard<std::mutex> lock(g_noticeMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_noticeMutex);
     g_sceneChangeRemoved = removed;
     g_sceneChangeNoticeTime = NowSeconds();
 }
@@ -275,7 +276,7 @@ static void RescanGameObjectsInBackground() {
             return;
         }
         {
-            std::lock_guard<std::mutex> lock(g_objectsMutex);
+            std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
             g_cachedGameObjects = std::move(objs);
         }
         g_rescanFinishTime.store(NowSeconds());
@@ -290,7 +291,7 @@ static void RescanGameObjectsInBackground() {
 static void ProcessScannedObjects() {
     std::vector<Il2CppObject*> snapshot;
     {
-        std::lock_guard<std::mutex> lock(g_objectsMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
         snapshot = g_cachedGameObjects;
     }
 
@@ -308,7 +309,7 @@ static void ProcessScannedObjects() {
             // 旧实现把用户手动挑的对象全删了，只留一行 logcat，用户视角就是"我选的东西凭空消失"。
             size_t before = 0, after = 0;
             {
-                std::lock_guard<std::mutex> lock(g_drawMutex);
+                std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
                 before = ObjectDrawManager::drawObjects.size();
                 ObjectDrawManager::drawObjects.erase(
                     std::remove_if(ObjectDrawManager::drawObjects.begin(),
@@ -320,7 +321,7 @@ static void ProcessScannedObjects() {
                 after = ObjectDrawManager::drawObjects.size();
             }
             {
-                std::lock_guard<std::mutex> lock(g_objectsMutex);
+                std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
                 g_cachedGameObjects.clear();
             }
             g_lastObjectCount.store(0);
@@ -338,7 +339,7 @@ static void ProcessScannedObjects() {
 
     // g_autoAddAll: 自动将新扫描到的对象加入绘制列表
     if (g_autoAddAll && g_MainCamera && g_WorldToScreenPoint) {
-        std::lock_guard<std::mutex> lock(g_drawMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
 
         // 用 unordered_set 快速判断对象是否已在 drawObjects 中
         std::unordered_set<Il2CppObject*> existing;
@@ -393,7 +394,7 @@ static void ProcessScannedObjects() {
 // 直接写 g_cachedGameObjects.size() 是数据竞争：后台线程会整体替换这个 vector，
 // 无锁读 size() 可能读到撕裂的值甚至已释放内存。
 static size_t CachedObjectCount() {
-    std::lock_guard<std::mutex> lock(g_objectsMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
     return g_cachedGameObjects.size();
 }
 
@@ -401,7 +402,7 @@ static size_t CachedObjectCount() {
 // UI 遍历的是快照，不能拿快照下标去索引原件（两者大小可能不同 → 越界写）。
 template <typename F>
 static void MutateDrawObject(Il2CppObject* gameObject, F&& fn) {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     for (auto& d : ObjectDrawManager::drawObjects) {
         if (d.target.gameObject == gameObject) {
             fn(d);
@@ -412,7 +413,7 @@ static void MutateDrawObject(Il2CppObject* gameObject, F&& fn) {
 
 // 清理 drawObjects 中已失效的对象（场景切换后或对象被销毁）
 void ObjectDrawManager::CleanupInvalidDrawObjects() {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     drawObjects.erase(
         std::remove_if(drawObjects.begin(), drawObjects.end(),
             [](const DrawObject& obj) {
@@ -463,7 +464,7 @@ void ObjectDrawManager::Tick() {
     Vector3 cameraPos{};
     const bool haveCameraPos = CameraWorldPosition(cameraPos);
 
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
 
     for (auto& drawObj : drawObjects) {
         // 先经句柄取回对象。对象已被 GC 回收时句柄返回 nullptr，
@@ -540,7 +541,7 @@ void ObjectDrawManager::Tick() {
 void ObjectDrawManager::DrawAll() {
     auto drawList = ImGui::GetForegroundDrawList();
 
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     for (const auto& drawObj : drawObjects) {
         if (drawObj.target.screenPosition.z <= 0)
             continue;
@@ -623,7 +624,7 @@ void ObjectDrawManager::DrawAll() {
     if (g_drawAllObjects) {
         std::vector<Il2CppObject*> snapshot;
         {
-            std::lock_guard<std::mutex> lock(g_objectsMutex);
+            std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
             snapshot = g_cachedGameObjects;
         }
 
@@ -730,11 +731,11 @@ void ObjectDrawManager::Shutdown() {
         g_scanThread.join();
 
     {
-        std::lock_guard<std::mutex> lock(g_objectsMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
         g_cachedGameObjects.clear();
     }
     {
-        std::lock_guard<std::mutex> lock(g_drawMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
         // clear() 析构每个 GameObjectInfo，句柄随之释放。
         // 必须释放：句柄是 GC 的强根，漏掉就等于让游戏的对象永远回收不掉
         // （反复开关菜单会持续泄漏）。
@@ -757,7 +758,7 @@ void ObjectDrawManager::Shutdown() {
 }
 
 void ObjectDrawManager::SelectObject(const GameObjectInfo& obj) {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     for (const auto& drawObj : drawObjects) {
         if (drawObj.target.gameObject == obj.gameObject) {
             return;
@@ -788,7 +789,7 @@ void ObjectDrawManager::SelectObject(Il2CppObject* gameObject) {
     if (!IsValidGameObject(gameObject))
         return;
 
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     for (const auto& drawObj : drawObjects) {
         if (drawObj.target.gameObject == gameObject) {
             return;
@@ -823,7 +824,7 @@ void ObjectDrawManager::SelectObject(Il2CppObject* gameObject) {
 }
 
 void ObjectDrawManager::DeselectAll() {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     drawObjects.clear();
 }
 
@@ -832,7 +833,7 @@ void ObjectDrawManager::AddDrawObject(const GameObjectInfo& obj) {
 }
 
 void ObjectDrawManager::RemoveDrawObject(Il2CppObject* gameObject) {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     drawObjects.erase(
         std::remove_if(drawObjects.begin(), drawObjects.end(),
                        [gameObject](const DrawObject& obj) {
@@ -843,7 +844,7 @@ void ObjectDrawManager::RemoveDrawObject(Il2CppObject* gameObject) {
 }
 
 void ObjectDrawManager::ClearAllDrawObjects() {
-    std::lock_guard<std::mutex> lock(g_drawMutex);
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
     drawObjects.clear();
 }
 
@@ -1034,7 +1035,7 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
     std::vector<GameObjectInfo> result;
     std::vector<Il2CppObject*> snapshot;
     {
-        std::lock_guard<std::mutex> lock(g_objectsMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
         snapshot = g_cachedGameObjects;
     }
 
@@ -1087,7 +1088,7 @@ void ObjectDrawManager::DrawUI() {
     // 锁的作用域正好到 move 为止，之后 drawSnapshot 与 drawObjects 无关。
     std::vector<DrawObject> drawSnapshot;
     {
-        std::lock_guard<std::mutex> lock(g_drawMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
         drawSnapshot = std::move(drawObjects);
     }
 
@@ -1165,7 +1166,7 @@ void ObjectDrawManager::DrawUI() {
         size_t roots = 0;
         size_t missing = 0;
         {
-            std::lock_guard<std::mutex> lock(g_drawMutex);
+            std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
             for (const auto &d : ObjectDrawManager::drawObjects)
             {
                 if (d.target.gameObjectHandle)
@@ -1184,7 +1185,7 @@ void ObjectDrawManager::DrawUI() {
 
     // 场景切换提示（几秒后自动消失）
     {
-        std::lock_guard<std::mutex> lock(g_noticeMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_noticeMutex);
         if (g_sceneChangeRemoved > 0 && (NowSeconds() - g_sceneChangeNoticeTime) < SCENE_CHANGE_NOTICE_SECONDS) {
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f),
                                "检测到场景切换，已清理 %zu 个失效对象（其余保留）", g_sceneChangeRemoved);

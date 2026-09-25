@@ -3,6 +3,7 @@
 //
 
 #include <algorithm>
+#include "Includes/NeverDestroyedMutex.h"
 #include <string>
 #include <locale>
 #include <codecvt>
@@ -653,18 +654,18 @@ Il2CppType *MethodInfo::getReturnType()
 // 这张表会被游戏线程上的 hook 回调（invoke 时查原地址）和 UI 线程
 // （装/卸 hook）同时访问，没有任何同步 —— unordered_map 并发 rehash
 // 就是堆破坏。
-static std::mutex g_hookedMutex;
+static NeverDestroyedMutex g_hookedMutex;
 std::unordered_map<uintptr_t, intptr_t> alreadyHooked{};
 
 bool MethodInfo::_isAlreadyHooked(uintptr_t ptr)
 {
-    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    std::lock_guard<NeverDestroyedMutex> guard(g_hookedMutex);
     return alreadyHooked.find(ptr) != alreadyHooked.end();
 }
 
 void MethodInfo::_addToHookedMap(uintptr_t ptr, uintptr_t oPtr)
 {
-    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    std::lock_guard<NeverDestroyedMutex> guard(g_hookedMutex);
     alreadyHooked[ptr] = oPtr;
 }
 
@@ -673,7 +674,7 @@ void MethodInfo::_addToHookedMap(uintptr_t ptr, uintptr_t oPtr)
 // 而 invoke 依然按旧记录跳向已经失效的 trampoline。
 void MethodInfo::_removeFromHookedMap(uintptr_t ptr)
 {
-    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    std::lock_guard<NeverDestroyedMutex> guard(g_hookedMutex);
     alreadyHooked.erase(ptr);
 }
 
@@ -747,7 +748,7 @@ uintptr_t MethodInfo::_getHookedMap(uintptr_t ptr)
     //
     // 这个函数是整个工具**最热**的 interop 路径 —— 所有 invoke /
     // invoke_static 模板都会先查一次表拿 trampoline。
-    std::lock_guard<std::mutex> guard(g_hookedMutex);
+    std::lock_guard<NeverDestroyedMutex> guard(g_hookedMutex);
     auto it = alreadyHooked.find(ptr);
     if (it != alreadyHooked.end())
     {

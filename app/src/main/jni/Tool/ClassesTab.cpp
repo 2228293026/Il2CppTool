@@ -1,4 +1,5 @@
 #include "ClassesTab.h"
+#include "Includes/NeverDestroyedMutex.h"
 #include "Il2cpp/Il2cpp.h"
 #include "KittyMemory/KittyMemory.h"
 #include "Tool/Keyboard.h"
@@ -20,7 +21,7 @@ extern Il2CppImage *g_Image;
 // 后台线程只往 g_pendingScanResults 写，真正并入 objectMap 由 UI 线程做。
 // objectMap 里的 vector 在 UI 里是被边遍历边 erase 的，如果让后台线程直接
 // objectMap[klass] = ...，UI 手上的引用会被整个换掉 → 迭代野指针 / UAF。
-static std::mutex g_scanResultMutex;
+static NeverDestroyedMutex g_scanResultMutex;
 static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> g_pendingScanResults;
 
 // savedSet 里是「用户手动保存、要长期留着」的对象，同样必须保活：
@@ -74,7 +75,7 @@ constexpr int MAX_CLASSES = 500;
 
 int maxLine{5};
 std::unordered_map<void *, HookerData> hookerMap;
-std::mutex hookerMtx;
+NeverDestroyedMutex hookerMtx;
 
 #ifndef USE_FRIDA
 void hookerHandler(void *address, DobbyRegisterContext *ctx)
@@ -274,7 +275,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 try
                 {
                     auto objs = Il2cpp::GC::FindObjects(klass);
-                    std::lock_guard<std::mutex> lock(g_scanResultMutex);
+                    std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
                     g_pendingScanResults[klass] = std::move(objs);
                 }
                 catch (const std::exception &e)
@@ -294,7 +295,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
 
     // 把后台线程的结果并进来（objectMap 只在 UI 线程被改动）
     {
-        std::lock_guard<std::mutex> lock(g_scanResultMutex);
+        std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
         if (!g_pendingScanResults.empty())
         {
             for (auto &[pendingKlass, pending] : g_pendingScanResults)

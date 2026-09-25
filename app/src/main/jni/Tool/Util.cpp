@@ -34,6 +34,12 @@ namespace Util
 
     std::string extractClassNameFromTypename(const char *typeName)
     {
+        // std::string(nullptr) 是 UB。调用方里既有类型名，也有可能传进来
+        // 一个解析失败的空指针。
+        if (typeName == nullptr)
+        {
+            return {};
+        }
         std::string nameStr{typeName};
         size_t dotIndex = nameStr.find_last_of('.');
         size_t ltIndex = nameStr.find_first_of("<");
@@ -54,6 +60,14 @@ namespace Util
                 if (dotIndex > ltIndex)
                 {
                     dotIndex = nameStr.find_last_of('.', ltIndex);
+                    // 泛型参数**之前**根本没有点（比如 "<>c__DisplayClass0"）：
+                    // find_last_of 找不到，返回 npos。而 npos + 1 会回绕成 0，
+                    // substr(0) 返回整个串，把 "<...>" 一起带进类名。
+                    // 旧代码没判这一点。
+                    if (dotIndex == std::string::npos)
+                    {
+                        return nameStr;
+                    }
                     classNamespace = nameStr.substr(0, dotIndex);
                 }
             }
@@ -77,10 +91,22 @@ namespace Util
     void FileWriter::open()
     {
         fileStream.open(this->fileName);
+        // 静默失败是这个工具里最伤的一种 bug：用户点了 Dump，进度条跑满、
+        // 提示成功，然后去游戏目录找不到文件 —— 因为数据目录不可写
+        // （权限、路径不存在），ofstream 构造失败却没人告诉任何人。
+        // 这里至少明确报错，并在 write() 里阻止继续写空文件。
+        if (!fileStream.is_open())
+        {
+            LOGE("无法写入文件: %s", this->fileName.c_str());
+        }
     }
 
     void FileWriter::write(const char *data)
     {
+        if (!fileStream.is_open() || data == nullptr)
+        {
+            return;
+        }
         fileStream << data;
         fileStream << std::endl;
     }
@@ -124,9 +150,17 @@ namespace ImGui
 {
     void ScrollWhenDraggingOnVoid_Internal(const ImVec2 &delta, ImGuiMouseButton mouse_button)
     {
-        ImGuiContext &g = *ImGui::GetCurrentContext();
+        // GetCurrentContext() 在 ImGui 还没初始化完（或正在销毁）时返回
+        // nullptr，而这里立刻解引用。CurrentWindow 同理：在 Begin/End
+        // 配对之外调用（比如已经在 EndChild 之后）就是空。
+        ImGuiContext *ctx = ImGui::GetCurrentContext();
+        if (ctx == nullptr)
+        {
+            return;
+        }
+        ImGuiContext &g = *ctx;
         ImGuiWindow *window = g.CurrentWindow;
-        if (!window->DC.NavWindowHasScrollY)
+        if (window == nullptr || !window->DC.NavWindowHasScrollY)
         {
             return;
         }
@@ -152,7 +186,13 @@ namespace ImGui
 
     bool IsItemHeld(float holdTime)
     {
-        ImGuiContext &g = *GImGui;
+        // 同上：GImGui 可能为空。
+        ImGuiContext *ctx = ImGui::GetCurrentContext();
+        if (ctx == nullptr)
+        {
+            return false;
+        }
+        ImGuiContext &g = *ctx;
         if (ImGui::IsItemActive())
         {
             if (g.HoveredIdTimer >= holdTime)
@@ -170,13 +210,24 @@ namespace ImGui
         dt += ImGui::GetIO().DeltaTime;
         if (dt >= .5f)
         {
-            currentFps = 1.f / ImGui::GetIO().DeltaTime;
+            // DeltaTime 为 0（首帧、或一帧被卡到零时长）时 1/x 是 inf，
+            // 印出来是 "FPS inf"，而 inf 再进 PlotLines 会把坐标轴的
+            // min/max 一起污染成 NaN，整张图可能直接画不出来。
+            const float delta = ImGui::GetIO().DeltaTime;
+            currentFps = (delta > 0.0f) ? (1.f / delta) : 0.f;
             dt = 0.f;
         }
         ImGui::Text("FPS %.1f", currentFps);
         PlotLines(label, fpsBuffer.data(), static_cast<int>(fpsBuffer.size()), 0, NULL, 0.0f, FLT_MAX, graphSize);
     }
 
+    // 注意：这是**命名空间作用域的全局对象**，构造函数里有 std::vector::resize，
+    // 会在库加载时（也就是在游戏进程里）执行。一旦分配失败抛 bad_alloc，
+    // 加载期就会直接 terminate —— 用户看到的现象是「游戏一启动就闪退」，
+    // 而且和本工具毫无关联，完全无法定位。
+    //
+    // 改成惰性初始化：只在第一次真正用到时才构造，构造失败也只影响这次
+    // 绘制，不会拖垮整个进程。
     class FpsTracker
     {
       public:
@@ -187,7 +238,9 @@ namespace ImGui
 
         void update(float deltaTime)
         {
-            fpsBuffer[currentFrame] = 1.0f / deltaTime;
+            // 同上：deltaTime 为 0 时 1/0 = inf，会被存进缓冲区并污染
+            // PlotLines 的纵轴。写 0 表示「这一帧没有有效数据」。
+            fpsBuffer[currentFrame] = (deltaTime > 0.0f) ? (1.0f / deltaTime) : 0.0f;
             currentFrame = (currentFrame + 1) % bufferSize;
         }
 
@@ -202,9 +255,13 @@ namespace ImGui
         std::vector<float> fpsBuffer;
     };
 
-    FpsTracker fpsTracker;
     void FpsGraph()
     {
+        // 函数内 static：构造推迟到第一次调用，库加载期不做任何分配。
+        // 构造异常（比如 bad_alloc）只在这里被 C++ 规则终结 —— 实际上
+        // std::vector 分配失败我们也无能为力，但至少不再发生在**加载期**，
+        // 那才是「游戏无理由闪退」最难查的时机。
+        static FpsTracker fpsTracker;
         fpsTracker.update(ImGui::GetIO().DeltaTime);
         ImGui::FpsGraph_Internal("FPS", fpsTracker.getFpsBuffer());
     }
