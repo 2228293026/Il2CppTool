@@ -6,6 +6,16 @@ namespace Keyboard
 {
     Il2CppClass *TouchScreenKeyboard = nullptr;
     Il2CppObject *openedKeyboard = nullptr;
+    // openedKeyboard 的 GC 强根。
+    //
+    // 键盘是**托管对象**，从 TouchScreenKeyboard.Open() 返回到我们
+    // Destroy() 它之间要横跨若干帧，期间游戏随时可能触发一次 GC。
+    // 裸指针被回收后，updateImpl() 里的 `openedKeyboard->invoke_method`
+    // 就是解引用野指针 —— 而且它发生在渲染线程的 eglSwapBuffers 钩子里，
+    // 崩了就是整个游戏崩。
+    // 句柄为 0 表示没打开键盘（也覆盖 NewHandle 失败的情况）。
+    uint32_t openedKeyboardHandle = 0;
+
     std::function<void(const std::string &)> lastCallback = nullptr;
 
     void Init()
@@ -35,6 +45,18 @@ namespace Keyboard
             LOGE("TouchScreenKeyboard.Open 返回空");
             return;
         }
+        // 上一次还没关就先关掉，否则旧键盘对象会一直挂在触屏上，
+        // 而且旧句柄泄漏。
+        if (openedKeyboardHandle != 0)
+        {
+            Il2cpp::GC::FreeHandle(openedKeyboardHandle);
+            openedKeyboardHandle = 0;
+        }
+        openedKeyboardHandle = Il2cpp::GC::NewHandle(kb);
+        if (openedKeyboardHandle == 0)
+        {
+            LOGW("键盘对象加根失败，后续状态查询可能读到已回收对象");
+        }
         openedKeyboard = kb;
         lastCallback = callback;
     }
@@ -44,22 +66,33 @@ namespace Keyboard
         lastCallback = nullptr;
 
         // private System.Void Destroy(); // 0x28c52e8
-        // protected override System.Void Finalize(); // 0x28c53b4
-        // 旧代码在这里 static 初始化并立刻解引用 openedKeyboard->klass：
-        // 键盘从没打开过时 openedKeyboard 是空的 → 空指针解引用。
+        // 旧代码在这里还额外调了一次 Finalize()。
+        //
+        // 那是**双重终结**：Finalize 是终结器，GC 迟早会自己调一次，
+        // 我们先手动调一遍等于让同一对象被终结两次 —— 托管侧的
+        // 资源释放跑两遍，行为未定义。而且它绕过正常的销毁路径。
+        // 只需要 Destroy 就够了。
+        //
+        // 另外这段只在键盘确实打开过时才做：openedKeyboard 为空时
+        // 旧代码静态初始化完就立刻解引用它。
         if (!openedKeyboard)
         {
+            if (openedKeyboardHandle != 0)
+            {
+                Il2cpp::GC::FreeHandle(openedKeyboardHandle);
+                openedKeyboardHandle = 0;
+            }
             return;
         }
-        auto Destroy = openedKeyboard->klass->getMethod("Destroy");
-        auto Finalize = openedKeyboard->klass->getMethod("Finalize");
+        auto Destroy = openedKeyboard->klass ? openedKeyboard->klass->getMethod("Destroy") : nullptr;
         if (Destroy)
         {
             Destroy->invoke_static<void>(openedKeyboard);
         }
-        if (Finalize)
+        if (openedKeyboardHandle != 0)
         {
-            Finalize->invoke_static<void>(openedKeyboard);
+            Il2cpp::GC::FreeHandle(openedKeyboardHandle);
+            openedKeyboardHandle = 0;
         }
         openedKeyboard = nullptr;
     }
@@ -146,11 +179,33 @@ namespace Keyboard
             }
             if (lastCallback)
             {
-                lastCallback(resultText);
-            }
+                // 关键：**先把回调搬走并清空状态，再调用它**。
+                //
+                // 旧顺序是 `lastCallback(resultText); Reset();`，而 Reset() 会
+                // 做 `lastCallback = nullptr` + 销毁键盘对象。问题在于：如果
+                // 回调内部又调了 Keyboard::Open()（链式输入，比如填完一个
+                // 参数接着问下一个），它刚设好的 lastCallback / openedKeyboard
+                // 会被紧随其后的 Reset() 全部抹掉 —— 用户点了确定，界面
+                // 「什么都没发生」。
+                //
+                // 先取走回调（同时清空 lastCallback 表达「本次已消费」），
+                // 再调用。回调里新开的那一轮就不受影响了。
+                auto callback = std::move(lastCallback);
+                lastCallback = nullptr;
+                callback(resultText);
 
-            Reset();
-            LOGD("Keyboard Done");
+                // 只有当回调**没有**重开键盘时才收尾销毁。
+                // 重开了就说明那是一个新的交互周期，把人家的对象留着。
+                if (!IsOpen())
+                {
+                    Reset();
+                    LOGD("Keyboard Done");
+                }
+            }
+            else
+            {
+                Reset();
+            }
         }
         else if (status != Visible)
         {

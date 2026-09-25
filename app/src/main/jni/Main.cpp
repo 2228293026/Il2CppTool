@@ -793,6 +793,9 @@ __attribute__((destructor)) void lib_cleanup()
     // std::terminate。而且它还在跑 il2cpp 调用 —— 不 join 就让进程退出，
     // 等于让一个正在遍历托管元数据的线程被强行掐掉。
     ClassesTabWorker::Shutdown();
+    // 释放软键盘的 GC 句柄。不释放就是一次句柄泄漏，而我们是注入进
+    // 别人进程的库 —— 漏的是游戏进程的 GC 句柄表。
+    Keyboard::Reset();
 }
 
 __attribute__((constructor)) void lib_main()
