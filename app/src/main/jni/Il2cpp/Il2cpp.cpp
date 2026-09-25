@@ -1324,7 +1324,27 @@ namespace Il2cpp
 
     const char *GetChars(Il2CppString *str)
     {
+        if (str == nullptr || !il2cpp_string_chars)
+        {
+            return nullptr;
+        }
         return reinterpret_cast<const char *>(il2cpp_string_chars(str));
+    }
+
+    // il2cpp 托管字符串的**字符数**。
+    //
+    // 关键：il2cpp 的字符串**不是** NUL 结尾的，长度只存在 length 字段里。
+    // 想按「已知长度」读出内容就必须问 il2cpp_string_length ——
+    // 靠 NUL 扫描会一路读进托管堆，直到碰巧撞上一个 0x0000 的字为止：
+    // 轻则尾部多出一串垃圾字符（用户看到的每个字符串都被污染），
+    // 重则读过页边界直接 SIGSEGV。
+    int32_t GetStringLength(Il2CppString *str)
+    {
+        if (str == nullptr || !il2cpp_string_length)
+        {
+            return 0;
+        }
+        return il2cpp_string_length(str);
     }
 
     Il2CppString *NewString(const char *str)
@@ -1362,9 +1382,22 @@ namespace Il2cpp
         return il2cpp_runtime_invoke(method, obj, params, exc);
     }
 
-    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params, int paramCount)
+    // 带异常出参的版本。
+    //
+    // 旧签名把 Il2CppException** 硬编码成 nullptr，于是**方法抛异常时**，
+    // 返回值是 null，UI 就显示 "the call returned null" —— 把「抛异常」
+    // 和「合法地返回 null」混为一谈。这个面板的卖点恰恰是
+    // 「查看返回值 / 异常」，说错比不说更糟。
+    //
+    // 现在让调用方能拿到异常对象自己判别。
+    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params,
+                                           int paramCount, Il2CppException **exception)
     {
-        return il2cpp_runtime_invoke_convert_args(method, obj, params, paramCount, nullptr);
+        if (method == nullptr)
+        {
+            return nullptr;
+        }
+        return il2cpp_runtime_invoke_convert_args(method, obj, params, paramCount, exception);
     }
 
     std::tuple<Il2CppAssembly **, size_t> assembliesCache{nullptr, 0};

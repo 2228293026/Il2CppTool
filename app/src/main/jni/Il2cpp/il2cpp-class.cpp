@@ -384,25 +384,67 @@ std::pair<Il2CppObject *, nlohmann::ordered_json> Il2CppObject::dump(const std::
             std::string _, val;
             iss >> _ >> val;
             auto objKlass = Il2cpp::GetObjectClass(object);
-            // LOGPTR(objKlass);
-            // LOGPTR(klass);
+            if (objKlass == nullptr)
+            {
+                return {nullptr, nlohmann::ordered_json()};
+            }
             // LOGD("%s | %s %s", objKlass->getFullName().c_str(), _.c_str(), val.c_str());
             auto type = Il2cpp::GetClassType(objKlass);
+            if (type == nullptr)
+            {
+                return {nullptr, nlohmann::ordered_json()};
+            }
             if (type->isArray())
             {
                 auto arr = (Il2CppArray<Il2CppObject *> *)object;
-                auto index = std::stoi(path);
+                // 同下：非数字路径不能让异常逃出去。
+                int index = 0;
+                try
+                {
+                    index = std::stoi(path);
+                }
+                catch (const std::exception &e)
+                {
+                    LOGE("dump: 数组下标 \"%s\" 不是数字: %s", path.c_str(), e.what());
+                    return {nullptr, nlohmann::ordered_json()};
+                }
                 object = arr->invoke_method<Il2CppObject *>("System.Collections.IList.get_Item", index);
             }
             else if (type->isList())
             {
                 auto list = (List<Il2CppObject *> *)object;
-                auto index = std::stoi(path);
+                // std::stoi 对非数字路径抛 std::invalid_argument。路径来自
+                // JSON 里的字段名，通常不会是数字，但用户可以编辑 JSON，
+                // 让异常逃出去就等于把整个游戏 terminate 掉。
+                int index = 0;
+                try
+                {
+                    index = std::stoi(path);
+                }
+                catch (const std::exception &e)
+                {
+                    LOGE("dump: 列表下标 \"%s\" 不是数字: %s", path.c_str(), e.what());
+                    return {nullptr, nlohmann::ordered_json()};
+                }
                 object = list->invoke_method<Il2CppObject *>("System.Collections.IList.get_Item", index);
             }
             else
             {
-                object = Il2cpp::GetFieldValueObject(object, objKlass->getField(val.c_str()));
+                // getField 是**单类**查找，继承来的字段返回 null。
+                //
+                // 而 dump() 枚举字段用的是 getFields(true)（含父类），
+                // 所以继承字段确实会出现在 JSON 里；ImGuiJson 又把这些键
+                // 喂回来当路径 —— 于是这里必然拿到 null，直接传给
+                // il2cpp_field_get_value_object 就是空指针解引用。
+                // 旧代码没有任何判空。
+                auto *field = objKlass->getField(val.c_str());
+                if (field == nullptr)
+                {
+                    LOGE("dump: 类 %s 上找不到字段 %s（继承字段请用父类路径）",
+                         objKlass->getName() ? objKlass->getName() : "?", val.c_str());
+                    return {nullptr, nlohmann::ordered_json()};
+                }
+                object = Il2cpp::GetFieldValueObject(object, field);
             }
             // LOGPTR(object);
         }
@@ -684,6 +726,13 @@ Il2CppObject *MethodInfo::getObject()
 
 uintptr_t MethodInfo::_getHookedMap(uintptr_t ptr)
 {
+    // 必须持锁。这张表会被游戏线程上的 hook 回调（invoke 时查原地址）
+    // 和 UI 线程（装/卸 hook）同时访问：unordered_map 在 rehash 时会
+    // 重建整个桶数组，另一线程此刻正在 find() 就是遍历已释放内存。
+    //
+    // 这个函数是整个工具**最热**的 interop 路径 —— 所有 invoke /
+    // invoke_static 模板都会先查一次表拿 trampoline。
+    std::lock_guard<std::mutex> guard(g_hookedMutex);
     auto it = alreadyHooked.find(ptr);
     if (it != alreadyHooked.end())
     {
@@ -865,9 +914,16 @@ bool Il2CppType::isPrimitive()
     static std::vector<const char *> CSPrimitive = {
         "System.Boolean", "System.Char",   "System.SByte", "System.Byte",   "System.Int16",  "System.UInt16",
         "System.Int32",   "System.UInt32", "System.Int64", "System.UInt64", "System.Single", "System.Double"};
+    // getName() 可能是 nullptr（getFullName() 里明确为此加了防护）。
+    // 这个函数对**每个参数**都会被调到，一个空的类型就够崩一次。
+    const char *typeName = this->getName();
+    if (typeName == nullptr)
+    {
+        return false;
+    }
     return std::find_if(CSPrimitive.begin(), CSPrimitive.end(),
-                        [this](const char *primitiveName)
-                        { return strcmp(this->getName(), primitiveName) == 0; }) != CSPrimitive.end();
+                        [typeName](const char *primitiveName)
+                        { return strcmp(typeName, primitiveName) == 0; }) != CSPrimitive.end();
 }
 
 bool Il2CppType::isValueType()
@@ -895,7 +951,13 @@ bool Il2CppType::isEnum()
 
 bool Il2CppType::isList()
 {
-    return std::string(this->getName()).starts_with("System.Collections.Generic.List");
+    // getName() 可能为 nullptr，而 std::string(nullptr) 是 UB。
+    const char *typeName = this->getName();
+    if (typeName == nullptr)
+    {
+        return false;
+    }
+    return std::string(typeName).starts_with("System.Collections.Generic.List");
 }
 
 bool Il2CppType::isArray()
@@ -938,8 +1000,27 @@ Il2CppClass *Il2CppType::getClass()
 
 std::string Il2CppString::to_string()
 {
-    auto chars = Il2cpp::GetChars(this);
-    std::u16string u16(reinterpret_cast<const char16_t *>(chars));
+    // 必须按 il2cpp 报告的长度读，不能靠 NUL 扫描。
+    //
+    // 旧实现是 `std::u16string u16(reinterpret_cast<const char16_t*>(chars))`
+    // —— 那个构造函数是「NUL 结尾」语义，会从 chars[0] 一路读到第一个
+    // 0x0000 的字为止。但 **il2cpp 的托管字符串根本没有结尾 NUL**，
+    // 长度只存在 length 字段里。扫描会一直读进托管堆，直到碰巧撞上对齐的
+    // 零字才停：轻则每个字符串尾部多出一串垃圾字符（这条路径渲染了界面上的
+    // 每一个字符串字段和每次调用结果），重则读过页边界 SIGSEGV。
+    const char *chars = Il2cpp::GetChars(this);
+    if (chars == nullptr)
+    {
+        return {};
+    }
+    const int32_t length = Il2cpp::GetStringLength(this);
+    if (length <= 0)
+    {
+        return {};
+    }
+    // 显式按长度构造 u16string，不做 NUL 扫描。
+    std::u16string u16(reinterpret_cast<const char16_t *>(chars),
+                      reinterpret_cast<const char16_t *>(chars) + length);
     return std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}.to_bytes(u16);
 }
 

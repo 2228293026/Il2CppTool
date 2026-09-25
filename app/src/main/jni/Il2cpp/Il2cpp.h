@@ -119,6 +119,12 @@ namespace Il2cpp
 
     // string
     const char *GetChars(Il2CppString *str); // returns wide char
+    // il2cpp 托管字符串的字符数。
+    //
+    // 字符串**不是** NUL 结尾的（长度只在 length 字段里），所以要按已知
+    // 长度读内容就必须用它。靠 NUL 扫描会读进托管堆直到碰巧撞上零字 ——
+    // 用户看到的是尾部多出垃圾字符，或者直接读过页边界崩掉。
+    int32_t GetStringLength(Il2CppString *str);
     Il2CppString *NewString(const char *str);
 
     // array
@@ -366,7 +372,10 @@ namespace Il2cpp
         return *static_cast<T *>(value);
     }
     Il2CppObject *RuntimeInvoke(MethodInfo *method, void *obj, void **params, Il2CppException **exc);
-    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params, int paramCount);
+    // exception 可为 nullptr（不关心异常），也可以传一个 Il2CppException* 变量
+    // 的地址，用来区分「方法抛了异常」和「合法地返回 null」。
+    Il2CppObject *RuntimeInvokeConvertArgs(MethodInfo *method, void *obj, Il2CppObject **params,
+                                           int paramCount, Il2CppException **exception = nullptr);
 #if __DEBUG__
     // this is a Debug function, it should be used as a tool only
     void Trace(Il2CppImage *image, std::function<bool(Il2CppClass *)> filterClasses,

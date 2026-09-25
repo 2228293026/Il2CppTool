@@ -800,13 +800,24 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
 {
     static ImGuiIO &io = ImGui::GetIO();
     bool methodIsStatic = Il2cpp::GetIsMethodStatic(method);
-    auto &params = paramMap[method];
+    if (!paramMap) paramMap = std::make_shared<decltype(paramMap)::element_type>();
+    auto &params = (*paramMap)[method];
     if (!methodIsStatic && !thiz)
     {
         auto &thisParam = params["this"];
         // 类名长度不受控，param.value 又是用户输入；固定 128 字节缓冲 + 无界 sprintf 会栈溢出。
         // 另外旧写法 sprintf(dst, "%s = %s", dst, ...) 把 dst 同时当源和目标，是未定义行为。
-        std::string thisLabel = std::string(Il2cpp::GetClassType(klass)->getName()) + " this";
+        // getName() 可能是 nullptr —— getFullName() 里有同样的防护，
+        // 注释写的是「我确实遇到过 typeName 为空的情况」。
+        // 旧代码 `std::string(GetClassType(klass)->getName())` 两层都裸解引用：
+        // GetClassType 为空 → 空指针；getName() 为空 → std::string(nullptr)，UB。
+        const char *klassName = "?";
+        auto *thisType = Il2cpp::GetClassType(klass);
+        if (thisType != nullptr && thisType->getName() != nullptr)
+        {
+            klassName = thisType->getName();
+        }
+        std::string thisLabel = std::string(klassName) + " this";
         if (!thisParam.value.empty())
         {
             thisLabel += " = " + thisParam.value;
@@ -827,6 +838,12 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                     snprintf(objStr, sizeof(objStr), "%p", (const void *)object);
                     thisParam.value = objStr;
                     thisParam.object = object;
+                    // 参数对象要活到用户按下「调用」，中间可能隔几帧，
+                    // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
+                    if (object)
+                    {
+                        SaveObjectWithRoot(object);
+                    }
                     ImGui::CloseCurrentPopup();
                 },
                 strcmp(method->getName(), ".ctor") == 0);
@@ -860,12 +877,30 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 }
                 else
                 {
+                    // isString 必须**按值**捕获。
+                    //
+                    // 旧代码是 [&param, &isString] 按引用捕获，但 isString 是本函数
+                    // 栈上的局部变量，作用域到函数结束就没了。而这个 lambda 被
+                    // Keyboard::Open 存进**全局**的 lastCallback，在**之后的某一帧**
+                    // 才被调用 —— 那时栈帧早被复用了。
+                    // 如果读到的垃圾恰好是 true，就会给一个非 String 参数塞进
+                    // 托管字符串对象，随后在 1044 行把这个指针当作该参数的类型
+                    // 传给 VM → 垃圾值或崩溃。
+                    const bool isStringParam = isString;
                     Keyboard::Open(
-                        [&param, &isString](const std::string &text)
+                        [this, &param, isStringParam](const std::string &text)
                         {
-                            if (isString)
+                            if (isStringParam)
                             {
                                 param.object = Il2cpp::NewString(text.c_str());
+                                // 这个托管字符串要一直活到用户按下「调用」为止 ——
+                                // 中间隔了几帧，随时可能被 GC 回收。届时
+                                // arrayParams[k] 里就是个野指针，被当作该参数的类型
+                                // 交给 VM。加根保活。
+                                if (param.object)
+                                {
+                                    SaveObjectWithRoot(param.object);
+                                }
                             }
                             param.value = text;
                         });
@@ -896,6 +931,12 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                                     snprintf(objStr, sizeof(objStr), "%p", (const void *)object);
                                     param.value = objStr;
                                     param.object = object;
+                    // 参数对象要活到用户按下「调用」，中间可能隔几帧，
+                    // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
+                    if (object)
+                    {
+                        SaveObjectWithRoot(object);
+                    }
                                     ImGui::CloseCurrentPopup();
                                 });
             ImGui::EndPopup();
@@ -908,7 +949,10 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
     if (ImGui::Button("Call", ImVec2(io.DisplaySize.x / 2, 0)))
     {
         auto paramsInfo = method->getParamsInfo();
-        auto params = paramMap[method];
+        // paramMap 理论上一定非空（CallerView 进来时就会创建），但这里仍然兜一下：
+        // 缺失时给一份空的，让下面的查找全部落空 → parseFailed，而不是野指针。
+        std::unordered_map<std::string, ParamValue> emptyParams;
+        auto params = paramMap ? (*paramMap)[method] : emptyParams;
         // 必须值初始化：new T[n] 是默认初始化（不填零）。只要有任何一个参数
         // 没走到赋值分支，arrayParams[k] 就是野指针，随后被交给
         // il2cpp_runtime_invoke 去解引用。
@@ -1064,25 +1108,68 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
         if (hasParams)
         {
             Il2CppObject *result = nullptr;
-            if (strcmp(method->getName(), ".ctor") != 0 && thisParam &&
-                Il2cpp::GetClassType(thisParam->klass)->isValueType())
+            // GetClassType 可能返回空（元数据被裁剪时），GetName() 也可能为空。
+            auto *thisClassType = (thisParam != nullptr) ? Il2cpp::GetClassType(thisParam->klass) : nullptr;
+            const bool thisIsValueType =
+                thisClassType != nullptr && thisClassType->isValueType();
+            const bool isCtor = method->getName() == nullptr ||
+                                strcmp(method->getName(), ".ctor") == 0;
+            // 显式接住托管异常：抛异常时 il2cpp 会同时把结果置 null 并
+            // 通过出参回填异常对象。不接的话，「抛异常」和「合法返回 null」
+            // 在界面上长得一模一样 —— 而这个面板的卖点就是「返回值 / 异常」。
+            Il2CppException *managedException = nullptr;
+            if (!isCtor && thisParam && thisIsValueType)
             {
                 auto thizz = Il2cpp::GetUnboxedValue(thisParam);
-                result = Il2cpp::RuntimeInvokeConvertArgs(method, thizz, arrayParams, paramsInfo.size());
+                result = Il2cpp::RuntimeInvokeConvertArgs(method, thizz, arrayParams,
+                                                          paramsInfo.size(), &managedException);
             }
             else
             {
-                result = Il2cpp::RuntimeInvokeConvertArgs(method, thisParam, arrayParams, paramsInfo.size());
+                result = Il2cpp::RuntimeInvokeConvertArgs(method, thisParam, arrayParams,
+                                                          paramsInfo.size(), &managedException);
             }
             LOGPTR(result);
-            if (result && strcmp(method->getName(), ".ctor") != 0)
+            if (managedException)
+            {
+                // 异常对象本身就是 Il2CppObject；to_string() 取它自己的
+                // message 字段通常拿不到有意义的内容，但至少把类型和
+                // 对象地址告诉用户 —— 比谎称「返回 null」强。
+                Il2CppObject *excObj = reinterpret_cast<Il2CppObject *>(managedException);
+                char excText[160]{0};
+                const char *excName = excObj->klass ? excObj->klass->getName() : nullptr;
+                snprintf(excText, sizeof(excText), "抛出异常: %s (%p)", excName ? excName : "?",
+                         static_cast<void *>(excObj));
+                callResults.at(method).push_back({excText, nullptr});
+                LOGE("调用抛出托管异常: %s", excText);
+            }
+            else if (result && method->getName() && strcmp(method->getName(), ".ctor") != 0)
             {
                 auto resultType = Il2cpp::GetClassType(result->klass);
-                if (resultType->isPrimitive())
+                if (resultType == nullptr)
+                {
+                    char typeText[96]{0};
+                    snprintf(typeText, sizeof(typeText), "返回值类型信息缺失 (%p)",
+                             static_cast<void *>(result));
+                    callResults.at(method).push_back({typeText, result});
+                }
+                else if (resultType->isPrimitive())
                 {
                     std::vector<uintptr_t> visited;
                     auto j = result->dump(visited, 1);
-                    callResults.at(method).push_back(std::pair{j.begin().value().dump(), nullptr});
+                    // 装箱后的基础类型没有字段时 dump() 返回字符串 "(no-fields)"，
+                    // 那时 j 不是容器，j.begin() == j.end()，再 .value() 就是解引用
+                    // end() —— UB。显式判一下。
+                    std::string primitiveText;
+                    if (j.is_object() && !j.empty())
+                    {
+                        primitiveText = j.begin().value().dump();
+                    }
+                    else
+                    {
+                        primitiveText = j.is_string() ? j.get<std::string>() : std::string("(无字段)");
+                    }
+                    callResults.at(method).push_back(std::pair{primitiveText, nullptr});
                 }
                 else if (strcmp(resultType->getName(), "System.String") == 0)
                 {
@@ -1119,7 +1206,9 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                         }
                         else
                         {
-                            callResults.at(method).push_back({"the call returned null", result});
+                            // 调用本身成功了（没有异常），只是 ToString() 没给出字符串。
+                            // 措辞要和上面那个「调用抛异常」区分开。
+                            callResults.at(method).push_back({"调用成功，但 ToString() 返回 null", result});
                         }
                     }
                     else
@@ -1130,12 +1219,21 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                         callResults.at(method).push_back({resultStr, result});
                     }
                 }
+                // savedSet 里没有 GCHandle 的条目，ResolveSaved 会**原样返回裸指针**
+                // （见 ResolveSaved 的实现），于是持有者一旦被 GC 回收，
+                // 后面 `object->klass` 就是解引用野指针。
+                //
+                // JSON 检视器那条路径一直是对的（SaveObjectWithRoot），这里
+                // 却是裸 insert —— 调用结果绕过了整套 GC 保活机制。
                 savedSet[resultType->getClass()].insert(result);
+                SaveObjectWithRoot(result);
                 // setJsonObject(result);
             }
-            else
+            else if (!managedException)
             {
-                callResults.at(method).push_back({"the call returned null", nullptr});
+                // 走到这里说明：没有异常，result 就是真的 null。
+                // （抛异常的情况已经在上面单独报过了。）
+                callResults.at(method).push_back({"调用成功，返回 null", nullptr});
             }
         }
         else
@@ -1631,38 +1729,70 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
             return;
         }
     }
-    auto it = hookerMap.find(method->methodPointer);
-    bool hooked = it != hookerMap.end();
+    // 迭代器不能在锁外用。旧代码把 find() 的结果 `it` 一直带到下面读
+    // it->second.hitCount —— 期间游戏线程的回调或后台的 ToggleHooker
+    // 线程可能正在 rehash/erase 这张表。改成锁内取快照、锁外只用值。
+    bool hooked;
+    int hitCountSnapshot = 0;
+    float cpsSnapshot = 0.f;
+    {
+        std::lock_guard guard(hookerMtx);
+        auto it = hookerMap.find(method->methodPointer);
+        hooked = it != hookerMap.end();
+        if (hooked)
+        {
+            hitCountSnapshot = it->second.hitCount.load(std::memory_order_relaxed);
+            cpsSnapshot = it->second.callsPerSecond;
+        }
+    }
     char label[16];
     if (!hooked)
     {
-        sprintf(label, "Trace");
+        snprintf(label, sizeof(label), "Trace");
     }
     else
     {
         snprintf(label, sizeof(label), "Restore");
-        auto value = it->second.hitCount.load(std::memory_order_relaxed);
-        auto cps = it->second.callsPerSecond;
-        if (cps > 0.f)
+        if (cpsSnapshot > 0.f)
         {
-            ImGui::Text("调用 %d 次 (%.0f 次/秒)", value, cps);
+            ImGui::Text("调用 %d 次 (%.0f 次/秒)", hitCountSnapshot, cpsSnapshot);
         }
         else
         {
-            ImGui::Text("调用 %d 次", value);
+            ImGui::Text("调用 %d 次", hitCountSnapshot);
         }
         ImGui::Separator();
     }
     if (ImGui::Button(label))
     {
         Tool::ToggleHooker(method);
-        it = hookerMap.find(method->methodPointer);
-        hooked = it != hookerMap.end();
+        std::lock_guard guard(hookerMtx);
+        hooked = hookerMap.find(method->methodPointer) != hookerMap.end();
     }
     ImGui::Separator();
     if (hooked)
     {
-        auto &backtraced = it->second.backtraced;
+        // 锁内一次性把要用的数据取出来，锁外画图。
+        //
+        // 不能整段持锁：这里是 ImGui 绘制，而游戏线程的 hook 回调要拿同一把锁
+        // 记 hitCount —— 我们绘制多久，游戏就被卡多久。
+        // 也不能持着迭代器出锁：后台的 ToggleHooker 线程随时可能 rehash/erase
+        // 这张表，迭代器随即失效。锁内复制值是唯一安全的做法。
+        std::vector<float> history;
+        float cps = 0.f;
+        bool backtracing = false;
+        CircularBuffer<std::vector<std::string>> backtraced{10};
+        {
+            std::lock_guard guard(hookerMtx);
+            auto found = hookerMap.find(method->methodPointer);
+            if (found != hookerMap.end())
+            {
+                history = found->second.rateHistory;
+                cps = found->second.callsPerSecond;
+                backtracing = found->second.backtracing;
+                backtraced = found->second.backtraced;
+            }
+        }
 
         // 调用频率曲线。
         //
@@ -1674,10 +1804,6 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
         // 窗口约 30 秒。绝不放在 hook 回调里采样：那会让 UI 绘制变成
         // 游戏主路径上的额外开销。
         {
-            // rateHistory 只被渲染线程碰（采样 + 绘制），所以这里不额外加锁。
-            // 拷贝一份再画：ImGui::PlotLines 会持有这个指针到绘制结束，
-            // 而下一帧的采样 push_back 可能触发 vector 重新分配。
-            auto history = it->second.rateHistory;
             if (history.empty())
             {
                 ImGui::TextDisabled("等待采样…（每 250ms 一次，约 30 秒窗口）");
@@ -1695,18 +1821,23 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
                 if (ImGui::IsItemHovered())
                 {
                     ImGui::SetTooltip("最近 %d 次采样（250ms 一次）\n峰值 %.0f 次/秒\n当前 %.0f 次/秒",
-                                      (int)history.size(), maxRate, it->second.callsPerSecond);
+                                      (int)history.size(), maxRate, cps);
                 }
             }
         }
         ImGui::Separator();
 
 #ifdef USE_FRIDA
-        if (!it->second.backtracing)
+        if (!backtracing)
         {
             if (ImGui::Button("Backtrace"))
             {
-                it->second.backtracing = true;
+                std::lock_guard guard(hookerMtx);
+                auto found = hookerMap.find(method->methodPointer);
+                if (found != hookerMap.end())
+                {
+                    found->second.backtracing = true;
+                }
             }
         }
 #else
@@ -1779,7 +1910,11 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
         Util::prependStringToBuffer(treeLabel, sizeof(treeLabel), "static ");
     }
     bool patched = oMap[method].bytes.empty() == false;
-    bool hooked = hookerMap.find(method->methodPointer) != hookerMap.end();
+    // 必须持锁查。hookerMap 会被游戏线程的 hook 回调和后台的
+    // ToggleHooker 线程改动（插入会触发 rehash），而这个函数对每个类的
+    // 每个方法每帧都跑一次 —— 无锁 find 与并发 insert 相撞就是遍历已释放
+    // 的桶数组。isMethodHooked 就是为这个场景写的，这里改用它。
+    bool hooked = isMethodHooked(method);
     // sprintf(treeLabel, "%s##%p", treeLabel, method + j);
     if (zeroPointer)
     {
@@ -1856,12 +1991,38 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
 
 const ClassesTab::MethodParamList &ClassesTab::getCachedParams(MethodInfo *method)
 {
+    // 返回的是**引用**，所以需要一个生命周期足够长的对象来持有结果。
+    //
+    // 三个改进（相对旧实现）：
+    // 1. **一次查找**。旧代码是 find() → operator[] → return operator[]，
+    //    同一件事做了三遍哈希查找。而这个函数在渲染线程上、每个已 hook 的
+    //    方法每帧都会调一次 —— 3N 次哈希 × 60fps。
+    // 2. **有上限**。key 是 MethodInfo*，稳定不会失效，但会话里浏览过的方法
+    //    会一直堆积，从不清理。给个上限，超了整体清空。
+    // 3. **判空**。method 为空时返回空列表，而不是空指针解引用。
+    static std::mutex cacheMutex;
     static std::unordered_map<MethodInfo *, MethodParamList> params;
-    if (params.find(method) == params.end())
+
+    if (method == nullptr)
     {
-        params[method] = method->getParamsInfo();
+        static const MethodParamList empty;
+        return empty;
     }
-    return params[method];
+
+    std::lock_guard guard(cacheMutex);
+    auto it = params.find(method);
+    if (it != params.end())
+    {
+        return it->second;
+    }
+
+    if (params.size() >= kParamCacheLimit)
+    {
+        LOGI("方法参数缓存达到上限 (%zu)，清空重建", params.size());
+        params.clear();
+    }
+    auto inserted = params.emplace(method, method->getParamsInfo());
+    return inserted.first->second;
 }
 
 // static std::unordered_map<Il2CppClass *, bool> states;
@@ -2236,8 +2397,14 @@ void ClassesTab::Draw(int index, bool closeable)
             for (int i = 0; i < filteredClasses.size(); i++)
             {
                 auto klass = filteredClasses[i];
+                if (klass == nullptr)
+                {
+                    continue;
+                }
 
-                bool isValueType = Il2cpp::GetClassType(klass)->isValueType();
+                // GetClassType 可能返回空（元数据被裁剪时）。
+                auto *klassType = Il2cpp::GetClassType(klass);
+                bool isValueType = klassType != nullptr && klassType->isValueType();
                 int pushedColor = 0;
                 if (isValueType)
                 {
@@ -2337,7 +2504,9 @@ void ensureIfValueType(Il2CppObject *currentObj, std::vector<std::string> &paths
     if (!currentObj || !rootObj || currentObj == rootObj)
         return;
 
-    bool isValueType = Il2cpp::GetClassType(currentObj->klass)->isValueType();
+    // GetClassType 可能返回空。
+    auto *currentType = Il2cpp::GetClassType(currentObj->klass);
+    bool isValueType = currentType != nullptr && currentType->isValueType();
     if (isValueType)
     {
         if (paths.size() > 1)
@@ -2396,6 +2565,160 @@ void ensureIfValueType(Il2CppObject *currentObj, std::vector<std::string> &paths
     }
 }
 
+// 标记「这个对象需要在下一帧重新 dump」。
+//
+// 旧实现是一个函数内 `static bool doRefresh`，被 ImGuiJson 的**所有调用者**
+// 共享。而 ImGuiJson 可以同时作用于多个对象（用户在几个对象的 JSON 视图
+// 之间切换），于是改 A 的字段会让 B 也跟着重新 dump —— 用户看到
+// 「我没动它，它的内容自己变了」。
+//
+// 做成文件级函数而不是局部变量：置位它的都是 JSON 表格里那些**无捕获
+// lambda**（软键盘回调、枚举选择回调），那些 lambda 捕获不了局部变量。
+static std::unordered_map<Il2CppObject *, bool> g_refreshRequests;
+
+static void RequestRefresh(Il2CppObject *object)
+{
+    if (object == nullptr)
+    {
+        return;
+    }
+    // 残留条目只可能来自「置位了但那一帧对象没被绘制」。数量以用户曾经
+    // 查看过的对象数封顶，实践中很小；这里给个上限兜底。
+    if (g_refreshRequests.size() > 256)
+    {
+        g_refreshRequests.clear();
+    }
+    g_refreshRequests[object] = true;
+}
+
+static bool ConsumeRefresh(Il2CppObject *object)
+{
+    auto it = g_refreshRequests.find(object);
+    if (it == g_refreshRequests.end())
+    {
+        return false;
+    }
+    g_refreshRequests.erase(it);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 数值字段编辑的两个配套辅助
+//
+// 问题一：往返截断（静默破坏游戏状态）
+//   旧代码对**所有**浮点字段都走 float，对**所有**整型字段都走 int：
+//     ImGui::Text("%s = %f", key, value.get<float>());
+//     Keyboard::Open(std::to_string(value.get<float>()).c_str(), ...)
+//     ImGui::Text("%s = %d", key, value.get<int>());
+//     Keyboard::Open(std::to_string(value.get<int>()).c_str(), ...)
+//   Double 字段 0.1234567890123 会以 0.123457 显示并**预填进输入框**；
+//   Int64/UInt64 超过 INT_MAX 的值会显示成负数（静默 static_cast，不抛）。
+//   用户只要点「确认」而没改内容，截断后的值就被**写回游戏内存** ——
+//   这比崩溃更糟，因为它不报错，只是悄悄把游戏改坏了。
+//
+// 问题二：解析异常会打断 ImGui 的 Begin/End 配对
+//   std::stof/stod/stoi/stoul/stoll/stoull 对非数字输入全部抛
+//   std::invalid_argument。这些 lambda 是在 Keyboard::Update() 里被调用的，
+//   那是在 ImGui::Begin 之后、EndTabItem 之前。抛出去虽然有 Keyboard 的
+//   try/catch 兜底（不会 std::terminate），但这一帧剩下的
+//   EndTabItem/End 全被跳过 → ImGui 的 Begin/End 栈失配 → 下一帧撞上
+//   IM_ASSERT → __builtin_trap() → **无声的 SIGILL**。
+//   （对比：CallerView 里的同类解析早就包了 try/catch，注释也写了理由。）
+// ---------------------------------------------------------------------------
+
+// 按字段的**声明类型**把 JSON 值格式化成可编辑文本。
+static std::string FormatFieldForEdit(const std::string &type, const nlohmann::ordered_json &value)
+{
+    if (type == "Double")
+    {
+        // 不能走 float。用 %.17g 保证往返无损。
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.17g", value.get<double>());
+        return buf;
+    }
+    if (type == "Single")
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.9g", value.get<float>());
+        return buf;
+    }
+    if (type == "Int64" || type == "UInt64")
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.get<int64_t>()));
+        return buf;
+    }
+    if (type == "Int32" || type == "UInt32")
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.get<int32_t>()));
+        return buf;
+    }
+    if (type == "Int16" || type == "UInt16")
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.get<int16_t>()));
+        return buf;
+    }
+    // 未知类型：走 float 旧路径，至少不崩
+    return std::to_string(value.get<float>());
+}
+
+// 解析用户输入并按声明类型写回字段。
+// 任何解析失败都返回 false，**绝不把异常抛进 ImGui 帧**。
+static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &type,
+                                    const std::string &fieldName, const std::string &text)
+{
+    try
+    {
+        if (type == "Single")
+        {
+            object->setField(fieldName.c_str(), std::stof(text));
+        }
+        else if (type == "Double")
+        {
+            object->setField(fieldName.c_str(), std::stod(text));
+        }
+        else if (type == "Int16")
+        {
+            object->setField(fieldName.c_str(), static_cast<int16_t>(std::stoll(text)));
+        }
+        else if (type == "UInt16")
+        {
+            object->setField(fieldName.c_str(), static_cast<uint16_t>(std::stoull(text)));
+        }
+        else if (type == "Int32")
+        {
+            object->setField(fieldName.c_str(), static_cast<int32_t>(std::stoll(text)));
+        }
+        else if (type == "UInt32")
+        {
+            object->setField(fieldName.c_str(), static_cast<uint32_t>(std::stoull(text)));
+        }
+        else if (type == "Int64")
+        {
+            object->setField(fieldName.c_str(), static_cast<int64_t>(std::stoll(text)));
+        }
+        else if (type == "UInt64")
+        {
+            object->setField(fieldName.c_str(), static_cast<uint64_t>(std::stoull(text)));
+        }
+        else
+        {
+            LOGW("未知的数值字段类型 %s，未写入", type.c_str());
+            return false;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        // 关键：**就地消化**。让异常逃出去会打断这一帧的 ImGui Begin/End 配对。
+        LOGE("字段 %s 的输入 \"%s\" 不是合法的 %s: %s", fieldName.c_str(), text.c_str(),
+             type.c_str(), e.what());
+        return false;
+    }
+    return true;
+}
+
 void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
 {
     // auto &paths = tool.dataMap[object].second;
@@ -2403,6 +2726,21 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
 
     int indentCounter = 0;
     auto currentObj = dataMap[rootObj].first.first;
+
+    // currentObj 可能为 nullptr：dump() 在路径解析不出来时返回 {nullptr, ...}，
+    // 而 dataMap[rootObj] 在 key 不存在时 operator[] 会默认构造出一个空 pair
+    // （first.first 就是 nullptr）。
+    //
+    // 旧代码在 2413 行直接 `GetClassType(currentObj->klass)->isValueType()` ——
+    // 判空检查（if (isLast && currentObj && ...)）排在它**后面**一行，
+    // 也就是说检查根本没起到保护作用。下面的循环体里还有五六处
+    // currentObj->klass / currentObj 的裸解引用。
+    if (currentObj == nullptr)
+    {
+        ImGui::TextDisabled("对象已失效（可能已被 GC 回收），请重新 Inspect");
+        return;
+    }
+
     for (auto it = paths.begin() + (paths.size() > 3 ? paths.size() - 4 : 0); it != paths.end(); ++it)
     {
         const bool isLast = std::next(it) == paths.end();
@@ -2410,7 +2748,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         ImGui::PushID(indentCounter);
 
         bool buttonPressed = false;
-        bool isValueType = Il2cpp::GetClassType(currentObj->klass)->isValueType();
+        // GetClassType 同样可能返回空（元数据被裁剪时）。
+        auto *currentType = Il2cpp::GetClassType(currentObj->klass);
+        bool isValueType = currentType != nullptr && currentType->isValueType();
         if (isLast && isValueType)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(222, 222, 222, 255));
@@ -2469,15 +2809,26 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
     ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(100, 200, 20, 128));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(100, 200, 20, 255));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(100, 200, 20, 255));
-    static bool doRefresh = false;
+    // doRefresh 是**跨帧**标志：下面的 JSON 表格里，字段编辑的回调
+    // （软键盘确认后写回字段、枚举选择等）会请求刷新，意思是「下一帧
+    // 重新 dump 一次，把新值刷到界面上」。请求按对象分别记录。
     if (ImGui::Button("Refresh", ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
     {
-        doRefresh = true;
+        RequestRefresh(rootObj);
     }
-    if (doRefresh)
+    if (ConsumeRefresh(rootObj))
     {
-        doRefresh = false;
         dataMap[rootObj].first = rootObj->dump(paths);
+        // 重新 dump 之后 currentObj 可能变了（甚至变成 nullptr ——
+        // 路径指向的对象在这一瞬间被销毁了）。下一帧会重新取，
+        // 但这一帧后面的代码还在用它，这里显式同步。
+        currentObj = dataMap[rootObj].first.first;
+        if (currentObj == nullptr)
+        {
+            ImGui::PopStyleColor(3);
+            ImGui::TextDisabled("刷新时对象已失效，请重新 Inspect");
+            return;
+        }
     }
     ImGui::PopStyleColor(3);
 
@@ -2543,7 +2894,8 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     {
                         Keyboard::Open(
                             text.c_str(),
-                            [type = std::move(type), val = std::move(val), currentObj](const std::string &value)
+                            [type = std::move(type), val = std::move(val), currentObj,
+                             rootObj](const std::string &value)
                             {
                                 LOGD("%s", value.c_str());
                                 auto f = currentObj ? currentObj->klass->getField(val.c_str()) : nullptr;
@@ -2559,7 +2911,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                 // （klass 指针 + monitor）当字段内容写进去，字段直接损坏。
                                 // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
                                 Il2cpp::SetFieldValue(currentObj, f, &newStr);
-                                doRefresh = true;
+                                RequestRefresh(rootObj);
                             });
                     }
                     else
@@ -2576,7 +2928,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                             {
                                 poper.Open(
                                     "EnumSelector",
-                                    [fieldType, currentObj, field](const std::string &result)
+                                    [fieldType, currentObj, field, rootObj](const std::string &result)
                                     {
                                         auto *enumClass = fieldType->getClass();
                                         auto *enumField = enumClass ? enumClass->getField(result.c_str()) : nullptr;
@@ -2605,7 +2957,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                             int32_t narrow = static_cast<int32_t>(raw);
                                             Il2cpp::SetFieldValue(currentObj, field, &narrow);
                                         }
-                                        doRefresh = true;
+                                        RequestRefresh(rootObj);
                                     },
                                     fieldType);
                             }
@@ -2628,80 +2980,68 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                    // split key by space
                                    currentObj->setField(val.c_str(), (int)b);
                                    ensureIfValueType(currentObj, paths, rootObj);
-                                   doRefresh = true;
+                                   RequestRefresh(rootObj);
                                });
                 }
             }
             else if (value.is_number_float())
             {
-                ImGui::Text("%s = %f", key.c_str(), value.get<float>());
+                {
+                    std::istringstream iss(key);
+                    std::string type, val;
+                    iss >> type >> val;
+                    // 显示也走类型正确的格式化，否则 Double 字段会被
+                    // 当成 float 印出来（0.123457），用户完全看不出被截断了。
+                    ImGui::Text("%s = %s", key.c_str(), FormatFieldForEdit(type, value).c_str());
+                }
 
                 if (ImGui::IsItemClicked())
                 {
                     std::istringstream iss(key);
                     std::string type, val;
                     iss >> type >> val;
-                    Keyboard::Open(std::to_string(value.get<float>()).c_str(),
+                    // 预填值同样必须按声明类型格式化：预填对了，
+                    // 「原样点确认」才是无损的。
+                    Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
                                    [type, currentObj, val, &paths, rootObj](const std::string &text)
                                    {
-                                       if (strcmp(type.c_str(), "Single") == 0)
+                                       if (currentObj == nullptr)
                                        {
-                                           float value = std::stof(text);
-                                           currentObj->setField(val.c_str(), value);
+                                           return;
                                        }
-                                       else if (strcmp(type.c_str(), "Double") == 0)
+                                       if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           double value = std::stod(text);
-                                           currentObj->setField(val.c_str(), value);
+                                           ensureIfValueType(currentObj, paths, rootObj);
+                                           RequestRefresh(rootObj);
                                        }
-                                       ensureIfValueType(currentObj, paths, rootObj);
-                                       doRefresh = true;
                                    });
                 }
             }
             else if (value.is_number())
             {
-                ImGui::Text("%s = %d", key.c_str(), value.get<int>());
+                {
+                    std::istringstream iss(key);
+                    std::string type, val;
+                    iss >> type >> val;
+                    ImGui::Text("%s = %s", key.c_str(), FormatFieldForEdit(type, value).c_str());
+                }
                 if (ImGui::IsItemClicked())
                 {
                     std::istringstream iss(key);
                     std::string type, val;
                     iss >> type >> val;
-                    Keyboard::Open(std::to_string(value.get<int>()).c_str(),
+                    Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
                                    [type, currentObj, val, &paths, rootObj](const std::string &text)
                                    {
-                                       if (strcmp(type.c_str(), "Int16") == 0)
+                                       if (currentObj == nullptr)
                                        {
-                                           int16_t value = std::stoi(text);
-                                           currentObj->setField(val.c_str(), value);
+                                           return;
                                        }
-                                       else if (strcmp(type.c_str(), "UInt16") == 0)
+                                       if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           uint16_t value = std::stoi(text);
-                                           currentObj->setField(val.c_str(), value);
+                                           ensureIfValueType(currentObj, paths, rootObj);
+                                           RequestRefresh(rootObj);
                                        }
-                                       else if (strcmp(type.c_str(), "Int32") == 0)
-                                       {
-                                           int32_t value = std::stoi(text);
-                                           currentObj->setField(val.c_str(), value);
-                                       }
-                                       else if (strcmp(type.c_str(), "UInt32") == 0)
-                                       {
-                                           uint32_t value = std::stoul(text);
-                                           currentObj->setField(val.c_str(), value);
-                                       }
-                                       else if (strcmp(type.c_str(), "Int64") == 0)
-                                       {
-                                           int64_t value = std::stoll(text);
-                                           currentObj->setField(val.c_str(), value);
-                                       }
-                                       else if (strcmp(type.c_str(), "UInt64") == 0)
-                                       {
-                                           uint64_t value = std::stoull(text);
-                                           currentObj->setField(val.c_str(), value);
-                                       }
-                                       ensureIfValueType(currentObj, paths, rootObj);
-                                       doRefresh = true;
                                    });
                 }
             }

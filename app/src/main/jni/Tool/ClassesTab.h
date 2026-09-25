@@ -57,7 +57,14 @@ struct ClassesTab
     static std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> newObjectMap;
     // 已保存（用户标记）的对象，同样要保活。
     static std::unordered_map<Il2CppClass *, std::set<Il2CppObject *>> savedSet;
-    std::unordered_map<MethodInfo *, std::unordered_map<std::string, ParamValue>> paramMap{};
+    // 方法调用面板里「每个参数的当前输入值」。
+    //
+    // 用 shared_ptr 而不是直接持有：界面上填参数时用的是
+    // `auto &param = params[paramKey]`，然后把这个引用**捕获进 lambda** 交给
+    // 软键盘（存在全局的 lastCallback 里，跨帧才触发）。
+    // 如果用户「打开软键盘的同时把标签页关掉」，tab 析构 → paramMap 析构 →
+    // 回调里那个引用就是野的。shared_ptr 让回调持有一份，tab 先走也没事。
+    std::shared_ptr<std::unordered_map<MethodInfo *, std::unordered_map<std::string, ParamValue>>> paramMap{};
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
     MethodList &buildMethodMap(Il2CppClass *klass);
@@ -96,6 +103,8 @@ struct ClassesTab
                     Il2CppObject *thiz = nullptr);
 
     const MethodParamList &getCachedParams(MethodInfo *method);
+    // 方法参数缓存条目上限（见 getCachedParams 的实现注释）。
+    static constexpr size_t kParamCacheLimit = 4096;
 
     struct OriginalMethodBytes
     {
