@@ -258,6 +258,8 @@ namespace Tool
                   [](Il2CppImage *img1, Il2CppImage *img2)
                   { return std::strcmp(img1->getName(), img2->getName()) < 0; });
         classesTabs.reserve(32);
+        // 筛选工作线程在 tab 构造前就要就绪（构造里会投递第一个筛选请求）。
+        ClassesTabWorker::EnsureStarted();
         if (classesTabs.empty())
             OpenNewTab();
 

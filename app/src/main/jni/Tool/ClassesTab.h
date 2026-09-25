@@ -115,8 +115,36 @@ struct ClassesTab
 
     void ImGuiJson(Il2CppObject *object);
 
+    // 触发一次筛选。
+    //
+    // 旧实现是**同步**的：调用方（每敲一个字符、每切一次选项）都要同步
+    // 跑完 getClasses() + 每个类的 getMethods() + getParamsInfo()。
+    // 那是「所有 assembly × 所有类 × 所有方法」量级的元数据遍历，
+    // 全部压在渲染线程上 —— 用户每敲一个字符，游戏就卡一下。
+    //
+    // 现在只把请求丢给后台线程就立刻返回；结果算好后由渲染线程在
+    // Draw 里认领。连续快速输入时只保留最新的一次请求（旧的直接丢弃），
+    // 不会排出一长串过期的筛选任务。
     void FilterClasses(const std::string &filter);
+    // 渲染线程调用：若后台已完成与当前请求匹配的筛选，就把结果取回来。
+    // 返回 true 表示本次有新结果落地。
+    bool PollFilterResult();
+    // 是否还有未完成的筛选请求。UI 用它显示「筛选中…」。
+    bool IsFilterPending();
+    // 后台筛选用的共享状态。用 shared_ptr 是为了让工作线程即使在 tab
+    // 被销毁之后才跑完，也仍然持有一份有效内存 —— 否则就是 use-after-free。
+    struct FilterState;
+    std::shared_ptr<FilterState> filterState;
 };
+
+// 全局筛选工作线程的启动/停止。停止时必须 join，否则全局 std::thread
+// 析构时 terminate —— 而这是注入进别人游戏的库，触发它等于让用户的
+// 游戏莫名崩掉。
+namespace ClassesTabWorker
+{
+void EnsureStarted();
+void Shutdown();
+} // namespace ClassesTabWorker
 
 void to_json(nlohmann::ordered_json &j, const ClassesTab &p);
 void from_json(const nlohmann::ordered_json &j, ClassesTab &p);

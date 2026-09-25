@@ -173,10 +173,14 @@ ClassesTab::ClassesTab()
             break;
         }
     }
-    // g_Image 为空时（il2cpp 还没就绪 / 没有可用 assembly）直接 getClasses() 是空指针解引用。
-    // 这里留空列表，让 UI 后续自己判空，而不是在构造期就崩。
-    classes = selectedImage ? selectedImage->getClasses() : std::vector<Il2CppClass *>{};
-    filteredClasses = classes;
+    // g_Image 为空时（il2cpp 还没就绪 / 没有可用 assembly）不能去
+    // getClasses() —— 那是空指针解引用。这里不预取，交给下面那次异步
+    // 筛选去处理（它内部对 selectedImage 有判空）。
+    //
+    // 注意这里**不再**同步调 getClasses()：那是整个 assembly 的类枚举，
+    // 而构造发生在 Tool::Init → on_init → 渲染线程上，正是启动卡顿的一部分。
+    // 改成投递一次后台筛选，结果在第一次 Draw 时被认领。
+    FilterClasses(filter);
 }
 
 ClassesTab::Paths &ClassesTab::getJsonPaths(Il2CppObject *object)
@@ -1909,6 +1913,9 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
 void ClassesTab::Draw(int index, bool closeable)
 {
     static ImGuiIO &io = ImGui::GetIO();
+    // 先认领后台算好的筛选结果。认领不到就保持上一帧的内容继续画 ——
+    // 这样输入过程中界面不会闪成空白。
+    PollFilterResult();
     char tabLabel[256];
     if (filter.empty())
     {
@@ -2010,6 +2017,13 @@ void ClassesTab::Draw(int index, bool closeable)
             snprintf(filterBuffer, sizeof(filterBuffer), "Filter : %s | %zu of %zu##filterbtn",
                      safeFilter.empty() ? "(none)" : safeFilter.c_str(), filteredClasses.size(),
                      classes.size());
+        }
+        // 筛选在后台跑。结果还没回来时明确标出来 —— 否则用户会以为
+        // 「输入了没反应」或者「列表卡住了」。
+        if (IsFilterPending())
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), "筛选中…");
         }
         if (ImGui::Button(filterBuffer, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)) && !Keyboard::IsOpen())
         {
@@ -2752,149 +2766,394 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
     }
 }
 
-void ClassesTab::FilterClasses(const std::string &filter)
+// ---------------------------------------------------------------------------
+// 后台筛选
+//
+// 为什么必须放到后台：一次筛选要做
+//   1. image->getClasses()      —— 遍历该 assembly 的全部类
+//   2. 每个类的 getMethods()    —— 分配一个 vector
+//   3. 每个方法的 getParamsInfo()—— 再分配一个 vector
+// 那是「所有 assembly × 所有类 × 所有方法」量级的元数据遍历。
+// 旧代码在渲染线程上同步做完这一切，而触发时机是「每敲一个字符」——
+// 用户每输入一个字母，游戏就卡一下。
+//
+// 设计要点
+// - 请求按值传递，worker 不持有 tab 指针。tab 在请求处理期间被销毁也不会
+//   碰到野指针（结果写进 shared_ptr 持有的 FilterState）。
+// - 只保留**最新**请求：连续快速输入时旧请求直接被覆盖，不会排出一长串
+//   已经过期的筛选任务。
+// - 结果用代号（generation）标记，渲染线程只认领与当前请求代号一致的结果，
+//   避免把过期结果画到界面上。
+// ---------------------------------------------------------------------------
+
+struct ClassesTab::FilterState
 {
-    filteredClasses.clear();
-    classes.clear();
-    methodMap.clear(); // is this necessary?
-    if (includeAllImages)
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    bool hasWork = false;
+    bool shutdown = false;
+    uint64_t requestGen = 0;
+
+    // 请求（按值）
+    std::string filter;
+    bool caseSensitive = true;
+    bool filterByClass = true;
+    bool filterByMethod = false;
+    bool filterByField = false;
+    bool showAllClasses = false;
+    Il2CppImage *selectedImage = nullptr;
+    bool includeAllImages = false;
+    std::vector<Il2CppImage *> images;
+
+    // 结果
+    bool hasResult = false;
+    uint64_t resultGen = 0;
+    std::vector<Il2CppClass *> classes;
+    std::vector<Il2CppClass *> filteredClasses;
+    ClassesTab::ClassMethodMap methodMap;
+};
+
+namespace
+{
+    // worker 线程读写的「待办」状态集合。key 是 FilterState 的裸指针
+    // （仅用于排序，实际数据通过 shared_ptr 访问）。
+    std::mutex g_queueMutex;
+    std::condition_variable g_queueCv;
+    std::vector<std::weak_ptr<ClassesTab::FilterState>> g_queue;
+    std::thread g_worker;
+    bool g_workerRunning = false;
+
+    // 在后台线程上执行真正耗时的筛选。
+    //
+    // 这些全是 il2cpp 调用（getClasses / getMethods / getParamsInfo），
+    // 必须在已挂载的线程上跑 —— 后台线程是 foreign thread，不 attach 就是
+    // 崩溃或静默错数据。用完必须 detach，否则 attached-thread 表里会留下
+    // 已退出线程的悬空条目，GC 遍历线程表时踩到。
+    struct FilterAttachGuard
     {
-        for (auto image : g_Images)
+        bool attached = false;
+        FilterAttachGuard()
         {
-            auto imageClasses = image->getClasses();
-            classes.insert(classes.end(), imageClasses.begin(), imageClasses.end());
+            attached = Il2cpp::EnsureAttached();
+        }
+        ~FilterAttachGuard()
+        {
+            if (attached)
+            {
+                Il2cpp::Detach();
+            }
+        }
+    };
+
+    void DoFilterWork(const std::shared_ptr<ClassesTab::FilterState> &st)
+    {
+        std::vector<Il2CppClass *> allClasses;
+        std::vector<Il2CppClass *> filtered;
+        ClassesTab::ClassMethodMap methodMap;
+
+        try
+        {
+            FilterAttachGuard attachGuard;
+            if (!attachGuard.attached)
+            {
+                LOGE("后台筛选: 无法 attach 到 il2cpp VM");
+                return;
+            }
+
+            if (st->includeAllImages)
+            {
+                for (auto image : st->images)
+                {
+                    if (image == nullptr)
+                    {
+                        continue;
+                    }
+                    auto imageClasses = image->getClasses();
+                    allClasses.insert(allClasses.end(), imageClasses.begin(), imageClasses.end());
+                }
+            }
+            else if (st->selectedImage != nullptr)
+            {
+                allClasses = st->selectedImage->getClasses();
+            }
+
+            // 大小写不敏感包含匹配。
+            //
+            // 旧实现是 `auto newA = a; auto newB = b; transform(tolower); find`
+            // —— 每比较一次就分配两个完整副本。这个比较跑在
+            // 「每个类 × 每个方法 × 每个字段」上：5000 个类、平均 20 个方法
+            // 就是十万次比较、二十万次堆分配。现在只转换**模式串**
+            // （长度固定，几百字节）并预先算好，遍历 haystack 时逐字符
+            // tolower 比较，全程零分配。
+            std::string loweredFilter;
+            if (!st->caseSensitive && !st->filter.empty())
+            {
+                loweredFilter.resize(st->filter.size());
+                std::transform(st->filter.begin(), st->filter.end(), loweredFilter.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            }
+
+            auto finder = [&](const char *haystack) -> bool
+            {
+                if (haystack == nullptr)
+                {
+                    return false;
+                }
+                if (st->caseSensitive)
+                {
+                    return std::strstr(haystack, st->filter.c_str()) != nullptr;
+                }
+                if (loweredFilter.empty())
+                {
+                    return true;
+                }
+                const size_t n = loweredFilter.size();
+                for (const char *p = haystack; *p != '\0'; ++p)
+                {
+                    size_t i = 0;
+                    while (i < n && p[i] != '\0' &&
+                           static_cast<char>(std::tolower(static_cast<unsigned char>(p[i]))) == loweredFilter[i])
+                    {
+                        ++i;
+                    }
+                    if (i == n)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            // 三个搜索范围是「或」关系：类名/方法名/字段名命中任意一个都算。
+            // 都不勾时回退到只按类名筛（UI 上也会兜底，这里再兜一层，
+            // 因为 ConfigSave/Load 能从旧配置里读出三者皆 false 的状态）。
+            const bool searchClass = st->filterByClass || (!st->filterByMethod && !st->filterByField);
+            const bool searchMethod = st->filterByMethod;
+            const bool searchField = st->filterByField;
+
+            const size_t limit = st->showAllClasses ? allClasses.size() : (size_t)MAX_CLASSES;
+
+            for (size_t i = 0; i < allClasses.size() && filtered.size() < limit; i++)
+            {
+                auto klass = allClasses[i];
+                if (klass == nullptr)
+                {
+                    continue;
+                }
+                if (Il2cpp::GetClassIsEnum(klass))
+                {
+                    continue;
+                }
+
+                bool found = false;
+                // 命中的方法先攒着，确认命中后再填 methodMap ——
+                // 否则没命中的类也白填一遍（那才是最贵的部分）。
+                std::vector<MethodInfo *> matchedMethods;
+
+                if (searchClass && finder(klass->getFullName().c_str()))
+                {
+                    found = true;
+                }
+                if (searchMethod)
+                {
+                    for (auto m : klass->getMethods())
+                    {
+                        if (finder(m->getName()))
+                        {
+                            found = true;
+                            matchedMethods.push_back(m);
+                        }
+                    }
+                }
+                if (searchField && !found)
+                {
+                    for (auto f : klass->getFields())
+                    {
+                        if (finder(f->getName()))
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found)
+                {
+                    continue;
+                }
+
+                filtered.push_back(klass);
+
+                // 按方法名命中时只保留命中的方法（这正是「按方法搜索」的
+                // 语义：展开这个类只该看到相关方法）。否则填全部方法。
+                if (!matchedMethods.empty())
+                {
+                    for (auto m : matchedMethods)
+                    {
+                        methodMap[klass].push_back({m, m->getParamsInfo()});
+                    }
+                }
+                else
+                {
+                    for (auto m : klass->getMethods())
+                    {
+                        methodMap[klass].push_back({m, m->getParamsInfo()});
+                    }
+                }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOGE("后台筛选异常: %s", e.what());
+        }
+        catch (...)
+        {
+            LOGE("后台筛选未知异常");
+        }
+
+        std::lock_guard guard(st->mutex);
+        st->classes = std::move(allClasses);
+        st->filteredClasses = std::move(filtered);
+        st->methodMap = std::move(methodMap);
+        st->resultGen = st->requestGen;
+        st->hasResult = true;
+    }
+
+    void WorkerLoop()
+    {
+        for (;;)
+        {
+            std::shared_ptr<ClassesTab::FilterState> job;
+            {
+                std::unique_lock lock(g_queueMutex);
+                g_queueCv.wait(lock, []
+                                { return g_workerRunning == false || !g_queue.empty(); });
+                if (!g_workerRunning && g_queue.empty())
+                {
+                    return;
+                }
+                // 取最后一个：连续快速输入时，中间那些请求已经过期了。
+                // 保留它们只会让用户多等 —— 界面反正只显示最新结果。
+                auto &last = g_queue.back();
+                job = last.lock();
+                g_queue.clear();
+            }
+            if (!job)
+            {
+                // tab 已经销毁，shared_ptr 过期。直接跳过。
+                continue;
+            }
+            DoFilterWork(job);
         }
     }
-    else
-    {
-        classes = selectedImage->getClasses();
-    }
+} // namespace
 
-    // 大小写不敏感包含匹配。
-    //
-    // 旧实现是 `auto newA = a; auto newB = b; transform(tolower); find`
-    // —— 每比较一次就**分配两个完整副本**。这个比较在
-    // 「每个类 × 每个方法 × 每个字段」上跑一遍：5000 个类、平均 20 个方法
-    // 就是十万次比较、二十万次堆分配，而且全在渲染线程上、每敲一个字符触发一次。
-    // 用户体验就是「输入框卡住」。
-    //
-    // 现在只转换**模式串**（filter 长度固定，几百字节）并预先算好，
-    // 遍历 haystack 时用 std::tolower 逐字符比较，全程零分配。
-    std::string loweredFilter;
-    if (!caseSensitive && !filter.empty())
+void ClassesTabWorker::EnsureStarted()
+{
+    std::lock_guard guard(g_queueMutex);
+    if (g_workerRunning)
     {
-        loweredFilter.resize(filter.size());
-        std::transform(filter.begin(), filter.end(), loweredFilter.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return;
     }
-
-    auto finder = [&](const char *haystack) -> bool
+    if (g_worker.joinable())
     {
-        if (haystack == nullptr)
+        g_worker.join();
+    }
+    g_workerRunning = true;
+    g_worker = std::thread(WorkerLoop);
+    LOGI("类筛选工作线程已启动");
+}
+
+void ClassesTabWorker::Shutdown()
+{
+    std::thread worker;
+    {
+        std::lock_guard guard(g_queueMutex);
+        g_workerRunning = false;
+        g_queue.clear();
+        worker = std::move(g_worker);
+    }
+    g_queueCv.notify_all();
+    if (worker.joinable())
+    {
+        // 必须 join：全局 std::thread 析构时若仍 joinable 就是 std::terminate，
+        // 而这是注入进别人游戏的库 —— 触发它等于让用户的游戏莫名崩掉。
+        worker.join();
+        LOGI("类筛选工作线程已停止");
+    }
+}
+
+void ClassesTab::FilterClasses(const std::string &filterArg)
+{
+    if (!filterState)
+    {
+        filterState = std::make_shared<FilterState>();
+    }
+    {
+        std::lock_guard guard(filterState->mutex);
+        filterState->filter = filterArg;
+        filterState->caseSensitive = caseSensitive;
+        filterState->filterByClass = filterByClass;
+        filterState->filterByMethod = filterByMethod;
+        filterState->filterByField = filterByField;
+        filterState->showAllClasses = showAllClasses;
+        filterState->selectedImage = selectedImage;
+        filterState->includeAllImages = includeAllImages;
+        filterState->images = g_Images;
+        // 先清结果标志：新请求还没算完，此刻 UI 不该继续显示旧结果
+        // （那会让用户看到和输入框内容不匹配的列表）。
+        filterState->hasResult = false;
+        filterState->requestGen++;
+    }
+    {
+        std::lock_guard guard(g_queueMutex);
+        g_queue.push_back(filterState);
+    }
+    g_queueCv.notify_one();
+}
+
+bool ClassesTab::IsFilterPending()
+{
+    if (!filterState)
+    {
+        return false;
+    }
+    std::lock_guard guard(filterState->mutex);
+    return !filterState->hasResult && filterState->resultGen != filterState->requestGen;
+}
+
+bool ClassesTab::PollFilterResult()
+{
+    if (!filterState)
+    {
+        return false;
+    }
+    std::vector<Il2CppClass *> newClasses;
+    std::vector<Il2CppClass *> newFiltered;
+    ClassMethodMap newMethodMap;
+    {
+        std::lock_guard guard(filterState->mutex);
+        // 只认领与**当前请求**同代的结果：算得再快也没用，
+        // 代号对不上就说明用户已经又改过条件了。
+        if (!filterState->hasResult || filterState->resultGen != filterState->requestGen)
         {
             return false;
         }
-        if (caseSensitive)
-        {
-            return std::strstr(haystack, filter.c_str()) != nullptr;
-        }
-        if (loweredFilter.empty())
-        {
-            return true;
-        }
-        // 朴素子串搜索。用 std::search + 逐字符 tolower 同样零分配。
-        const size_t n = loweredFilter.size();
-        const char *start = haystack;
-        for (const char *p = start; *p != '\0'; ++p)
-        {
-            size_t i = 0;
-            while (i < n && p[i] != '\0' &&
-                   static_cast<char>(std::tolower(static_cast<unsigned char>(p[i]))) == loweredFilter[i])
-            {
-                ++i;
-            }
-            if (i == n)
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    for (int i = 0; i < classes.size() && filteredClasses.size() < (showAllClasses ? classes.size() : MAX_CLASSES); i++)
-    {
-        auto klass = classes[i];
-
-        if (/* Il2cpp::GetClassIsStatic(klass) || */ Il2cpp::GetClassIsEnum(klass))
-            continue;
-
-        // 三种范围现在是「或」关系：类名/方法名/字段名命中任意一个都算。
-        // 旧版本是互斥单选，用户必须先想清楚搜什么才能输关键词 ——
-        // 而实际使用中「类名或者方法名里有这个字符串」才是最自然的问法。
-        //
-        // 都不勾时回退到只按类名筛（UI 上也会兜底，这里再兜一层，
-        // 因为 ConfigSave/Load 能从旧配置里读出三者皆 false 的状态）。
-        const bool searchClass = filterByClass || (!filterByMethod && !filterByField);
-        const bool searchMethod = filterByMethod;
-        const bool searchField = filterByField;
-
-        bool found = false;
-        // 命中的类需要把方法列表填进 methodMap（UI 展开时才用）。
-        // 先攒着，确认命中之后再填 —— 否则没命中的类也白填一遍。
-        std::vector<MethodInfo *> matchedMethods;
-
-        if (searchClass && finder(klass->getFullName().c_str()))
-        {
-            found = true;
-        }
-
-        if (searchMethod)
-        {
-            for (auto m : klass->getMethods())
-            {
-                if (finder(m->getName()))
-                {
-                    found = true;
-                    matchedMethods.push_back(m);
-                }
-            }
-        }
-
-        if (searchField && !found)
-        {
-            for (auto f : klass->getFields())
-            {
-                if (finder(f->getName()))
-                {
-                    found = true;
-                    break;
-                }
-            }
-        }
-
-        if (!found)
-            continue;
-
-        filteredClasses.push_back(klass);
-
-        // 按方法名命中时只保留命中的方法（这正是「按方法搜索」的语义：
-        // 展开这个类只该看到相关方法）。否则填全部方法。
-        if (!matchedMethods.empty())
-        {
-            for (auto m : matchedMethods)
-            {
-                methodMap[klass].push_back({m, m->getParamsInfo()});
-            }
-        }
-        else
-        {
-            for (auto m : klass->getMethods())
-            {
-                methodMap[klass].push_back({m, m->getParamsInfo()});
-            }
-        }
+        newClasses = std::move(filterState->classes);
+        newFiltered = std::move(filterState->filteredClasses);
+        newMethodMap = std::move(filterState->methodMap);
+        filterState->hasResult = false;
+        filterState->classes.clear();
+        filterState->filteredClasses.clear();
+        filterState->methodMap.clear();
     }
+    classes = std::move(newClasses);
+    filteredClasses = std::move(newFiltered);
+    methodMap = std::move(newMethodMap);
+    // 持久化放在「认领结果」这里而不是每次按键：
+    // 旧实现每敲一个字符就写一次配置文件，纯属无谓的 IO。
     Tool::ConfigSave();
+    return true;
 }
 
 void to_json(nlohmann::ordered_json &j, const ClassesTab &p)

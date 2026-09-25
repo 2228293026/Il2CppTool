@@ -789,6 +789,10 @@ void *hack_thread(void *)
 __attribute__((destructor)) void lib_cleanup()
 {
     Tool::ShutdownDumper();
+    // 同样要停：筛选工作线程是全局 std::thread，析构时仍 joinable 就是
+    // std::terminate。而且它还在跑 il2cpp 调用 —— 不 join 就让进程退出，
+    // 等于让一个正在遍历托管元数据的线程被强行掐掉。
+    ClassesTabWorker::Shutdown();
 }
 
 __attribute__((constructor)) void lib_main()
