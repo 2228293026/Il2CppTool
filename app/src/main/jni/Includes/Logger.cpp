@@ -25,6 +25,65 @@ namespace logger
     bool AutoScroll = true;    // Keep scrolling if already at the bottom.
     bool WordWrap = true;
 
+    // 缓冲区上限。
+    //
+    // ImGuiTextBuffer 是无界增长的，而且没有 erase() 可用。日志页现在接到了
+    // 界面上，而 Draw 每帧会把整个缓冲区拷进一份快照（ImGui 的绘制会跨帧
+    // 持有那个指针，没法一直持锁）。一旦调试版跑一次对象扫描攒下几 MB，
+    // 就是每帧几 MB 的拷贝 + 上传纹理，直接把渲染线程压垮。
+    //
+    // 做法：超限时整体重建，只保留尾部那几行。重建比重拷贝罕见得多
+    // （要再攒 512KB 才会再来一次），完全可接受。
+    constexpr int kMaxLogBytes = 512 * 1024;
+    int g_droppedLines = 0; // 因超限被丢弃的行数（UI 上如实告知用户）
+
+    void TrimLocked()
+    {
+        if (Buf.size() <= kMaxLogBytes)
+        {
+            return;
+        }
+        // 找保留起点：向前越过 kMaxLogBytes，再往回找最近的换行，
+        // 保证从整行的开头开始保留。
+        int keepFrom = Buf.size() - kMaxLogBytes;
+        while (keepFrom > 0 && Buf[keepFrom - 1] != '\n')
+        {
+            keepFrom--;
+        }
+
+        std::string tail(Buf.begin() + keepFrom, Buf.begin() + Buf.size());
+
+        // 统计被丢掉的行数，供 UI 显示。
+        int dropped = 0;
+        for (int i = 0; i < keepFrom; i++)
+        {
+            if (Buf[i] == '\n')
+            {
+                dropped++;
+            }
+        }
+        g_droppedLines += dropped;
+
+        Buf.clear();
+        LineOffsets.clear();
+        LineOffsets.push_back(0);
+        Buf.append(tail.c_str(), tail.c_str() + tail.size());
+        const char *begin = Buf.begin();
+        for (int i = 0; i < Buf.size(); i++)
+        {
+            if (begin[i] == '\n')
+            {
+                LineOffsets.push_back(i + 1);
+            }
+        }
+    }
+
+    int DroppedLines()
+    {
+        std::lock_guard<std::mutex> guard(g_logMutex);
+        return g_droppedLines;
+    }
+
     void Clear()
     {
         std::lock_guard<std::mutex> guard(g_logMutex);
@@ -70,6 +129,47 @@ namespace logger
         for (int new_size = Buf.size(); old_size < new_size; old_size++)
             if (Buf[old_size] == '\n')
                 LineOffsets.push_back(old_size + 1);
+
+        TrimLocked();
+    }
+
+    // 界面上有哪些行（供「错误数」角标用）。
+    int ErrorCount()
+    {
+        std::lock_guard<std::mutex> guard(g_logMutex);
+        const char *begin = Buf.begin();
+        int total = Buf.size();
+        int count = 0;
+        // 只扫开头那几个字节，够判断前缀是不是 "[E] " 即可。
+        for (int i = 0; i + 3 < total; i++)
+        {
+            if (Buf[i] == '\n')
+            {
+                break;
+            }
+            if (begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+            {
+                count = 1; // 第一行就是错误
+                break;
+            }
+        }
+        for (int i = 1; i + 3 < total; i++)
+        {
+            if (Buf[i - 1] == '\n' && begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // 整个缓冲区导出成一个字符串，供「复制到剪贴板」用。
+    std::string CopyText()
+    {
+        std::lock_guard<std::mutex> guard(g_logMutex);
+        const char *begin = Buf.begin();
+        int total = Buf.size();
+        return total > 0 ? std::string(begin, begin + total) : std::string();
     }
 
     // NEVER CALL LOG HERE
@@ -96,15 +196,50 @@ namespace logger
         ImGui::SameLine();
         bool clear = ImGui::Button("Clear##log");
         ImGui::SameLine();
+        if (ImGui::Button("复制全部##log"))
+        {
+            // 贴到剪贴板方便直接发 issue —— 手机上没有 adb logcat 时，
+            // 这是把诊断信息带出去的主要途径。
+            ImGui::SetClipboardText(CopyText().c_str());
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("把全部日志复制到剪贴板");
+        }
         ImGui::SameLine();
-        // Filter.Draw("Filter", -100.0f);
+        // 过滤框：出问题时能直接按关键字筛，比如只看 [E]。
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputTextWithHint("##logfilter", "过滤（留空显示全部）", Filter.InputBuf,
+                                     IM_ARRAYSIZE(Filter.InputBuf)))
+        {
+            Filter.Build();
+        }
+        {
+            int dropped = DroppedLines();
+            if (dropped > 0)
+            {
+                // 如实告知，而不是让人以为日志莫名消失。
+                ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "已丢弃最早的 %d 行（超出 512KB 上限）", dropped);
+            }
+        }
 
         ImGui::Separator();
 
         static float fontScale = 0.5f;
-        ImGui::SliderFloat("Scale", &fontScale, 0.1f, 1.f, "%.2f");
-        static auto font = ImGui::GetFont();
-        static auto origScale = font->Scale;
+        if (ImGui::SliderFloat("Scale", &fontScale, 0.1f, 1.f, "%.2f"))
+        {
+            // 换字体就得重取指针：原实现把 `static auto font = ImGui::GetFont()`
+            // 缓存了下来，而字体图集可能在运行期重建（「设置 → 字体」的
+            // fontFullRange 需要重启工具，但 ImGui 自身在 Scale 变化、
+            // 或 io.FontDefault 被重新指向时也会重建）。
+            // 缓存下来的 ImFont* 指向的是**已释放的图集纹理**。
+            // 每帧重取：GetFont() 只是一次指针读，代价可忽略。
+        }
+        // 关键：不能缓存。ImFont* 指向的是字体图集，图集一旦重建
+        // （改 fontFullRange、换 io.FontDefault、缩放变化）旧指针就是野的。
+        // 每帧重取，代价只是一次指针读。
+        ImFont *font = ImGui::GetFont();
+        const float origScale = font->Scale;
         font->Scale = fontScale;
         ImGui::PushFont(font);
         if (ImGui::BeginChild("scrolling", ImVec2(0, 0), false, WordWrap ? 0 : ImGuiWindowFlags_HorizontalScrollbar))
@@ -118,24 +253,33 @@ namespace logger
             // 不能直接用 Buf.begin() —— ImGui 的绘制会一直持有那个指针，
             // 而另一个线程随时可能在 Buf 里追加日志触发 realloc，
             // 旧缓冲被释放后 ImGui 还在读它，就是读已释放内存。
+            //
+            // 但也不能**每帧**都拷：日志页开着的时候这是每帧一次全量复制 +
+            // 纹理上传，几 MB 的缓冲区直接把渲染线程压垮。
+            // 只有内容真的变了才重拷。
             static std::vector<char> bufSnapshot;
             static std::vector<int> offsetsSnapshot;
+            static int lastCopiedSize = -1;
             {
                 std::lock_guard<std::mutex> guard(g_logMutex);
-                const char *begin = Buf.begin();
-                int total = Buf.size();
-                if (total > 0)
+                const int total = Buf.size();
+                if (total != lastCopiedSize)
                 {
-                    bufSnapshot.assign(begin, begin + total);
-                }
-                else
-                {
-                    bufSnapshot.clear();
-                }
-                offsetsSnapshot.resize(LineOffsets.Size);
-                for (int i = 0; i < LineOffsets.Size; i++)
-                {
-                    offsetsSnapshot[i] = LineOffsets[i];
+                    const char *begin = Buf.begin();
+                    if (total > 0)
+                    {
+                        bufSnapshot.assign(begin, begin + total);
+                    }
+                    else
+                    {
+                        bufSnapshot.clear();
+                    }
+                    offsetsSnapshot.resize(LineOffsets.Size);
+                    for (int i = 0; i < LineOffsets.Size; i++)
+                    {
+                        offsetsSnapshot[i] = LineOffsets[i];
+                    }
+                    lastCopiedSize = total;
                 }
             }
             // 以 '\0' 结尾，满足 TextUnformatted / strncmp 的要求

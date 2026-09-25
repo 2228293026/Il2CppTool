@@ -1,6 +1,7 @@
 #pragma once
 #include <jni.h>
 #include <android/log.h>
+#include <string>
 
 // pasted straight from the imgui_demo.cpp
 namespace logger
@@ -12,6 +13,16 @@ namespace logger
     void DebugLog(const char *fmt, ...);
 
     void Draw(const char *title, bool *p_open = 0);
+
+    // 缓冲区里的错误行数 —— 给 tab 上的角标用。
+    int ErrorCount();
+
+    // 整个缓冲区导出成字符串（配合 ImGui::SetClipboardText）。
+    std::string CopyText();
+
+    // 因超出 512KB 上限而被丢弃的旧日志行数 —— UI 上如实告知用户，
+    // 否则「日志怎么没了」会让人以为哪里出了问题。
+    int DroppedLines();
 }; // namespace logger
 
 // 日志分级策略

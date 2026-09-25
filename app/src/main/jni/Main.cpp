@@ -316,6 +316,34 @@ void draw_thread()
             ImGui::EndTabItem();
         }
 
+        // 日志页。
+        //
+        // logger::Draw() 一直都有完整实现，但**从来没被任何地方调用过** ——
+        // 也就是说所有 LOGE/LOGW 的内容都只进了缓冲区，用户根本看不到。
+        // 手机上又没有 adb logcat，唯一的出口是 logcat，于是「为什么没生效」
+        // 这类问题基本无从查起。
+        //
+        // 上一轮把 LOGE 从「release 下被编译掉」修回来之后，把窗口接到界面上
+        // 才算真正闭环：拒绝/失败的原因当场就能看到，还能一键复制走。
+        {
+            int errors = logger::ErrorCount();
+            std::string logTabLabel = "日志";
+            if (errors > 0)
+            {
+                logTabLabel = "日志 (" + std::to_string(errors) + " 错误)";
+            }
+            if (ImGui::BeginTabItem(logTabLabel.c_str()))
+            {
+                ImGui::TextDisabled(
+                    "工具自身的诊断信息。正式版会记录 W/E/I 级（较吵的 D 级默认静默，"
+                    "用 build.ps1 -Debug 构建可打开）。\n"
+                    "手机上排查问题时可以用「复制全部」把内容贴出来。");
+                ImGui::Separator();
+                logger::Draw("日志");
+                ImGui::EndTabItem();
+            }
+        }
+
         if (ImGui::BeginTabItem("设置"))
         {
             ImGui::Separator();
