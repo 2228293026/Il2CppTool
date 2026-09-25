@@ -3364,10 +3364,15 @@ namespace
                 // 命中的方法先攒着，确认命中后再填 methodMap ——
                 // 否则没命中的类也白填一遍（那才是最贵的部分）。
                 std::vector<MethodInfo *> matchedMethods;
+                // 类名**本身**是否命中。只有靠方法名/字段名才捞出来的类，
+                // 才应该只展示相关方法；类名命中的类是「整类都相关」，
+                // 应当展示全部方法。
+                bool classNameMatched = false;
 
                 if (searchClass && finder(klass->getFullName().c_str()))
                 {
                     found = true;
+                    classNameMatched = true;
                 }
                 if (searchMethod)
                 {
@@ -3398,9 +3403,17 @@ namespace
 
                 filtered.push_back(klass);
 
-                // 按方法名命中时只保留命中的方法（这正是「按方法搜索」的
-                // 语义：展开这个类只该看到相关方法）。否则填全部方法。
-                if (!matchedMethods.empty())
+                // 什么时候只列命中的方法？
+                //
+                // 仅当这个类**是靠方法名捞出来的**（类名本身没命中）。
+                // 那种情况下「按方法搜索」的语义成立：展开它只该看到相关方法。
+                //
+                // 而如果类名本身就命中了，整个类都是相关的 —— 哪怕恰好有
+                // 几个方法名也含这个关键字，也应该展示**全部**方法。
+                // 旧实现没区分这两种情况，于是「同时勾选类名+方法名」时，
+                // 用户明明是奔着这个类去的，展开却只看到零星几个方法。
+                const bool narrowToMatches = !matchedMethods.empty() && !classNameMatched;
+                if (narrowToMatches)
                 {
                     for (auto m : matchedMethods)
                     {

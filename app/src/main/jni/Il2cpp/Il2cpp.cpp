@@ -1006,6 +1006,13 @@ namespace Il2cpp
             for (size_t i{0}; i < size; i++)
             {
                 auto klass = il2cpp_image_get_class(image, i);
+                // il2cpp_image_get_class 对越界/未解析的索引返回 NULL，
+                // 而「部分解析完成的 image」在 INIT_PENDING 阶段是常态。
+                // 旧代码直接 klass->getFullName() 就是空指针解引用。
+                if (klass == nullptr)
+                {
+                    continue;
+                }
                 if (klass->getFullName().compare(name) == 0)
                 {
                     result = klass;

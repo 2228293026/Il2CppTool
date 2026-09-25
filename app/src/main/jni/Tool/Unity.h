@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include "Includes/NeverDestroyedMutex.h"
+
 struct UnityEngine_Vector2
 {
     float x;
@@ -47,6 +49,15 @@ namespace Unity
     // ImGui context 存活标志。输入 hook 装在游戏的输入路径上，
     // context 被销毁后必须靠它直通原函数，不能再摸 ImGui。
     extern bool g_uiContextAlive;
+
+    // 保护 ImGuiIO 的跨线程访问。
+    //
+    // 输入 hook（游戏输入线程）往 g.InputEventsQueue push_back，
+    // 渲染线程的 NewFrame 遍历并清空同一个 vector —— 扩容 realloc 时
+    // free 旧缓冲，另一线程还在遍历就是 use-after-free。
+    // 渲染线程（Menu/ImGui.cpp 的 internalDrawMenu）必须用同一把锁。
+    // 定义在 Unity.cpp。
+    NeverDestroyedMutex &InputMutex();
     void HookInput();
     void UninstallInputHooks();
 }

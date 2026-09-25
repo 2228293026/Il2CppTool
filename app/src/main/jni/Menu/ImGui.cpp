@@ -1,5 +1,6 @@
 
 #include "ImGui.h"
+#include "Includes/NeverDestroyedMutex.h"
 #include "KittyMemory/KittyMemory.h"
 #include "dobby.h"
 #include "Includes/Utils.h"
@@ -307,12 +308,49 @@ void internalDrawMenu(int width, int height)
     if (!isInitialized)
         return;
 
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(width, height);
-    ImGui::NewFrame();
+    // 和输入 hook 互斥。
+    //
+    // NewFrame 会遍历 g.InputEventsQueue 并把它 resize(0) 清空，而游戏输入
+    // 线程上的 get_touchCount hook 正在往同一个 vector push_back —— 扩容时
+    // 会 free 旧缓冲，另一线程还在遍历就是 use-after-free。
+    // ImGui_ImplAndroid_NewFrame 写的 io.DisplaySize 也是同一条无同步路径。
+    // 详见 Tool/Unity.cpp 里 Unity::InputMutex 的说明。
+    {
+        std::lock_guard<NeverDestroyedMutex> guard(Unity::InputMutex());
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplAndroid_NewFrame(width, height);
+        ImGui::NewFrame();
+    }
 
     ImGui::SetNextWindowSize(ImVec2((float)width / 2, (float)height / 2), ImGuiCond_Once);
-    menuAddress();
+
+    // 异常边界 —— 每帧路径必须有，和 on_init 那个冷路径一样。
+    //
+    // 这个函数是 eglSwapBuffers 钩子，位于**游戏的渲染线程**上。
+    // 栈上没有有效的 unwind info（Dobby 的 trampoline 是手写汇编），
+    // 异常一路逃出去就是 std::terminate —— 用户的游戏直接没了。
+    //
+    // 之前只给 on_init 加了边界，逐帧的 menuAddress() 一直裸奔。而
+    // draw_thread 里有大量会抛的东西：nlohmann 的 type_error/out_of_range、
+    // std::string/vector 的 bad_alloc、ImGui 自己的 IM_ASSERT
+    // （本工程把 IM_ASSERT 映射成 __builtin_trap）。
+    // 一次 bad_alloc 就等于一局游戏没了。
+    //
+    // 注意 catch 里**不能**再调 ImGui 的东西：NewFrame 已经发出去了，
+    // 这一帧的 Begin/End 配对是残缺的，再操作窗口栈只会让状态更糟。
+    // 记录 + 放行，让游戏继续画它自己那一帧。
+    try
+    {
+        menuAddress();
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("internalDrawMenu: 菜单绘制抛出异常: %s", e.what());
+    }
+    catch (...)
+    {
+        LOGE("internalDrawMenu: 菜单绘制抛出未知异常");
+    }
 
     ImGui::Render();
 

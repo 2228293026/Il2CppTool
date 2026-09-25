@@ -22,7 +22,12 @@ static MethodInfo *s_get_touchCount = nullptr;
 static MethodInfo *s_GetMouseButton = nullptr;
 // ImGui 侧左键是否处于「已按下」状态。用于补发抬起事件：
 // 触摸被系统取消、或手指数归零而 Unity 没给 Ended 时，靠它兜底。
-static bool s_pressed = false;
+//
+// 必须是 atomic：下面两个 hook 跑在**游戏的输入线程**上，而它们读写的
+// ImGuiIO 由**渲染线程**的 NewFrame 更新。普通 bool 会被编译器自由提升
+// 读寄存器，跨线程毫无保证 —— 两个调用线程还会互相把「按住」状态改花，
+// 表现就是界面卡在按下态。
+static std::atomic<bool> s_pressed{false};
 
 static Il2CppClass *Input;
 
@@ -32,6 +37,28 @@ static Il2CppClass *Input;
 namespace Unity
 {
 bool g_uiContextAlive = false;
+
+// 保护 ImGuiIO 的跨线程访问。
+//
+// 关键冲突：输入 hook（游戏输入线程）调 io.AddMousePosEvent / AddMouseButtonEvent，
+// 它们最终 push_back 到 g.InputEventsQueue —— 一个**会扩容、会 realloc、
+// 释放旧缓冲**的 ImVector。而渲染线程的 ImGui::NewFrame() 正在遍历同一个
+// vector、然后 resize(0) 清空它。
+//
+// 后果不是「读到旧值」这么轻：realloc 会 free 旧缓冲，另一线程还在遍历它
+// 就是 use-after-free。io.DisplaySize 同样是无同步读写。
+//
+// 常见 Unity+GLES3 配置下玩家循环、get_touchCount、eglSwapBuffers 都在
+// UnityMain 上，可能碰巧不出事；但有独立渲染线程 / 多线程图形作业的游戏上
+// 就会炸。这里加锁 —— 临界区只是几个 push_back，代价可忽略，
+// 而 IM_ASSERT 映射的是 __builtin_trap（无声 SIGILL），赌不起。
+//
+// 用永不析构的单例：本库是注入进别人进程的，锁不能进 .fini_array。
+NeverDestroyedMutex &InputMutex()
+{
+    static NeverDestroyedMutex m;
+    return m;
+}
 } // namespace Unity
 
 extern bool collapsed;
@@ -54,6 +81,12 @@ bool Input_GetMouseButton(int n, MethodInfo *method)
     if (!Unity::g_uiContextAlive)
         return oInput_GetMouseButton(n, mi);
 
+    std::lock_guard<NeverDestroyedMutex> guard(Unity::InputMutex());
+    // 上面那个检查只是「进来时 context 还活着」；拿到锁之后必须重新确认
+    // —— 等锁期间渲染线程完全可能已经 DestroyContext 了。
+    if (!Unity::g_uiContextAlive)
+        return oInput_GetMouseButton(n, mi);
+
     ImGuiIO &io = ImGui::GetIO();
 
     ImVec2 size{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
@@ -70,6 +103,13 @@ int get_touchCount(MethodInfo *method)
     auto *mi = method ? method : s_get_touchCount;
 
     // ImGui context 已销毁时不能摸 GetIO()，见上方说明
+    if (!Unity::g_uiContextAlive)
+        return o_get_touchCount(mi);
+
+    // 整段持锁：下面所有 io.* 写入都往 g.InputEventsQueue 里 push_back，
+    // 而渲染线程的 NewFrame 正在遍历并清空同一个 vector。详见
+    // Unity::InputMutex 的注释。
+    std::lock_guard<NeverDestroyedMutex> guard(Unity::InputMutex());
     if (!Unity::g_uiContextAlive)
         return o_get_touchCount(mi);
 
@@ -91,6 +131,35 @@ int get_touchCount(MethodInfo *method)
         auto touch = Input->invoke_static_method<UnityEngine_Touch>("GetTouch", 0);
         float x = touch.m_Position.x;
         float y = io.DisplaySize.y - touch.m_Position.y;
+
+        // 一次性自检：UnityEngine_Touch 的字段偏移是**假设**的（注释写
+        // m_FingerId 在 0x10，即假定对象带 16 字节头），而按值返回的值类型
+        // 其实**没有** Il2CppObject 头 —— 那样的话所有偏移都该减去 16。
+        //
+        // 判据很干脆：m_Phase 必须落在 0~3（Began/Moved/Ended/Canceled）。
+        // 如果偏移错了，0x34 处读到的是别的字段（比如 m_Radius ≈ 0.5f，
+        // 即 0x3F000000 = 1056964608），下面四个分支一个都不会命中 ——
+        // 表现是**菜单对触摸完全无反应**，而且没有任何报错。
+        //
+        // 只报一次，不在热路径上刷屏。
+        static bool offsetsChecked = false;
+        if (!offsetsChecked)
+        {
+            offsetsChecked = true;
+            const int phase = static_cast<int>(touch.m_Phase);
+            if (phase < 0 || phase > 3)
+            {
+                LOGE("UnityEngine_Touch 字段偏移疑似错误: m_Phase=%d (应为 0..3)，"
+                     "m_Position=(%f, %f)。触摸将无法工作 —— "
+                     "请对照 dump 出来的 UnityEngine.Touch 布局修正 Unity.h",
+                     phase, (double)touch.m_Position.x, (double)touch.m_Position.y);
+            }
+            else
+            {
+                LOGI("UnityEngine_Touch 偏移自检通过: m_Phase=%d, m_Position=(%f, %f)", phase,
+                     (double)touch.m_Position.x, (double)touch.m_Position.y);
+            }
+        }
 
         if (touch.m_Phase == UnityEngine_TouchPhase::Began)
         {
