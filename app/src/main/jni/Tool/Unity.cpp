@@ -29,6 +29,12 @@ static MethodInfo *s_GetMouseButton = nullptr;
 // 表现就是界面卡在按下态。
 static std::atomic<bool> s_pressed{false};
 
+// 本次手势是否归菜单消费。
+//
+// 在 Began 那一刻定下来，整段手势不再变 —— 这是为了让游戏要么完整看到
+// 一次触摸、要么完全看不到，不会看到「开始了却凭空消失」（那会被当成取消）。
+static std::atomic<bool> s_touchCaptured{false};
+
 static Il2CppClass *Input;
 
 // ImGui context 是否还活着。输入 hook 装在游戏的输入路径上，
@@ -59,10 +65,63 @@ NeverDestroyedMutex &InputMutex()
     static NeverDestroyedMutex m;
     return m;
 }
+
+// 菜单窗口的屏幕矩形。渲染线程写、输入线程读，共用 InputMutex。
+static float g_menuRect[4] = {0.f, 0.f, 0.f, 0.f};
+static bool g_menuRectValid = false;
+
+// 注意：Publish/Query 都**不自己加锁**，调用方必须已持有 InputMutex。
+// 渲染线程那边是先取锁再调用，输入 hook 那边整个函数体都在锁内 ——
+// 两边都是「已持锁 → 调用」，这样不会自锁。
+void PublishMenuRect(float x0, float y0, float x1, float y1)
+{
+    g_menuRect[0] = x0;
+    g_menuRect[1] = y0;
+    g_menuRect[2] = x1;
+    g_menuRect[3] = y1;
+    g_menuRectValid = true;
+}
+
+bool QueryMenuRect(float &x0, float &y0, float &x1, float &y1)
+{
+    if (!g_menuRectValid)
+    {
+        return false;
+    }
+    x0 = g_menuRect[0];
+    y0 = g_menuRect[1];
+    x1 = g_menuRect[2];
+    y1 = g_menuRect[3];
+    return true;
+}
 } // namespace Unity
 
 extern bool collapsed;
 extern bool fullScreen;
+
+// 这次触摸归不归菜单？必须在**调用方已持有 InputMutex** 时使用。
+//
+// 优先用菜单窗口的实际矩形（渲染线程每帧发布），因为它对「当前触摸坐标」
+// 是精确的；而 io.WantCaptureMouse 是由**上一帧**的鼠标位置算出来的 ——
+// 第一次按下时手指还没落下，必然滞后一帧，于是点菜单会漏到游戏里。
+static bool ShouldCaptureAt(float x, float y, const ImGuiIO &io)
+{
+    // 折叠 + 全屏时左上角留了一块「唤出菜单」的角标区域，
+    // 点那里不应该算作「点菜单」，否则用户根本点不出菜单。
+    const ImVec2 corner{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
+    if (collapsed && fullScreen && x <= corner.x && y <= corner.y)
+    {
+        return false;
+    }
+
+    float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
+    if (Unity::QueryMenuRect(x0, y0, x1, y1))
+    {
+        return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+    }
+    // 矩形还没发布（菜单刚起来的第一帧）时退回旧判据。
+    return io.WantCaptureMouse;
+}
 
 bool Input_GetMouseButton(int n, MethodInfo *method)
 {
@@ -166,6 +225,18 @@ int get_touchCount(MethodInfo *method)
             io.AddMousePosEvent(x, y);
             io.AddMouseButtonEvent(0, true);
             s_pressed = true;
+            // **在手势开始的那一刻**就决定这次触摸归谁，之后不再变。
+            //
+            // 旧代码是每帧重新判断 WantCaptureMouse，于是手指从游戏区划到菜单上
+            // 时判断会中途翻转：游戏先拿到 touchCount==1（Began），下一帧突然
+            // 变成 0，而 Ended 从来没发给它。绝大多数游戏把「手指凭空消失」
+            // 当作取消 —— 表现为点一下菜单，角色当场停住、镜头拖拽弹回、
+            // 蓄力被丢弃。用起来就像菜单本身把游戏弄坏了。
+            //
+            // 现在用**当前触摸坐标**和菜单的实际矩形来判断，而不是用
+            // io.WantCaptureMouse（后者由上一帧的鼠标位置算出，第一次按下
+            // 时必然滞后一帧）。矩形由渲染线程每帧发布。
+            s_touchCaptured = ShouldCaptureAt(x, y, io);
         }
         else if (touch.m_Phase == UnityEngine_TouchPhase::Ended)
         {
@@ -173,6 +244,7 @@ int get_touchCount(MethodInfo *method)
             io.AddMouseButtonEvent(0, false);
             io.AddMousePosEvent(-1, -1);
             s_pressed = false;
+            s_touchCaptured = false;
         }
         else if (touch.m_Phase == UnityEngine_TouchPhase::Moved)
         {
@@ -189,6 +261,7 @@ int get_touchCount(MethodInfo *method)
                 io.AddMousePosEvent(-1, -1);
                 s_pressed = false;
             }
+            s_touchCaptured = false;
         }
     }
     else if (s_pressed)
@@ -198,14 +271,15 @@ int get_touchCount(MethodInfo *method)
         io.AddMouseButtonEvent(0, false);
         io.AddMousePosEvent(-1, -1);
         s_pressed = false;
+        s_touchCaptured = false;
     }
 
-    ImVec2 size{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
-    if (io.WantCaptureMouse && !(collapsed && fullScreen && (io.MousePos.x > size.x && io.MousePos.y > size.y)))
+    // 这次手势归菜单就返回 0，让游戏认为没有手指。
+    // 注意是「整段手势都返回 0」—— Began 那一刻就已经决定了，
+    // 所以游戏要么完整看到这次触摸，要么从头到尾看不到，
+    // 绝不会看到「开始了却凭空消失」。
+    if (s_touchCaptured)
     {
-        // 正在把这次触摸交给菜单消费：让游戏认为没有手指，
-        // 否则同一次触摸会既点菜单又点游戏。
-        // 注意这里不碰 s_pressed —— 按下状态由上面的触摸阶段维护。
         return 0;
     }
 
@@ -282,6 +356,11 @@ namespace Unity
 
     void UninstallInputHooks()
     {
+        // 顺手清掉手势归属标记。万一摘 hook 时正有一次触摸被判给了菜单，
+        // 这个 true 会留下来；下次重新装 hook 后游戏就一直收不到手指
+        // （表现为「重新初始化之后游戏点不动了」）。
+        s_touchCaptured = false;
+        s_pressed = false;
         if (!g_inputHooked)
         {
             return;

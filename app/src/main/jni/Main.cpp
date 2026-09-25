@@ -70,6 +70,9 @@ constexpr std::array<float, 7> scaleFactors = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 
 ImGuiStyle initialStyle;
 
 const char *title = OBFUSCATE("Il2CppTool v0.9 | HitMargin");
+// 菜单窗口标题的外部可见名字。Menu/ImGui.cpp 需要用 FindWindowByName
+// 拿到菜单的实际屏幕矩形，好让输入线程判断「这次触摸是不是落在菜单上」。
+const char *menuTitle = title;
 void draw_thread()
 {
     static ImVec2 lastSize = ImVec2(0, 0);

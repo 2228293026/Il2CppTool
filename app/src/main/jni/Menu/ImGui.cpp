@@ -7,6 +7,9 @@
 #include "Includes/obfuscate.h"
 #include "Includes/Logger.h"
 #include "imgui/imgui.h"
+// FindWindowByName / ImGuiWindow 都在内部头里，需要用它拿到菜单窗口的
+// 实际屏幕矩形（好让输入线程判断触摸是不是落在菜单上）。
+#include "imgui/imgui_internal.h"
 #include "Includes/Roboto-Regular.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 #include "imgui/backends/imgui_impl_android.h"
@@ -353,6 +356,21 @@ void internalDrawMenu(int width, int height)
     }
 
     ImGui::Render();
+
+    // 把菜单窗口的实际矩形发布给输入线程。
+    //
+    // 输入 hook 需要知道「这次触摸是不是落在菜单上」来决定要不要把手指
+    // 让给游戏。用 io.WantCaptureMouse 判断会滞后一帧（它由上一帧的鼠标
+    // 位置算出），于是点菜单会漏到游戏里；用这里的真实矩形则是当前帧精确的。
+    {
+        extern const char *menuTitle;
+        std::lock_guard<NeverDestroyedMutex> guard(Unity::InputMutex());
+        ImGuiWindow *w = ImGui::FindWindowByName(menuTitle);
+        if (w != nullptr)
+        {
+            Unity::PublishMenuRect(w->Pos.x, w->Pos.y, w->Pos.x + w->Size.x, w->Pos.y + w->Size.y);
+        }
+    }
 
     if (needClear)
     {

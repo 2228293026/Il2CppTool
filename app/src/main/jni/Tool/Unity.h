@@ -58,6 +58,17 @@ namespace Unity
     // 渲染线程（Menu/ImGui.cpp 的 internalDrawMenu）必须用同一把锁。
     // 定义在 Unity.cpp。
     NeverDestroyedMutex &InputMutex();
+
+    // 菜单窗口的屏幕矩形，由渲染线程每帧发布、输入线程读取。
+    //
+    // 用途：在触摸**开始**的那一刻就能判断它是不是落在菜单上。
+    // 之前只看 io.WantCaptureMouse，而它是由上一帧的鼠标位置算出来的 ——
+    // 于是「第一次按下」时用的是手指落下**之前**的位置，判断必然滞后一帧。
+    //
+    // 这两个函数**不自己加锁**，调用方必须已经持有 InputMutex。
+    void PublishMenuRect(float x0, float y0, float x1, float y1);
+    bool QueryMenuRect(float &x0, float &y0, float &x1, float &y1);
+
     void HookInput();
     void UninstallInputHooks();
 }
