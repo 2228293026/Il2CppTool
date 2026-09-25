@@ -79,48 +79,64 @@ std::mutex hookerMtx;
 #ifndef USE_FRIDA
 void hookerHandler(void *address, DobbyRegisterContext *ctx)
 {
+    // 这段跑在**游戏线程**上 —— 每次被 hook 的方法被调用都会进来一次。
+    // 所以这里的每一分开销都是直接加在游戏帧时间上的。
+    //
+    // 旧实现在这里 snprintf 出一个 512 字节的 "地址 | 方法名"，再拿它去
+    // visited 里做最多 maxLine 次 std::string 比较。方法每秒被调上千次时，
+    // 就是每秒上千次格式化 + 上千次字符串比较，外加全程持着全局互斥锁
+    // —— 工具本身成了拖慢游戏的原因。
+    //
+    // 现在：去重改用指针比较（address 已经是 hookerMap 的 key，精确且免费），
+    // 字符串只在**首次**命中、需要新建列表项时格式化一次。
     std::lock_guard guard(hookerMtx);
-    if (hookerMap.find(address) != hookerMap.end())
+    auto it = hookerMap.find(address);
+    if (it == hookerMap.end())
     {
-        auto &hookerData = hookerMap[address];
-        hookerData.hitCount++;
-        hookerData.time = 1.f;
+        // 已经被摘钩子但回调还在路上。不碰任何数据。
+        return;
+    }
+    auto &hookerData = it->second;
+    // relaxed：纯统计计数器，丢一次更新无所谓，换取不在游戏路径上加锁。
+    hookerData.hitCount.fetch_add(1, std::memory_order_relaxed);
+    hookerData.time = 1.f;
 
-        auto name = hookerData.method->getName();
+    int i = 0;
+    for (auto vit = HookerData::visited.rbegin(); vit != HookerData::visited.rend(); ++vit)
+    {
+        if (i >= maxLine)
+        {
+            break;
+        }
+        // 指针比较取代字符串比较
+        if (vit->address == address)
+        {
+            vit->goneTime = 10.f;
+            vit->time = 2.f;
+            vit->hitCount++;
+            return;
+        }
+        i++;
+    }
+
+    // 走到这里说明这个方法第一次出现在「最近调用」列表里 ——
+    // 此时才做一次字符串格式化。
+    HookerTrace trace;
+    trace.address = address;
+    trace.time = 2.f;
+    trace.goneTime = 10.f;
+    trace.hitCount = 0;
+    if (hookerData.method)
+    {
+        const char *name = hookerData.method->getName();
         // 方法名长度不受控（混淆过的 il2cpp 元数据可以很长），
         // 128 字节固定缓冲 + 无界 sprintf 就是栈溢出。
         char buffer[512]{0};
-        snprintf(buffer, sizeof(buffer), "%p | %s", (void *)hookerData.method->getAbsAddress(), name);
-        if (!HookerData::visited.empty())
-        {
-            // auto &back = HookerData::visited.back();
-            // if (back.name == name)
-            // {
-            //     back.goneTime = 10.f;
-            //     back.time = 2.f;
-            //     back.hitCount++;
-            //     return;
-            // }
-            int i = 0;
-            for (auto it = HookerData::visited.rbegin(); it != HookerData::visited.rend(); ++it)
-            {
-                if (i >= maxLine)
-                {
-                    break;
-                }
-                if (it->name == buffer)
-                {
-                    it->goneTime = 10.f;
-                    it->time = 2.f;
-                    it->hitCount++;
-                    return;
-                }
-                i++;
-            }
-        }
-        HookerData::visited.push_back({buffer, 2.f, 10.f, 0});
-        // LOGD("%s", hookerData.method->getName());
+        snprintf(buffer, sizeof(buffer), "%p | %s", (void *)hookerData.method->getAbsAddress(),
+                 name ? name : "?");
+        trace.name = buffer;
     }
+    HookerData::visited.push_back(std::move(trace));
 }
 #endif
 
@@ -1575,9 +1591,17 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
     }
     else
     {
-        sprintf(label, "Restore");
-        auto value = it->second.hitCount;
-        ImGui::Text("Hit Count %d", value);
+        snprintf(label, sizeof(label), "Restore");
+        auto value = it->second.hitCount.load(std::memory_order_relaxed);
+        auto cps = it->second.callsPerSecond;
+        if (cps > 0.f)
+        {
+            ImGui::Text("调用 %d 次 (%.0f 次/秒)", value, cps);
+        }
+        else
+        {
+            ImGui::Text("调用 %d 次", value);
+        }
         ImGui::Separator();
     }
     if (ImGui::Button(label))
@@ -1590,6 +1614,44 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
     if (hooked)
     {
         auto &backtraced = it->second.backtraced;
+
+        // 调用频率曲线。
+        //
+        // 累计次数只能告诉你「它被调过」，告诉不了你「它有多热」。
+        // 一个被调 100 次的方法可能只是启动时走了一遍；而 5000 次/秒意味着
+        // 它在每帧的关键路径上 —— 这正是用户想知道的信息。
+        //
+        // 数据由 Tool::SampleHookRates() 在渲染线程按 250ms 采样，
+        // 窗口约 30 秒。绝不放在 hook 回调里采样：那会让 UI 绘制变成
+        // 游戏主路径上的额外开销。
+        {
+            // rateHistory 只被渲染线程碰（采样 + 绘制），所以这里不额外加锁。
+            // 拷贝一份再画：ImGui::PlotLines 会持有这个指针到绘制结束，
+            // 而下一帧的采样 push_back 可能触发 vector 重新分配。
+            auto history = it->second.rateHistory;
+            if (history.empty())
+            {
+                ImGui::TextDisabled("等待采样…（每 250ms 一次，约 30 秒窗口）");
+            }
+            else
+            {
+                float maxRate = 0.f;
+                for (float v : history)
+                {
+                    maxRate = std::max(maxRate, v);
+                }
+                // 纵轴下限给 1，避免「一直是 0」时曲线贴在底边看不出「无数据」
+                ImGui::PlotLines("##calls", history.data(), (int)history.size(), 0, nullptr, 0.f,
+                                 std::max(maxRate * 1.15f, 1.f), ImVec2(0, 40));
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("最近 %d 次采样（250ms 一次）\n峰值 %.0f 次/秒\n当前 %.0f 次/秒",
+                                      (int)history.size(), maxRate, it->second.callsPerSecond);
+                }
+            }
+        }
+        ImGui::Separator();
+
 #ifdef USE_FRIDA
         if (!it->second.backtracing)
         {
@@ -1682,9 +1744,19 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
         if (hooked)
         {
             std::lock_guard guard(hookerMtx);
-            int hitCount = hookerMap[method->methodPointer].hitCount;
-            char hitLabel[64]{0};
-            snprintf(hitLabel, sizeof(hitLabel), "Hit Count %d | ", hitCount);
+            int hitCount = hookerMap[method->methodPointer].hitCount.load(std::memory_order_relaxed);
+            char hitLabel[96]{0};
+            // 次/秒比累计次数更能说明问题：100 次可能是启动时调的，
+            // 1000 次/秒 说明它在每帧的关键路径上。
+            float cps = hookerMap[method->methodPointer].callsPerSecond;
+            if (cps > 0.f)
+            {
+                snprintf(hitLabel, sizeof(hitLabel), "%.0f/s | 共 %d | ", cps, hitCount);
+            }
+            else
+            {
+                snprintf(hitLabel, sizeof(hitLabel), "共 %d 次 | ", hitCount);
+            }
             Util::prependStringToBuffer(treeLabel, sizeof(treeLabel), hitLabel);
         }
         else if (patched)

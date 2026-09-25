@@ -110,6 +110,76 @@ namespace Tool
         HookerData::visited = CircularBuffer<HookerTrace>(max);
     }
 
+    // 采样各 hook 的调用频率，供 UI 画曲线。
+    //
+    // 每帧在**渲染线程**调用，绝不能放进 hook 回调里 —— 那是游戏的执行路径，
+    // 采样意味着遍历整张 hookerMap，那会直接变成每帧一次的游戏卡顿来源。
+    //
+    // hitCount 用 relaxed 原子就是为这里准备的：采样读它不需要拿互斥锁，
+    // 读到的值可能略滞后一两次更新，对「次/秒」这种统计量毫无影响。
+    void SampleHookRates()
+    {
+        // 采样间隔太短曲线会很抖，太长则丢掉尖峰。250ms 是个平衡点。
+        constexpr double kSampleInterval = 0.25;
+        // 保留的历史点数。120 * 0.25s = 30 秒的窗口。
+        constexpr size_t kHistorySize = 120;
+
+        const auto now = std::chrono::steady_clock::now();
+        const double nowSec = std::chrono::duration<double>(now.time_since_epoch()).count();
+
+        std::lock_guard guard(hookerMtx);
+        // 按 key 排序后再处理：hookerMap 的 key 是函数地址（指针），
+        // unordered_map 的遍历顺序对同一份内容只是「碰巧稳定」，换个插入
+        // 顺序就变。UI 列表依赖这个顺序做稳定排序，顺序不稳会让同频率的
+        // 方法在列表里上下跳动。
+        std::vector<void *> addresses;
+        addresses.reserve(hookerMap.size());
+        // NOLINTNEXTLINE 盖不住这条：诊断落在 for-range 语句的 range 上，
+        // 跨行，所以改成同行标注。
+        // 见上面注释：这次遍历只收集 key，真正决定顺序的是紧接着的 sort。
+        for (auto &[addr, data] : hookerMap) // NOLINT(bugprone-nondeterministic-pointer-iteration-order)
+        {
+            addresses.push_back(addr);
+        }
+        std::sort(addresses.begin(), addresses.end());
+
+        for (void *addr : addresses)
+        {
+            auto it = hookerMap.find(addr);
+            // 理论上不会发生（刚持锁取的 key），但 find 失败时必须跳过，
+            // 不能假设 find 一定成功。
+            if (it == hookerMap.end())
+            {
+                continue;
+            }
+            auto &data = it->second;
+            if (data.lastSampleTime == 0.0)
+            {
+                // 第一次见到：只记录基线，不产生一个假的尖峰
+                data.lastSampleTime = nowSec;
+                data.sampledHitCount = data.hitCount.load(std::memory_order_relaxed);
+                continue;
+            }
+            const double dt = nowSec - data.lastSampleTime;
+            if (dt < kSampleInterval)
+            {
+                continue;
+            }
+            const int current = data.hitCount.load(std::memory_order_relaxed);
+            const int delta = current - data.sampledHitCount;
+            data.sampledHitCount = current;
+            data.lastSampleTime = nowSec;
+            // 负数只可能来自计数器回绕/重置，夹到 0
+            data.callsPerSecond = delta > 0 ? static_cast<float>(delta / dt) : 0.f;
+
+            if (data.rateHistory.size() >= kHistorySize)
+            {
+                data.rateHistory.erase(data.rateHistory.begin());
+            }
+            data.rateHistory.push_back(data.callsPerSecond);
+        }
+    }
+
     void InitScreenSize()
     {
         auto Display = Il2cpp::FindClass("UnityEngine.Display");
@@ -202,6 +272,9 @@ namespace Tool
 
     void Draw()
     {
+        // 采样放在 UI 之前：这一帧画出来的曲线要用这一帧刚采到的数据。
+        SampleHookRates();
+
         // 对象绘制管理器：开关位于工具页顶部，仅在状态变化时初始化/关闭
         static bool objMgrRunning = false;
         ImGui::Checkbox("对象绘制管理器", &ObjectDrawManager::showObjectManager);
@@ -509,8 +582,15 @@ namespace Tool
         if (DobbyInstrument((void *)method->methodPointer, (dobby_instrument_callback_t)hookerHandler) == 0) {
             printHex(method->methodPointer);
             std::lock_guard guard(hookerMtx);
-            hookerMap[method->methodPointer].hitCount = 0;
-            hookerMap[method->methodPointer].method = method;
+            auto &data = hookerMap[method->methodPointer];
+            // 装钩子前先归零：否则复用同一地址的旧条目会带着上一轮的计数和
+            // 曲线过来，UI 上看起来像「刚装上就已经被调了几千次」。
+            data.hitCount.store(0, std::memory_order_relaxed);
+            data.sampledHitCount = 0;
+            data.callsPerSecond = 0.f;
+            data.rateHistory.clear();
+            data.lastSampleTime = 0.0;
+            data.method = method;
             return true;
         } else {
             LOGE("Failed to instrument %s", method->getName());

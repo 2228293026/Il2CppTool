@@ -196,14 +196,26 @@ void draw_thread()
                 // 既是被并发写的数据竞争，也可能因为中途 erase 变成野指针。
                 // 改成持锁拷一份最小快照（MethodInfo* + hitCount），之后只读快照。
                 // MethodInfo* 指向游戏元数据，本身稳定，可以带出锁外使用。
-                std::vector<std::pair<MethodInfo *, int>> sortedHooker;
+                // 除累计次数外一并带上「次/秒」：按累计次数排序只能找出
+                // 「启动时跑得最多的」，按频率排序才能找出「每帧都在跑的」——
+                // 后者才是用户真正想找的热点。
+                struct HookerSnapshot
+                {
+                    MethodInfo *method;
+                    int hitCount;
+                    float callsPerSecond;
+                };
+                std::vector<HookerSnapshot> sortedHooker;
                 {
                     std::lock_guard guard(hookerMtx);
                     ImGui::Text("追踪方法数量 : %zu", hookerMap.size());
                     for (auto &[name, data] : hookerMap)
                     {
-                        if (data.hitCount > 0 && data.method)
-                            sortedHooker.emplace_back(data.method, data.hitCount);
+                        int hits = data.hitCount.load(std::memory_order_relaxed);
+                        if (hits > 0 && data.method)
+                        {
+                            sortedHooker.push_back({data.method, hits, data.callsPerSecond});
+                        }
                     }
                 }
                 if (!sortedHooker.empty())
@@ -212,18 +224,32 @@ void draw_thread()
                     {
                         ImGui::OpenPopup("QuickRestorePopup");
                     }
+                    // 先按频率降序，频率相同再按累计次数降序
                     std::sort(sortedHooker.begin(), sortedHooker.end(),
-                              [](const auto &a, const auto &b) { return a.second > b.second; });
+                              [](const auto &a, const auto &b)
+                              {
+                                  if (a.callsPerSecond != b.callsPerSecond)
+                                      return a.callsPerSecond > b.callsPerSecond;
+                                  return a.hitCount > b.hitCount;
+                              });
                     ImGui::BeginChild("TracerList", ImVec2(0, 0), ImGuiChildFlags_None,
                                       ImGuiWindowFlags_HorizontalScrollbar);
                     auto &tab = Tool::GetFirstTab();
-                    for (auto &[method, hitCount] : sortedHooker)
+                    for (auto &[method, hitCount, cps] : sortedHooker)
                     {
                         // 类名 + 方法名长度不受控（混淆过的 il2cpp 名字可以很长），
                         // 固定 256 字节 + sprintf 就是栈溢出，改成 snprintf 截断。
                         char label[256]{0};
-                        snprintf(label, sizeof(label), "%s::%s (%dx)###%p", method->getClass()->getName(),
-                                 method->getName(), hitCount, method);
+                        if (cps > 0.f)
+                        {
+                            snprintf(label, sizeof(label), "%s::%s  %.0f/s (%d)###%p",
+                                     method->getClass()->getName(), method->getName(), cps, hitCount, method);
+                        }
+                        else
+                        {
+                            snprintf(label, sizeof(label), "%s::%s (%d)###%p",
+                                     method->getClass()->getName(), method->getName(), hitCount, method);
+                        }
                         // if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
                         // {
                         //     toBeErased = v;
@@ -249,7 +275,7 @@ void draw_thread()
                                           ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_MenuBar))
                     {
                         MethodInfo *toBeErased = nullptr;
-                        for (auto &[method, hitCount] : sortedHooker)
+                        for (auto &[method, hitCount, cps] : sortedHooker)
                         {
                             char label[256]{0};
                             snprintf(label, sizeof(label), "%s::%s (%dx)###%p", method->getClass()->getName(),

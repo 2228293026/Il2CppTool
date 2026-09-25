@@ -193,26 +193,37 @@ namespace Frida
                 // }
             }
 
-            auto name = hookerData->method->getName();
-            char buffer[256]{0};
-            sprintf(buffer, "%p | %s::%s", (void *)hookerData->method->getAbsAddress(),
-                    hookerData->method->getClass()->getName(), name);
-            if (!HookerData::visited.empty())
+            // 和 hookerHandler 保持一致：按指针去重，字符串只在首次命中时格式化。
+            //
+            // 顺带修掉这里的两个问题：
+            // - `sprintf` 进 buffer[256]，而 %p + 类名 + 方法名长度都不受控
+            //   （混淆过的 il2cpp 元数据可以很长）→ 栈溢出。
+            // - 每次命中都重新格式化再逐条比较字符串。Frida 回调同样跑在
+            //   游戏线程上。
+            for (auto it = HookerData::visited.rbegin(); it != HookerData::visited.rend(); ++it)
             {
-                for (auto it = HookerData::visited.rbegin(); it != HookerData::visited.rend(); ++it)
+                if (it->address == (void *)hookerData->method->methodPointer)
                 {
-                    if (it->name == buffer)
-                    {
-                        it->goneTime = 10.f;
-                        it->time = 2.f;
-                        it->hitCount++;
-                        // std::rotate(HookerData::visited.rbegin(), it + 1, HookerData::visited.rend());
-                        return;
-                    }
+                    it->goneTime = 10.f;
+                    it->time = 2.f;
+                    it->hitCount++;
+                    // std::rotate(HookerData::visited.rbegin(), it + 1, HookerData::visited.rend());
+                    return;
                 }
-                // LOGD("%s", hookerData->method->getName());
             }
-            HookerData::visited.push_back({buffer, 2.f, 10.f, 0});
+
+            HookerTrace trace;
+            trace.address = (void *)hookerData->method->methodPointer;
+            trace.time = 2.f;
+            trace.goneTime = 10.f;
+            trace.hitCount = 0;
+            char buffer[512]{0};
+            const char *name = hookerData->method->getName();
+            const char *className = hookerData->method->getClass() ? hookerData->method->getClass()->getName() : nullptr;
+            snprintf(buffer, sizeof(buffer), "%p | %s::%s", (void *)hookerData->method->getAbsAddress(),
+                     className ? className : "?", name ? name : "?");
+            trace.name = buffer;
+            HookerData::visited.push_back(std::move(trace));
         }
 
         virtual void on_leave(Gum::InvocationContext *context)
