@@ -1197,6 +1197,18 @@ namespace Il2cpp
         return il2cpp_field_get_type(field);
     }
 
+    // 枚举的底层存储类型。C# enum 的底层可以是 byte/sbyte/short/ushort/
+    // int/uint/long/ulong，宽度不一；读值时必须按这个类型来，否则会用
+    // 4 字节的临时变量去接 8 字节的字段，把调用者的栈写坏。
+    Il2CppType *GetEnumBaseType(Il2CppClass *klass)
+    {
+        if (klass == nullptr || !il2cpp_class_enum_basetype)
+        {
+            return nullptr;
+        }
+        return il2cpp_class_enum_basetype(klass);
+    }
+
     const char *GetFieldName(FieldInfo *field)
     {
         return il2cpp_field_get_name(field);

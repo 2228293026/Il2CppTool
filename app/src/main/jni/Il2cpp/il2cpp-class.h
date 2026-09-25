@@ -267,7 +267,8 @@ struct Il2CppObject
 };
 
 void AddCustomDumpHandler(std::function<nlohmann::ordered_json(Il2CppObject *, Il2CppType *, size_t)> handler);
-void ChangeMaxListArraySize(size_t size, std::function<void()> callback);
+// 临时调高列表/数组展开上限，跑完 callback 自动恢复（异常安全）。
+void ChangeMaxListArraySize(int size, std::function<void()> callback);
 
 struct _Il2CppArray : Il2CppObject
 {
@@ -333,11 +334,18 @@ struct Il2CppClass
 
 struct FieldInfo
 {
-
+    // 注意：il2cpp_field_get_value / _static_get_value 会写入
+    // **field->type 的 data_size 字节**，与 T 的大小无关。
+    // 拿 int 去读一个 8 字节的枚举/字段，运行时就会往 4 字节的栈变量上写
+    // 8 字节 —— 直接踩坏调用者的栈帧。T 比字段窄时还会把未初始化的
+    // 高位字节当成值返回。
+    //
+    // 所以：只在类型宽度确定匹配时用这两个模板。要读枚举请用
+    // getEnumValue()，它会按真实底层类型取值。
     template <typename T>
     T getValue(Il2CppObject *instance)
     {
-        T value;
+        T value{};
         Il2cpp::GetFieldValue(instance, this, &value);
         return value;
     }
@@ -345,10 +353,18 @@ struct FieldInfo
     template <typename T>
     T getStaticValue()
     {
-        T value;
+        T value{};
         Il2cpp::GetFieldStaticValue(this, &value);
         return value;
     }
+
+    // 按底层类型宽度读枚举静态成员（MyEnum.Foo）的值。
+    // 返回 int64_t：uint64 底色的成员用位模式承载。
+    //
+    // 为什么不能直接 getStaticValue<int>()：il2cpp 会按字段的真实宽度写入，
+    // C# enum 底层可以是 long/ulong（8 字节），用 4 字节变量去接就是往
+    // 调用者栈上多写 4 字节 —— 直接破坏栈帧。
+    static int64_t getEnumStaticValue(FieldInfo *field);
 
     template <typename T>
     void setValue(Il2CppObject *instance, T value)

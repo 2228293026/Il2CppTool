@@ -48,12 +48,23 @@ nlohmann::ordered_json Handler(Il2CppObject *object, Il2CppType *type, size_t ma
 int ListArraySize = 5;
 bool NoCircularReference = true;
 
-void ChangeMaxListArraySize(size_t size, std::function<void()> callback)
+// 临时把列表/数组的展开上限调高，跑完 callback 再恢复。
+//
+// RAII 恢复：callback 里会做 JSON 构造、对象遍历，抛异常很常见。
+// 旧代码在 callback 之后才恢复，异常一旦发生 ListArraySize 就永久停在
+// 大值上，之后每次 dump 都把整个数组/列表完整展开 —— 工具会越来越卡。
+void ChangeMaxListArraySize(int size, std::function<void()> callback)
 {
-    auto tmp = ListArraySize;
-    ListArraySize = size;
+    struct Guard
+    {
+        int old;
+        ~Guard()
+        {
+            ListArraySize = old;
+        }
+    } guard{ListArraySize};
+    ListArraySize = std::clamp(size, 5, 10000);
     callback();
-    ListArraySize = tmp;
 }
 
 // object may be null
@@ -401,15 +412,34 @@ std::pair<Il2CppObject *, nlohmann::ordered_json> Il2CppObject::dump(const std::
         return {nullptr, nlohmann::ordered_json()};
     }
     std::vector<uintptr_t> visited;
-    ListArraySize = 100;
-    NoCircularReference = false;
+
+    // ListArraySize / NoCircularReference 是全局状态，这里临时改大以便
+    // 展开完整对象。旧代码在函数尾部手动恢复：一旦 dump 中途抛异常
+    // （JSON 分配失败、深递归），这两个全局就永远停在「展开模式」，
+    // 之后每一次 dump 都会跑满整个对象图 —— 表现为工具越用越卡。
+    // RAII 保证异常路径也恢复。
+    struct DumpGlobalsGuard
+    {
+        int oldListArraySize;
+        bool oldNoCircularReference;
+        DumpGlobalsGuard()
+            : oldListArraySize(ListArraySize), oldNoCircularReference(NoCircularReference)
+        {
+            ListArraySize = 100;
+            NoCircularReference = false;
+        }
+        ~DumpGlobalsGuard()
+        {
+            ListArraySize = oldListArraySize;
+            NoCircularReference = oldNoCircularReference;
+        }
+    } globalsGuard;
+
     nlohmann::ordered_json result;
     if (!noDump)
     {
         result = object->dump(visited, 2);
     }
-    NoCircularReference = true;
-    ListArraySize = 5;
     return {object, result};
 }
 
@@ -749,6 +779,67 @@ uintptr_t FieldInfo::getOffset()
 const char *FieldInfo::getName()
 {
     return Il2cpp::GetFieldName(this);
+}
+
+int64_t FieldInfo::getEnumStaticValue(FieldInfo *field)
+{
+    if (field == nullptr)
+    {
+        return 0;
+    }
+    auto *fieldType = field->getType();
+    if (fieldType == nullptr)
+    {
+        return 0;
+    }
+    // 字段是枚举类型时，它的 class 才能问出底层存储类型。
+    auto *baseType = Il2cpp::GetEnumBaseType(fieldType->getClass());
+
+    // 关键：il2cpp_field_static_get_value 写入的字节数由字段类型决定，
+    // 与目标变量无关。拿 4 字节缓冲去接一个 8 字节的枚举字段，运行时就会
+    // 多写 4 字节，踩坏调用者的栈帧 —— 而这个 bug 只在「目标游戏里真的
+    // 存在 long 底色的枚举」时才发作，本地测不出来。
+    const char *name = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
+    // 注意：这里必须显式捕获 field —— 它是本函数的参数，
+    // 泛型 lambda 在无捕获默认时不能用外层变量。
+    auto read = [field](auto tag) -> int64_t {
+        using V = decltype(tag);
+        V v{};
+        Il2cpp::GetFieldStaticValue(field, &v);
+        return static_cast<int64_t>(v);
+    };
+    // uint64 超过 INT64_MAX 时用位模式承载（不丢位）。
+    auto readU64 = [field]() -> int64_t {
+        uint64_t v = 0;
+        Il2cpp::GetFieldStaticValue(field, &v);
+        return static_cast<int64_t>(v);
+    };
+
+    if (name)
+    {
+        if (strcmp(name, "System.Byte") == 0)
+            return read(uint8_t{});
+        if (strcmp(name, "System.SByte") == 0)
+            return read(int8_t{});
+        if (strcmp(name, "System.Int16") == 0)
+            return read(int16_t{});
+        if (strcmp(name, "System.UInt16") == 0 || strcmp(name, "System.Char") == 0)
+            return read(uint16_t{});
+        if (strcmp(name, "System.Int32") == 0)
+            return read(int32_t{});
+        if (strcmp(name, "System.UInt32") == 0)
+            return read(uint32_t{});
+        if (strcmp(name, "System.Int64") == 0)
+            return read(int64_t{});
+        if (strcmp(name, "System.UInt64") == 0)
+            return readU64();
+        if (strcmp(name, "System.Boolean") == 0)
+            return read(bool{}) ? 1 : 0;
+    }
+
+    // 问不到底层类型时按 8 字节读：多读的是自己栈上的临时变量，
+    // 不会破坏别人的内存，比猜 4 字节安全。
+    return read(int64_t{});
 }
 
 bool Il2CppType::isPointer()

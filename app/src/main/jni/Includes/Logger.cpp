@@ -1,12 +1,24 @@
 #include "Logger.h"
 
-#include "Logger.h"
 #include "imgui/imgui.h"
 #include <cstdio>
+#include <mutex>
 #include <string.h>
+#include <vector>
 
 namespace logger
 {
+    // Buf / LineOffsets 会被多个线程访问：
+    //   - 游戏线程的 hook 回调（被 hook 的方法里就能打日志）
+    //   - 后台扫描线程
+    //   - 渲染线程的 Draw / Clear
+    // 而 ImVector 在扩容时会 realloc 并释放旧缓冲 —— 渲染线程正拿着
+    // Buf.begin() 遍历时另一个线程 realloc 掉那块内存，就是堆破坏。
+    //
+    // 所以 AddLog/Clear 与 Draw 全程持锁，Draw 还在锁内把内容拷进
+    // 局部快照后再交给 ImGui 渲染：ImGui 的绘制代码会跨多帧持有
+    // 那个指针，不可能整段都锁着。
+    std::mutex g_logMutex;
     ImGuiTextBuffer Buf;
     ImGuiTextFilter Filter;
     ImVector<int> LineOffsets; // Index to lines offset. We maintain this with AddLog() calls.
@@ -15,6 +27,7 @@ namespace logger
 
     void Clear()
     {
+        std::lock_guard<std::mutex> guard(g_logMutex);
         Buf.clear();
         LineOffsets.clear();
         LineOffsets.push_back(0);
@@ -34,6 +47,11 @@ namespace logger
 
     void AddLog(const char *prefix, const char *fmt, ...)
     {
+        // 整段临界区：old_size 的读取、append、扫描 '\n' 填充 LineOffsets
+        // 必须原子完成，否则 LineOffsets 会和 Buf 对不上（行号指向错位的
+        // 位置，Draw 里会切出乱码甚至越界）。
+        std::lock_guard<std::mutex> guard(g_logMutex);
+
         int old_size = Buf.size();
         // 需要 prefix + fmt + '\n' + '\0' 四部分。
         // 旧代码只分配了 strlen(prefix)+strlen(fmt)+1，sprintf 必然多写 1 字节
@@ -95,8 +113,36 @@ namespace logger
                 Clear();
 
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-            const char *buf = Buf.begin();
-            const char *buf_end = Buf.end();
+
+            // 关键：在锁内把内容拷进本地快照，之后再交给 ImGui。
+            // 不能直接用 Buf.begin() —— ImGui 的绘制会一直持有那个指针，
+            // 而另一个线程随时可能在 Buf 里追加日志触发 realloc，
+            // 旧缓冲被释放后 ImGui 还在读它，就是读已释放内存。
+            static std::vector<char> bufSnapshot;
+            static std::vector<int> offsetsSnapshot;
+            {
+                std::lock_guard<std::mutex> guard(g_logMutex);
+                const char *begin = Buf.begin();
+                int total = Buf.size();
+                if (total > 0)
+                {
+                    bufSnapshot.assign(begin, begin + total);
+                }
+                else
+                {
+                    bufSnapshot.clear();
+                }
+                offsetsSnapshot.resize(LineOffsets.Size);
+                for (int i = 0; i < LineOffsets.Size; i++)
+                {
+                    offsetsSnapshot[i] = LineOffsets[i];
+                }
+            }
+            // 以 '\0' 结尾，满足 TextUnformatted / strncmp 的要求
+            bufSnapshot.push_back('\0');
+            const char *buf = bufSnapshot.data();
+            const char *buf_end = buf + bufSnapshot.size() - 1;
+            const int offsetCount = (int)offsetsSnapshot.size();
 
             static auto Text = [](const char *line_start, const char *line_end)
             {
@@ -125,11 +171,11 @@ namespace logger
                 // This is because we don't have random access to the result of our filter.
                 // A real application processing logs with ten of thousands of entries may want to store the result of
                 // search/filter.. especially if the filtering function is not trivial (e.g. reg-exp).
-                for (int line_no = 0; line_no < LineOffsets.Size; line_no++)
+                for (int line_no = 0; line_no < offsetCount; line_no++)
                 {
-                    const char *line_start = buf + LineOffsets[line_no];
+                    const char *line_start = buf + offsetsSnapshot[line_no];
                     const char *line_end =
-                        (line_no + 1 < LineOffsets.Size) ? (buf + LineOffsets[line_no + 1] - 1) : buf_end;
+                        (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
                     Text(line_start, line_end);
                 }
             }
@@ -150,14 +196,14 @@ namespace logger
                 // would make it possible (and would be recommended if you want to search through tens of thousands of
                 // entries).
                 ImGuiListClipper clipper;
-                clipper.Begin(LineOffsets.Size);
+                clipper.Begin(offsetCount);
                 while (clipper.Step())
                 {
                     for (int line_no = clipper.DisplayStart; line_no < clipper.DisplayEnd; line_no++)
                     {
-                        const char *line_start = buf + LineOffsets[line_no];
+                        const char *line_start = buf + offsetsSnapshot[line_no];
                         const char *line_end =
-                            (line_no + 1 < LineOffsets.Size) ? (buf + LineOffsets[line_no + 1] - 1) : buf_end;
+                            (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
                         Text(line_start, line_end);
                     }
                 }

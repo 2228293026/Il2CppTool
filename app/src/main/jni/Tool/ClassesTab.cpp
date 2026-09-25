@@ -951,7 +951,25 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                     auto *field = enumClass ? enumClass->getField(param.value.c_str()) : nullptr;
                     if (field && enumClass)
                     {
-                        arrayParams[k] = field->getStaticValue<ValueType<int>>().box(enumClass);
+                        // 按枚举真实底层宽度取值。底层可能是 long/ulong（8 字节），
+                        // 旧代码固定用 int 承接，运行时就会往 4 字节变量上写 8 字节。
+                        auto raw = FieldInfo::getEnumStaticValue(field);
+
+                        // 再按底层宽度装箱：box() 读 sizeof(T) 个字节，
+                        // 宽度对不上会把栈上的临时变量读过头。
+                        auto *baseType = Il2cpp::GetEnumBaseType(enumClass);
+                        const char *baseName = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
+                        if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
+                                         strcmp(baseName, "System.UInt64") == 0))
+                        {
+                            int64_t wide = raw;
+                            arrayParams[k] = ValueType<int64_t>{wide}.box(enumClass);
+                        }
+                        else
+                        {
+                            int32_t narrow = static_cast<int32_t>(raw);
+                            arrayParams[k] = ValueType<int32_t>{narrow}.box(enumClass);
+                        }
                     }
                     else
                     {
@@ -1374,22 +1392,52 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                         "EnumSelector",
                         [method, type](const std::string &result)
                         {
-                            int value = type->getClass()->getField(result.c_str())->getStaticValue<int>();
-
-                            using namespace asmjit;
-                            Patcher p{method};
-                            p.movInt16(value);
-                            p.ret();
-
-                            if (oMap[method].bytes.empty())
+                            auto *enumClass = type->getClass();
+                            auto *field = enumClass ? enumClass->getField(result.c_str()) : nullptr;
+                            if (!field)
                             {
-                                oMap[method].bytes = p.patch();
-                                oMap[method].text = result;
+                                LOGE("枚举 %s 找不到成员 %s", type->getName() ? type->getName() : "?", result.c_str());
+                                return;
+                            }
+                            // 按真实底层宽度取值。旧代码固定 getStaticValue<int>()：
+                            // 底层是 long/ulong 的枚举会让 il2cpp 往 4 字节变量写 8 字节。
+                            auto raw = FieldInfo::getEnumStaticValue(field);
+                            auto *baseType = Il2cpp::GetEnumBaseType(enumClass);
+                            const char *baseName = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
+
+                            Patcher p{method};
+                            if (!p.valid())
+                            {
+                                LOGE("Patcher 初始化失败");
+                                return;
+                            }
+                            // 返回值宽度同样要跟底层类型走。旧代码不管枚举多大
+                            // 一律 movInt16：byte 底色的枚举写出 2 字节是对的，
+                            // 但 long 底色的会被截断成 16 位。
+                            if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
+                                             strcmp(baseName, "System.UInt64") == 0))
+                            {
+                                p.movInt64(static_cast<int64_t>(raw));
                             }
                             else
                             {
-                                LOGE("oMap is not empty for %s", method->getName());
+                                p.movInt32(static_cast<int32_t>(raw));
                             }
+                            p.ret();
+
+                            if (!oMap[method].bytes.empty())
+                            {
+                                LOGE("oMap is not empty for %s", method->getName());
+                                return;
+                            }
+                            auto patched = p.patch();
+                            if (patched.empty())
+                            {
+                                LOGE("枚举补丁写入失败: %s", method->getName());
+                                return;
+                            }
+                            oMap[method].bytes = std::move(patched);
+                            oMap[method].text = result;
                         },
                         type);
                 }
@@ -2276,19 +2324,51 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     }
                     else
                     {
-                        auto field = currentObj->klass->getField(val.c_str());
-                        auto fieldType = field->getType();
-                        if (fieldType->isEnum())
+                        auto field = currentObj ? currentObj->klass->getField(val.c_str()) : nullptr;
+                        if (!field)
                         {
-                            poper.Open(
-                                "EnumSelector",
-                                [fieldType, currentObj, field](const std::string &result)
-                                {
-                                    int value = fieldType->getClass()->getField(result.c_str())->getStaticValue<int>();
-                                    Il2cpp::SetFieldValue(currentObj, field, &value);
-                                    doRefresh = true;
-                                },
-                                fieldType);
+                            LOGE("找不到字段 %s", val.c_str());
+                        }
+                        else
+                        {
+                            auto fieldType = field->getType();
+                            if (fieldType && fieldType->isEnum())
+                            {
+                                poper.Open(
+                                    "EnumSelector",
+                                    [fieldType, currentObj, field](const std::string &result)
+                                    {
+                                        auto *enumClass = fieldType->getClass();
+                                        auto *enumField = enumClass ? enumClass->getField(result.c_str()) : nullptr;
+                                        if (!enumField)
+                                        {
+                                            LOGE("枚举 %s 找不到成员 %s",
+                                                 fieldType->getName() ? fieldType->getName() : "?", result.c_str());
+                                            return;
+                                        }
+                                        // 读写两侧都必须按真实底层宽度。
+                                        // 写侧同样危险：il2cpp 从源地址读
+                                        // field 长度的那几个字节，4 字节的 int
+                                        // 会被读成 8 字节，把栈上的相邻变量也读进去。
+                                        auto raw = FieldInfo::getEnumStaticValue(enumField);
+                                        auto *baseType = Il2cpp::GetEnumBaseType(enumClass);
+                                        const char *baseName = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
+
+                                        if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
+                                                         strcmp(baseName, "System.UInt64") == 0))
+                                        {
+                                            int64_t wide = raw;
+                                            Il2cpp::SetFieldValue(currentObj, field, &wide);
+                                        }
+                                        else
+                                        {
+                                            int32_t narrow = static_cast<int32_t>(raw);
+                                            Il2cpp::SetFieldValue(currentObj, field, &narrow);
+                                        }
+                                        doRefresh = true;
+                                    },
+                                    fieldType);
+                            }
                         }
                     }
                 }

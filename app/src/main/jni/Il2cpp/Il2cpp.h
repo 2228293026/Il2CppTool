@@ -95,6 +95,9 @@ namespace Il2cpp
     void SetFieldValueObject(Il2CppObject *object, FieldInfo *field, Il2CppObject *newValue);
     uintptr_t GetFieldOffset(FieldInfo *field);
     Il2CppType *GetFieldType(FieldInfo *field);
+
+    // 枚举的底层存储类型（byte/short/int/long…）。读枚举值必须按它取宽度。
+    Il2CppType *GetEnumBaseType(Il2CppClass *klass);
     const char *GetFieldName(FieldInfo *field);
     int GetFieldFlags(FieldInfo *field);
 
