@@ -61,6 +61,16 @@ struct ClassesTab
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
     MethodList &buildMethodMap(Il2CppClass *klass);
+    // 按类缓存的方法列表。只在渲染线程访问。
+    //
+    // 旧实现是函数内 static 的**单项**缓存且所有 tab 共享：缓存命中率
+    // 接近 0（弹窗在「对每个对象遍历」的循环里打开，相邻对象的类几乎
+    // 必然不同），而且返回的引用会在别处触发重建时当场失效。
+    // 改为按类缓存，命中任意类都直接返回。
+    std::unordered_map<Il2CppClass *, MethodList> methodCache;
+    // 缓存条目上限。方法列表是稳定元数据、命中率很高，但游戏可以动态
+    // 加载 assembly，无界增长迟早吃掉内存。
+    static constexpr size_t kMethodCacheLimit = 256;
 
     ClassMethodMap methodMap{};
     ClassesTab();

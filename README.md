@@ -13,18 +13,24 @@
 主界面悬浮窗（ImGui，中文界面）包含以下标签页：
 
 - **工具**：核心浏览面板。可开任意多个「类标签页」，每个标签页：
-  - 类 / 方法 / 字段的搜索与过滤（可切换大小写敏感、按类/方法/字段过滤）
+  - 类 / 方法 / 字段的搜索与过滤（可切换大小写敏感；**类名/方法名/字段名可多选**，一次搜出「类名或方法名里有这个字符串」的结果）。筛选在**后台线程**执行，输入时界面不卡
   - 展开任意类查看其**字段（Field）与当前值、方法（Method）参数、嵌套类型**
   - **直接调用方法**（填参数→运行），查看返回值 / 异常
   - 按对象查看运行时对象图（`dataMap`，显示实例字段与类型层级）
   - 长按某对象/方法可把它在**新标签页**中打开继续分析；已打开的标签页会保留在 tab 栏里
-- **追踪（Trace）**：对被关注的方法做 **frida-gum hook 追踪**，实时显示命中次数、最近调用、backtracer（frida 汇编回溯栈），可一键「恢复」（取消追踪）。
-- **DUMP**：把当前进程的 il2cpp 类型树导出为 `.cs`（输出 `.cs` 文件到游戏数据目录），Dumper 基于 il2cpp 元数据（Perfree 体系的 il2cpp_dump）。
+- **追踪（Trace）**：对被关注的方法做 hook 追踪，实时显示**调用次数与「次/秒」频率曲线**（频率排序能直接找出每帧都在跑的热点方法），以及最近调用列表，可一键「恢复」（取消追踪）。
+  > ⚠️ **frida-gum 汇编回溯（backtracer）当前不可用**：`Android.mk` 里没有定义 `USE_FRIDA`，所以 `Frida::Init()` 不会执行，gumpp 的 invocation listener 从未启动，界面上的 Backtrace 按钮是禁用状态。想启用请在 `app/src/main/jni/Android.mk` 的 `LOCAL_CFLAGS` 里加 `-DUSE_FRIDA` 重新编译。
+  > 注意：**方法追踪本身不依赖 Frida** —— 它走的是 Dobby 的 `DobbyInstrument`，与 `USE_FRIDA` 无关，一直可用。
+- **DUMP**：把当前进程的 il2cpp 类型树导出为 `.cs`（输出到游戏数据目录）。**流式写盘**（内存占用与游戏规模无关）、按类显示**进度条**、可**中途取消**、可重复导出。
 - **设置**：UI 缩放、全屏、是否拦截键盘输入；显示**包名 / 游戏版本 / Unity 版本 / 架构**；提供作者链接（bilibili）。配置存到 `tool_conf.json`。
 
 此外还有底层能力（部分在「工具」内，部分常驻）：
 
-- **对象绘制管理 / GameObjects ESP**：枚举进程内 `UnityEngine.GameObject` / `Camera`，用 `WorldToScreenPoint` 把世界坐标转屏幕坐标，在前台绘制框/线/点，可选自动刷新。
+- **对象绘制管理 / GameObjects ESP**：枚举进程内 `UnityEngine.GameObject` / `Camera`，用 `WorldToScreenPoint` 把世界坐标转屏幕坐标，在前台绘制框/线/点。可选：
+  - **距离显示**（默认开）与**最大绘制距离过滤** —— 屏幕坐标把远近压扁了，没有距离就判断不了该不该打、打不打得到
+  - **真实包围盒**（默认开）：用 `Renderer.bounds` 的 8 个角点投影出屏幕矩形，而不是固定像素；自动剔除相机背后的角点，拿不到时退回固定尺寸
+  - 名字/距离标签挂在包围盒顶端，便于辨认大物件
+  - 已选对象持有 **GC 强引用**（GCHandle），不会被 GC 回收成悬垂指针
 - **Patcher**：用 **asmjit** 就地改写 il2cpp 方法体（生成 `mov`/`movPtr` 等 AArch32/AArch64 指令补丁，写入方法所在的可写内存），用于做方法级修改。
 - **内存操作**：KittyMemory（读/写/补丁/备份）。
 - **字符串混淆**：`Includes/obfuscate.h`（AY 混淆）保护关键字符串。
@@ -32,7 +38,10 @@
 
 ## 支持范围
 
-- 架构：`arm64-v8a`（`Application.mk` 当前 `APP_ABI := arm64-v8a`；代码结构里保留了 `armeabi-v7a` 的预编译库，编成 `APP_ABI=armeabi-v7a` 也可用）。
+- 架构：**仅 `arm64-v8a`**。
+  > ⚠️ `armeabi-v7a` **目前无法构建**。C++ 源码本身在 32 位下能编过（实测 0 个源码错误），但预编译的 `asmjit/lib/libasmjit.a` 是 **AArch64-only**（`llvm-readelf` 确认 `Machine: AArch64`），链接阶段必然失败：
+  > `ld.lld: error: ... libasmjit.a(archtraits.cpp.o) is incompatible with armelf_linux_eabi`
+  > `Dobby` 和 `Frida` 两个预编译库倒是都有 v7a 版本。要支持 32 位，需要换一份 arm32 的 asmjit 静态库；此外 `Tool/Patcher.cpp` 在非 aarch64 分支里固定用 `Arch::kARM` 发指令，而 Android 默认是 **Thumb-2**，那部分也需要改成按目标指令模式选择。
 - 系统：Android，需要目标游戏的进程里能加载我们的 so。
 
 ## 目录结构
@@ -70,7 +79,6 @@ build.bat
 ```powershell
 .\build.ps1                            # 走 ANDROID_NDK_HOME
 .\build.ps1 D:\android-ndk-r29         # 显式 NDK 路径
-.\build.ps1 APP_ABI=armeabi-v7a,arm64-v8a   # 追加 make 参数
 # 若执行策略拦截：powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
@@ -85,13 +93,7 @@ cd app/src/main
 # Linux / Termux： $ANDROID_NDK_HOME/ndk-build -j8
 ```
 
-更多 ABI（可选）：
-
-```
-build.bat APP_ABI=armeabi-v7a,arm64-v8a
-```
-
-**输出**：`app/src/main/libs/<abi>/libIl2CppTool.so`（当前默认 `arm64-v8a`）。
+**输出**：`app/src/main/libs/<abi>/libIl2CppTool.so`（当前仅 `arm64-v8a`，见「支持范围」）。
 
 > 若未设环境变量，也可以显式给路径：`build.bat D:\android-ndk-r29`（Windows）。
 

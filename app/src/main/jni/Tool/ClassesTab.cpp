@@ -140,25 +140,59 @@ void hookerHandler(void *address, DobbyRegisterContext *ctx)
 }
 #endif
 
+// 取某个类的方法列表（含参数信息），带缓存。
+//
+// 旧实现是「函数内 static + 只记 lastClass」的**单项缓存**，而且那份
+// static 是**所有 ClassesTab 实例共享**的。问题有两个：
+//
+// 1. 缓存只有一项。弹窗是在「对每个对象遍历」的循环里打开的，
+//    相邻对象的类几乎必然不同 —— 缓存命中率接近 0，每次都要重新
+//    getMethods() + 每个方法 getParamsInfo()，而那正是这个函数本该避免的开销。
+// 2. static 跨 tab 共享。函数返回的是**引用**，一旦在遍历过程中因为别处
+//    又调了一次而重建，调用方手里的引用当场失效（列表被 clear + 重填）。
+//    现在是「拿引用后立刻用完」，所以没炸，但这是靠巧合成立的。
+//
+// 现在改成**按类缓存**的成员 map：
+// - 每个 tab 各有一份，tab 之间不再互相冲刷；
+// - 命中任意类都直接返回，不需要重建；
+// - 返回的引用在缓存被淘汰前一直有效。
+//
+// 只在渲染线程调用（MethodPopup 展开时），所以不需要额外加锁。
 ClassesTab::MethodList &ClassesTab::buildMethodMap(Il2CppClass *klass)
 {
-    static Il2CppClass *lastClass = nullptr;
-    static MethodList methodList;
-
-    if (lastClass != klass)
+    if (klass == nullptr)
     {
-        methodList.clear();
-        auto methods = klass->getMethods();
-        LOGD("Rebuilding %s | %lu methods", klass->getName(), methods.size());
-        for (auto method : methods)
-        {
-            auto paramsInfo = method->getParamsInfo();
-            methodList.push_back({method, paramsInfo});
-        }
-        LOGD("Rebuilt %lu methods", methodList.size());
-        lastClass = klass;
+        // 返回一个空的静态列表而不是崩掉。调用方会走 "No methods" 分支。
+        static MethodList empty;
+        return empty;
     }
-    return methodList;
+
+    auto it = methodCache.find(klass);
+    if (it != methodCache.end())
+    {
+        return it->second;
+    }
+
+    MethodList methods;
+    auto rawMethods = klass->getMethods();
+    LOGD("Rebuilding %s | %lu methods", klass->getName() ? klass->getName() : "?", rawMethods.size());
+    methods.reserve(rawMethods.size());
+    for (auto method : rawMethods)
+    {
+        methods.push_back({method, method->getParamsInfo()});
+    }
+
+    // 缓存要有上限。方法列表是稳定的元数据，命中率会一直很高，
+    // 但游戏可以动态加载 assembly，无界增长迟早吃掉内存。
+    // 到上限时整体清空：宁可下一次重建，也不要维护复杂的 LRU。
+    if (methodCache.size() >= kMethodCacheLimit)
+    {
+        LOGI("方法缓存达到上限 (%zu)，清空重建", methodCache.size());
+        methodCache.clear();
+    }
+    auto inserted = methodCache.emplace(klass, std::move(methods));
+    LOGD("Rebuilt %zu methods", inserted.first->second.size());
+    return inserted.first->second;
 }
 
 ClassesTab::ClassesTab()
@@ -2712,14 +2746,19 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             auto &methods = buildMethodMap(currentObj->klass);
             if (methods.empty())
             {
-                ImGui::Text("No methods for class %s", currentObj->klass->getName());
+                ImGui::Text("No methods for class %s",
+                            currentObj->klass && currentObj->klass->getName() ? currentObj->klass->getName() : "?");
             }
             else
             {
-                int j = 0;
                 for (auto &[method, paramsInfo] : methods)
                 {
-                    ImGui::PushID(method + j++);
+                    // ID 用方法指针本身。旧代码写的是 `method + j++` ——
+                    // 那是对 MethodInfo* 做指针算术（越界指针，UB），而且
+                    // 叠加一个随遍历变化的偏移：只要方法顺序有任何变化，
+                    // 每个方法的 ImGui ID 就跟着变，展开状态/滚动位置全部错位。
+                    // 方法指针本身是稳定的元数据地址，天然适合当 ID。
+                    ImGui::PushID(static_cast<const void *>(method));
                     MethodViewer(currentObj->klass, method, paramsInfo, currentObj, true);
                     ImGui::Separator();
                     ImGui::PopID();
