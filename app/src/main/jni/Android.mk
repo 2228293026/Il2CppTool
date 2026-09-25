@@ -46,6 +46,7 @@ LOCAL_SRC_FILES := Main.cpp \
     Tool/Util.cpp \
     Tool/Patcher.cpp \
     Tool/PopUpSelector.cpp \
+    Tool/SelfCheck.cpp \
     Tool/ClassesTab.cpp \
     Tool/Unity.cpp \
     Tool/ObjectDrawManager.cpp \

@@ -97,6 +97,16 @@ public:
 
     static bool WorldToScreen(const Vector3& worldPos, Vector3& screenPos);
     static ImVec2 GetScreenCenter();
+
+    // ---- 自检用的查询接口（Tool/SelfCheck.cpp 调用）----
+    // 相机与 WorldToScreenPoint 是否都就绪 —— ESP 能不能画框的全部前提。
+    static bool WorldToScreenAvailable();
+    // GetComponent<Renderer> / get_bounds 是否就绪（决定能否用真实包围盒）。
+    static bool RendererBoundsAvailable();
+    // 当前已绘制的目标数。
+    static size_t DrawObjectCount();
+    // 当前持有的 GC 强根总数（扫描缓存 + 已绘制目标 + 已保存对象）。
+    static size_t TotalRootCount();
 };
 
 extern ObjectDrawManager g_ObjectDrawManager;

@@ -35,6 +35,14 @@ static std::atomic<bool> s_pressed{false};
 // 一次触摸、要么完全看不到，不会看到「开始了却凭空消失」（那会被当成取消）。
 static std::atomic<bool> s_touchCaptured{false};
 
+// 触摸偏移自检结果：0 = 未自检，1 = 通过，-1 = 失败。
+static std::atomic<int> s_touchOffsetOk{0};
+
+int Unity::TouchOffsetCheck()
+{
+    return s_touchOffsetOk.load();
+}
+
 static Il2CppClass *Input;
 
 // ImGui context 是否还活着。输入 hook 装在游戏的输入路径上，
@@ -208,6 +216,7 @@ int get_touchCount(MethodInfo *method)
             const int phase = static_cast<int>(touch.m_Phase);
             if (phase < 0 || phase > 3)
             {
+                s_touchOffsetOk = false;
                 LOGE("UnityEngine_Touch 字段偏移疑似错误: m_Phase=%d (应为 0..3)，"
                      "m_Position=(%f, %f)。触摸将无法工作 —— "
                      "请对照 dump 出来的 UnityEngine.Touch 布局修正 Unity.h",
@@ -215,6 +224,7 @@ int get_touchCount(MethodInfo *method)
             }
             else
             {
+                s_touchOffsetOk = true;
                 LOGI("UnityEngine_Touch 偏移自检通过: m_Phase=%d, m_Position=(%f, %f)", phase,
                      (double)touch.m_Position.x, (double)touch.m_Position.y);
             }

@@ -9,6 +9,7 @@
 #include "Menu/ImGui.h"
 #include "Tool/Keyboard.h"
 #include "Tool/Tool.h"
+#include "Tool/SelfCheck.h"
 #include "Tool/Util.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -345,6 +346,15 @@ void draw_thread()
                 logger::Draw("日志");
                 ImGui::EndTabItem();
             }
+        }
+
+        // 自检页：把「哪些前置条件成立」一次性摊开。
+        // 这个项目里多数问题是静默的（ESP 拿不到相机就只是不画框，
+        // 触摸偏移错了菜单就完全没反应），自检直接指出是哪一环坏了。
+        if (ImGui::BeginTabItem("自检"))
+        {
+            SelfCheck::DrawUI();
+            ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("设置"))

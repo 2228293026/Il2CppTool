@@ -802,6 +802,53 @@ void ObjectDrawManager::Initialize() {
          (void*)g_GetComponent, (void*)g_GetBounds);
 }
 
+// ---- 自检用的查询接口 ----
+
+bool ObjectDrawManager::WorldToScreenAvailable()
+{
+    // 相机句柄是渲染线程独占的（见 ResolveMainCamera 的线程约束说明），
+    // 而自检也在渲染线程上跑，所以这里直接取是安全的。
+    return ResolveMainCamera() != nullptr && g_WorldToScreenPoint != nullptr;
+}
+
+bool ObjectDrawManager::RendererBoundsAvailable()
+{
+    return g_GetComponent != nullptr && g_GetBounds != nullptr && g_RendererClass != nullptr;
+}
+
+size_t ObjectDrawManager::DrawObjectCount()
+{
+    std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
+    return drawObjects.size();
+}
+
+size_t ObjectDrawManager::TotalRootCount()
+{
+    size_t total = 0;
+    {
+        std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
+        total += g_cachedGameObjects.size();
+    }
+    {
+        std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
+        for (const auto &d : drawObjects)
+        {
+            if (d.target.gameObjectHandle)
+            {
+                total++;
+            }
+            if (d.target.transformHandle)
+            {
+                total++;
+            }
+        }
+    }
+    // savedSet 是 static 的（ClassesTab::savedSet），在 ClassesTab.cpp 里。
+    // 跨文件访问它的内部状态需要它自己暴露；这里只统计本模块持有的，
+    // 数量级上够判断「是否在持续泄漏」了。
+    return total;
+}
+
 void ObjectDrawManager::Shutdown() {
     LOGI("关闭对象绘制管理器");
 
