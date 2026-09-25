@@ -98,7 +98,42 @@ static bool g_limitDistance = false;
 // 每个目标每帧要多 8 次投影 + 1 次 GetComponent，所以留开关。
 static bool g_useRealBounds = true;
 
+// 主相机的 **GC 强根**。
+//
+// 相机原本是一个裸的全局 Il2CppObject*，被 7 处以上直接解引用
+// （CameraWorldPosition / 各种 WorldToScreenPoint 调用点）。
+//
+// 场景切换时旧的 Camera 会被销毁；只要游戏侧不再引用它，GC 就会回收 ——
+// 我们手上那个裸指针随即变野，而 IsValidGameObject 之类的检查必须先
+// 解引用才能调用，所以「先判断再用」在这里根本救不了。
+//
+// RefreshCamera 每 2 秒才刷新一次，场景切换的检测又只是「对象数量比值」
+// 这个启发式（数量相近的切换根本测不出来）。所以在这两秒的空档里，
+// 一个已经死掉的相机指针会被喂给 WorldToScreenPoint。
+//
+// 这和 ESP 列表里 GameObject 的加根是同一个道理（见下面的加根说明）。
+static uint32_t g_MainCameraHandle = 0;
+
+// 兼容用的裸指针缓存 —— 权威来源是上面的句柄。
+// **只允许**在持有句柄的前提下读它；任何解引用之前都应先经过
+// ResolveMainCamera()，不要直接用这个全局。
 static Il2CppObject* g_MainCamera = nullptr;
+
+// 取当前主相机；句柄为空（没相机 / 已被回收）时返回 nullptr。
+//
+// 必须替换掉所有直接用 g_MainCamera 解引用的地方。
+static inline Il2CppObject* ResolveMainCamera()
+{
+    if (g_MainCameraHandle == 0)
+    {
+        return nullptr;
+    }
+    return Il2cpp::GC::GetHandleTarget(g_MainCameraHandle);
+}
+
+// 释放相机句柄并清空缓存指针。定义在 RefreshCamera 之后。
+static void ReleaseMainCamera();
+
 static MethodInfo* g_WorldToScreenPoint = nullptr;
 static MethodInfo* g_IsNativeObjectAlive = nullptr;
 
@@ -189,15 +224,43 @@ static bool IsValidGameObject(Il2CppObject* o) {
 
 // 刷新相机引用（场景切换后旧相机可能失效）
 void ObjectDrawManager::RefreshCamera() {
-    if (!g_CameraClass) return;
+    if (!g_CameraClass) {
+        ReleaseMainCamera();
+        return;
+    }
     try {
         auto cam = g_CameraClass->invoke_static_method<Il2CppObject*>("get_main");
         if (cam && cam->klass == g_CameraClass) {
-            g_MainCamera = cam;
+            if (g_MainCameraHandle == 0 || g_MainCamera != cam) {
+                // 换了相机 → 先释放旧句柄再挂新的，别泄漏。
+                ReleaseMainCamera();
+                g_MainCameraHandle = Il2cpp::GC::NewHandle(cam);
+                if (g_MainCameraHandle == 0) {
+                    LOGW("主相机加 GC 根失败，ESP 将不可用直到下次刷新");
+                    g_MainCamera = nullptr;
+                    return;
+                }
+                g_MainCamera = cam;
+            }
+        } else {
+            // Camera.main 拿不到了（加载中 / 场景刚切）。释放句柄，
+            // 让所有取用点自然拿到 nullptr 而不是野指针。
+            ReleaseMainCamera();
         }
     } catch (...) {
-        g_MainCamera = nullptr;
+        ReleaseMainCamera();
     }
+}
+
+// 释放相机句柄。
+static void ReleaseMainCamera()
+{
+    if (g_MainCameraHandle != 0)
+    {
+        Il2cpp::GC::FreeHandle(g_MainCameraHandle);
+        g_MainCameraHandle = 0;
+    }
+    g_MainCamera = nullptr;
 }
 
 // 相机在世界空间的位置。用来算目标到相机的距离 ——
@@ -207,9 +270,10 @@ void ObjectDrawManager::RefreshCamera() {
 // 「get_transform」是继承来的方法，所以必须从父类上取，单类查找拿不到。
 static bool CameraWorldPosition(Vector3 &out)
 {
-    if (!g_MainCamera || !g_GetTransform || !g_GetPosition) return false;
+    auto *cam = ResolveMainCamera();
+    if (!cam || !g_GetTransform || !g_GetPosition) return false;
     try {
-        auto transform = g_MainCamera->invoke_method<Il2CppObject*>(g_GetTransform);
+        auto transform = cam->invoke_method<Il2CppObject*>(g_GetTransform);
         if (!transform) return false;
         out = transform->invoke_method<Vector3>(g_GetPosition);
         return true;
@@ -325,7 +389,7 @@ static void ProcessScannedObjects() {
                 g_cachedGameObjects.clear();
             }
             g_lastObjectCount.store(0);
-            g_MainCamera = nullptr;
+            ReleaseMainCamera();
 
             // 给 UI 留个提示，别让用户以为工具坏了
             if (before > after) {
@@ -338,7 +402,8 @@ static void ProcessScannedObjects() {
     g_lastObjectCount.store(currCount);
 
     // g_autoAddAll: 自动将新扫描到的对象加入绘制列表
-    if (g_autoAddAll && g_MainCamera && g_WorldToScreenPoint) {
+    auto *cam = ResolveMainCamera();
+    if (g_autoAddAll && cam && g_WorldToScreenPoint) {
         std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
 
         // 用 unordered_set 快速判断对象是否已在 drawObjects 中
@@ -356,7 +421,7 @@ static void ProcessScannedObjects() {
                 auto transform = go->invoke_method<Il2CppObject*>(g_GetTransform);
                 if (!transform) continue;
                 auto position = transform->invoke_method<Vector3>(g_GetPosition);
-                auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, position);
+                auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, position);
                 screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
 
                 if (screen.z <= 0) continue;
@@ -447,16 +512,19 @@ void ObjectDrawManager::Tick() {
 
     // 3. 高频坐标刷新（每帧执行，只遍历 drawObjects）
     if (!autoRefresh) return;
-    if (!g_MainCamera || !g_WorldToScreenPoint) {
-        RefreshCamera();
-        if (!g_MainCamera) return;
-    }
 
-    // 定期刷新相机（每2秒），防止场景切换后相机失效
+    // 定期刷新相机（每 2 秒），防止场景切换后相机失效。
+    // 先刷再取：句柄可能是上一轮才被释放的，用旧值会拿到野指针。
     static float lastCameraRefresh = 0.f;
     if (now - lastCameraRefresh > 2.0f) {
         lastCameraRefresh = now;
         RefreshCamera();
+    }
+    auto *cam = ResolveMainCamera();
+    if (!cam || !g_WorldToScreenPoint) {
+        RefreshCamera();
+        cam = ResolveMainCamera();
+        if (!cam) return;
     }
 
     // 相机位置在循环外取一次：它对所有目标都是同一个值，
@@ -513,7 +581,7 @@ void ObjectDrawManager::Tick() {
             }
 
             // 世界坐标转屏幕坐标
-            auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, position);
+            auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, position);
             screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
             drawObj.target.screenPosition = screen;
 
@@ -621,7 +689,8 @@ void ObjectDrawManager::DrawAll() {
     }
 
     // g_drawAllObjects: 绘制场景中所有对象（从缓存列表读取）
-    if (g_drawAllObjects) {
+    auto *cam = ResolveMainCamera();
+    if (g_drawAllObjects && cam && g_WorldToScreenPoint) {
         std::vector<Il2CppObject*> snapshot;
         {
             std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
@@ -635,7 +704,7 @@ void ObjectDrawManager::DrawAll() {
                 auto transform = go->invoke_method<Il2CppObject*>(g_GetTransform);
                 if (!transform) continue;
                 auto position = transform->invoke_method<Vector3>(g_GetPosition);
-                auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, position);
+                auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, position);
                 screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
 
                 if (screen.z <= 0) continue;
@@ -698,8 +767,10 @@ void ObjectDrawManager::Initialize() {
     auto CameraClass = Il2cpp::FindClass("UnityEngine.Camera");
     g_CameraClass = CameraClass;
     if (CameraClass) {
-        g_MainCamera = CameraClass->invoke_static_method<Il2CppObject*>("get_main");
-        if (g_MainCamera) {
+        // 走 RefreshCamera 而不是直接赋值：它会把新相机挂上 GC 根，
+        // 直接写裸指针会漏掉句柄。
+        RefreshCamera();
+        if (ResolveMainCamera()) {
             // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有多个重载
             // （含带 MonoOrStereoscopicEye 的两参版本），按下标取很容易挑错签名；
             // 而 invoke 是按「尾部再塞一个 MethodInfo*」的约定直接 reinterpret 成函数指针调的，
@@ -751,7 +822,7 @@ void ObjectDrawManager::Shutdown() {
     g_rescanBusy.store(false);
     g_needsRescan.store(false);
     g_hasNewList.store(false);
-    g_MainCamera = nullptr;
+    ReleaseMainCamera();
 
     // 允许再次启用
     g_shutdownRequested.store(false);
@@ -853,9 +924,10 @@ void ObjectDrawManager::UpdateGameObjects() {
 }
 
 bool ObjectDrawManager::WorldToScreen(const Vector3& worldPos, Vector3& screenPos) {
-    if (!g_MainCamera || !g_WorldToScreenPoint) return false;
+    auto *cam = ResolveMainCamera();
+    if (!cam || !g_WorldToScreenPoint) return false;
     try {
-        auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, worldPos);
+        auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, worldPos);
         screenPos = screen;
         screenPos.y = ImGui::GetIO().DisplaySize.y - screenPos.y;
         return screenPos.z > 0;
@@ -898,7 +970,8 @@ void ObjectDrawManager::DrawLineToCenter(const DrawObject& drawObj) {
 // 调用方回退到固定尺寸。
 static bool ComputeScreenBounds(Il2CppObject *gameObject, ImVec2 &outMin, ImVec2 &outMax)
 {
-    if (!gameObject || !g_GetComponent || !g_GetBounds || !g_MainCamera || !g_WorldToScreenPoint)
+    auto *cam = ResolveMainCamera();
+    if (!gameObject || !g_GetComponent || !g_GetBounds || !cam || !g_WorldToScreenPoint)
     {
         return false;
     }
@@ -967,7 +1040,7 @@ static bool ComputeScreenBounds(Il2CppObject *gameObject, ImVec2 &outMin, ImVec2
         Vector3 screen;
         try
         {
-            screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, corner);
+            screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, corner);
         }
         catch (...)
         {
@@ -1039,7 +1112,8 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
         snapshot = g_cachedGameObjects;
     }
 
-    if (!g_MainCamera || !g_WorldToScreenPoint || !g_GetTransform || !g_GetPosition)
+    auto *cam = ResolveMainCamera();
+    if (!cam || !g_WorldToScreenPoint || !g_GetTransform || !g_GetPosition)
         return result;
 
     result.reserve(snapshot.size());
@@ -1050,7 +1124,7 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
             auto transform = go->invoke_method<Il2CppObject*>(g_GetTransform);
             if (!transform) continue;
             auto position = transform->invoke_method<Vector3>(g_GetPosition);
-            auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, position);
+            auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(cam, position);
             screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
 
             if (screen.z <= 0) continue;
