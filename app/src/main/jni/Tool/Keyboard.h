@@ -18,4 +18,8 @@ namespace Keyboard
     void Reset();
     void Update();
     bool IsOpen();
+    namespace detail
+    {
+        void updateImpl(); // 真正的轮询逻辑，由 Update() 加异常边界后调用
+    }
 }; // namespace Keyboard

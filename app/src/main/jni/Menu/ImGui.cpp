@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include "EGL/egl.h"
 #include "imgui/OPPOSans-H.h"
+#include "Tool/Unity.h"
 using swapbuffers_orig = EGLBoolean (*)(EGLDisplay dpy, EGLSurface surf);
 EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf);
 swapbuffers_orig o_swapbuffers = nullptr;
@@ -21,9 +22,9 @@ void (*menuAddress)();
 void (*onInitAddr)();
 
 bool isInitialized = false;
-// setupMenu 只应该试一次。失败后如果每帧都重试，就会每次都新建一个 ImGui context +
-// 重新跑一遍 on_init（il2cpp 超时那条路是 10 秒等待），既泄漏又会把游戏卡死。
-static bool g_setupAttempted = false;
+// setupMenu 只应该试一次（失败时不要每帧重来重建 context）；没就绪时按帧重试。
+// 定义在 Main.cpp。
+int g_initState = INIT_PENDING;
 int glWidth = 0;
 int glHeight = 0;
 
@@ -43,6 +44,9 @@ int getGlHeight()
 
 HOOKINPUT(void, Input, void *thiz, void *ex_ab, void *ex_ac)
 {
+    // hook 失败时 origInput 是空的，直接调就是空指针跳转
+    if (!origInput)
+        return;
     origInput(thiz, ex_ab, ex_ac);
     if (isInitialized)
         ImGui_ImplAndroid_HandleInputEvent((AInputEvent *)thiz);
@@ -52,11 +56,6 @@ HOOKINPUT(void, Input, void *thiz, void *ex_ab, void *ex_ac)
 ImVec2 initialScreenSize;
 // This menu_addr is used to allow for multiple game support in the future
 bool needClear = true;
-// on_init 失败时（例如 il2cpp 一直没就绪）会置位。
-// 绝不能在这种状态下把 isInitialized 置 true：draw_thread 之后会去摸
-// 没解析好的 il2cpp API 和空的 Tool/Keyboard 状态，等于开局就崩。
-// 定义在 Main.cpp。
-extern bool g_initFailed;
 void *initModMenu(void *menu_addr, void *on_init_addr, bool isJni)
 {
     menuAddress = (void (*)())menu_addr;
@@ -73,8 +72,21 @@ void *initModMenu(void *menu_addr, void *on_init_addr, bool isJni)
             sleep(1);
         }
         auto swapBuffers = ((uintptr_t)DobbySymbolResolver(OBFUSCATE("libEGL.so"), OBFUSCATE("eglSwapBuffers")));
+        if (!swapBuffers)
+        {
+            // 解析不到 eglSwapBuffers 就没法渲染菜单，标失败让 setupMenu 早退，
+            // 否则后面每帧都会拿一个空的原函数指针去调。
+            LOGE("解析不到 eglSwapBuffers，菜单无法工作");
+            g_initState = INIT_FAILED;
+            return nullptr;
+        }
         KittyMemory::ProtectAddr((void *)swapBuffers, sizeof(swapBuffers), PROT_READ | PROT_WRITE | PROT_EXEC);
-        DobbyHook((void *)swapBuffers, (void *)swapbuffers_hook, (void **)&o_swapbuffers);
+        if (DobbyHook((void *)swapBuffers, (void *)swapbuffers_hook, (void **)&o_swapbuffers) != 0 || !o_swapbuffers)
+        {
+            LOGE("eglSwapBuffers hook 安装失败");
+            g_initState = INIT_FAILED;
+            return nullptr;
+        }
 
 // // Taken from https://github.com/fedes1to/Zygisk-ImGui-Menu/blob/main/module/src/main/cpp/hook.cpp
 #ifdef LIB_INPUT
@@ -83,7 +95,12 @@ void *initModMenu(void *menu_addr, void *on_init_addr, bool isJni)
             OBFUSCATE("_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE"));
         if (sym_input != nullptr)
         {
-            DobbyHook((void *)sym_input, (void *)myInput, (void **)&origInput);
+            if (DobbyHook((void *)sym_input, (void *)myInput, (void **)&origInput) != 0 || !origInput)
+            {
+                // 没装上就当作没这个 hook，myInput 里也会因为 origInput 为空而直接返回
+                LOGE("libinput hook 安装失败，忽略触摸转发");
+                origInput = nullptr;
+            }
         }
 #endif
     }
@@ -93,17 +110,20 @@ void *initModMenu(void *menu_addr, void *on_init_addr, bool isJni)
 
 void setupMenu()
 {
-    if (isInitialized || g_setupAttempted)
+    if (isInitialized || g_initState == INIT_FAILED)
         return;
-    // 记下"试过了"，哪怕失败也不要每帧重来
-    g_setupAttempted = true;
 
-    auto ctx = ImGui::CreateContext();
-    if (!ctx)
+    // 重试路径会重复进来，ImGui context 只能建一次
+    static bool ctxCreated = false;
+    if (!ctxCreated)
     {
-        LOGI("%s", (char *)OBFUSCATE("Failed to create context"));
-        return;
-    }
+        auto ctx = ImGui::CreateContext();
+        if (!ctx)
+        {
+            LOGI("%s", (char *)OBFUSCATE("Failed to create context"));
+            g_initState = INIT_FAILED;
+            return;
+        }
 
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)glWidth, (float)glHeight);
@@ -113,30 +133,73 @@ void setupMenu()
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     // Setup Platform/Renderer backends
-    ImGui_ImplAndroid_Init();
-    ImGui_ImplOpenGL3_Init("#version 300 es");
+    if (!ImGui_ImplAndroid_Init())
+    {
+        LOGE("ImGui_ImplAndroid_Init 失败");
+        ImGui::DestroyContext();
+        g_initState = INIT_FAILED;
+        return;
+    }
+    if (!ImGui_ImplOpenGL3_Init("#version 300 es"))
+    {
+        LOGE("ImGui_ImplOpenGL3_Init 失败");
+        ImGui_ImplAndroid_Shutdown();
+        ImGui::DestroyContext();
+        g_initState = INIT_FAILED;
+        return;
+    }
 
 ImFontConfig font_cfg;
         font_cfg.SizePixels = 22.0f;
         io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, 28.0f, nullptr, io.Fonts->GetGlyphRangesChineseFull());
         io.Fonts->AddFontDefault(&font_cfg);
 
-    ImGui::GetStyle().ScaleAllSizes(2);
-    ImGuiStyle &style = ImGui::GetStyle();
-    style.ScrollbarSize *= 2.5f;
+        ImGui::GetStyle().ScaleAllSizes(2);
+        ImGuiStyle &style = ImGui::GetStyle();
+        style.ScrollbarSize *= 2.5f;
+
+        ctxCreated = true;
+    }
+
+    // 通知输入 hook「ImGui 上下文已就绪」：
+    // 装在游戏输入路径上的 hook 必须知道什么时候才可以安全地摸 ImGui::GetIO()。
+    Unity::g_uiContextAlive = true;
 
     if (onInitAddr)
         onInitAddr();
 
-    // on_init 失败时不要把 UI 标记成可用，否则 draw_thread 会去操作
-    // 没初始化好的 il2cpp / Tool 状态。
-    if (g_initFailed)
+    // INIT_PENDING：依赖还没就绪（例如 libil2cpp.so 还没加载）。
+    // 直接跳过这一帧的菜单渲染 —— 游戏画面照常，钩子下一帧会再试。
+    // 这样「等依赖」不再占用渲染线程，不会造成首帧卡死 / ANR。
+    if (g_initState == INIT_PENDING)
     {
-        LOGE("on_init 失败，跳过菜单初始化");
-        // 半成品 context/backend 要收掉，不然 GL/ImGui 资源一直挂着
+        static int attempts = 0;
+        if (++attempts == 1)
+        {
+            LOGI("等待 il2cpp 就绪中…（菜单暂不显示，游戏不受影响）");
+        }
+        if (attempts >= INIT_MAX_ATTEMPTS)
+        {
+            LOGE("等待 %d 帧仍未就绪，放弃菜单初始化", attempts);
+            g_initState = INIT_FAILED;
+        }
+    }
+
+    if (g_initState == INIT_FAILED)
+    {
+        LOGE("on_init 失败，关闭菜单");
+        // 关键顺序：先摘输入 hook，再销毁 context。
+        // 否则游戏下一次输入事件会进来摸一个已经销毁的 ImGui context。
+        Unity::g_uiContextAlive = false;
+        Unity::UninstallInputHooks();
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplAndroid_Shutdown();
         ImGui::DestroyContext();
+        ctxCreated = false;
+        return;
+    }
+    if (g_initState == INIT_PENDING)
+    {
         return;
     }
 
@@ -169,9 +232,23 @@ void internalDrawMenu(int width, int height)
 
 EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf)
 {
-    EGLint w, h;
-    eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+    // hook 安装失败时原函数是空的，直接调就是空指针跳转 —— 这种情况根本不该进来，
+    // 真进来了也不能崩游戏。
+    if (!o_swapbuffers)
+        return EGL_FALSE;
+
+    EGLint w = 0, h = 0;
+    // 旧代码忽略返回值：查询失败时 w/h 是未初始化的垃圾值，
+    // 会一路喂给 ImGui 的 DisplaySize 和 glViewport。
+    if (eglQuerySurface(dpy, surf, EGL_WIDTH, &w) != EGL_TRUE || w <= 0)
+        w = glWidth;
+    if (eglQuerySurface(dpy, surf, EGL_HEIGHT, &h) != EGL_TRUE || h <= 0)
+        h = glHeight;
+    if (w <= 0 || h <= 0)
+    {
+        // 尺寸还拿不到就这一帧不画菜单，但仍然要把画面交还给游戏
+        return o_swapbuffers(dpy, surf);
+    }
     glWidth = w;
     glHeight = h;
     static bool initialScreenSet = false;

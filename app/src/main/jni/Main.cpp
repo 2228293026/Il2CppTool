@@ -42,9 +42,10 @@ extern std::unordered_map<void *, HookerData> hookerMap;
 extern std::mutex hookerMtx;
 extern int maxLine;
 
-// on_init 失败标志。setupMenu() 在调用 on_init 之后会检查它，
-// 失败时不会把 isInitialized 置 true，避免 draw_thread 操作未初始化的 il2cpp 状态。
-bool g_initFailed = false;
+// 初始化状态由 Menu/ImGui.cpp 定义（INIT_PENDING / INIT_READY / INIT_FAILED）。
+// on_init 的各个失败点把它置成 INIT_FAILED；依赖没就绪时置 INIT_PENDING，
+// 由 setupMenu 在后续帧重试。setupMenu 据此决定要不要继续建 UI。
+extern int g_initState;
 
 extern ImVec2 initialScreenSize;
 
@@ -506,25 +507,14 @@ void ConfigInit()
 void on_init()
 {
     LOGD(__FUNCTION__);
-    // 这段等待跑在渲染线程（on_init 是被 eglSwapBuffers 钩子同步调进来的）。
-    // 目标游戏没有 libil2cpp.so / 换了名字时，旧的 while 死等会让这一帧永远不返回，
-    // 表现为游戏彻底黑屏卡死。必须有界 + 失败退出。
-    constexpr int kMaxWaitSeconds = 60;
-    bool libLoaded = false;
-    for (int i = 0; i < kMaxWaitSeconds; i++)
+
+    // 这段跑在渲染线程（on_init 是被 eglSwapBuffers 钩子同步调进来的）。
+    // 原先这里 while + sleep(1) 死等：目标不是 il2cpp 游戏时首帧能卡 60 秒（ANR）。
+    // 现在只探测一次，没就绪就返回 INIT_PENDING，由 setupMenu 在后续帧重试，
+    // 期间游戏照常渲染，菜单暂时不显示。
+    if (!isLibraryLoaded(targetLibName))
     {
-        if (isLibraryLoaded(targetLibName))
-        {
-            libLoaded = true;
-            break;
-        }
-        sleep(1);
-    }
-    if (!libLoaded)
-    {
-        LOGE("等待 %d 秒仍未加载 %s，目标可能不是 il2cpp 游戏，工具不启动", kMaxWaitSeconds,
-             (const char *)targetLibName);
-        g_initFailed = true;
+        g_initState = INIT_PENDING;
         return;
     }
 
@@ -535,7 +525,7 @@ void on_init()
     if (!Il2cpp::Init())
     {
         LOGE("il2cpp 初始化失败，工具不启动");
-        g_initFailed = true;
+        g_initState = INIT_FAILED;
         return;
     }
     // attach 失败（超时/拿不到 thread）就不要再往下走了：后面的 Keyboard/Unity/
@@ -543,7 +533,7 @@ void on_init()
     if (!Il2cpp::EnsureAttached())
     {
         LOGE("无法 attach 到 il2cpp VM，工具不启动");
-        g_initFailed = true;
+        g_initState = INIT_FAILED;
         return;
     }
 
@@ -561,12 +551,11 @@ void on_init()
 
     LOGD("HOOKING...");
 
-
-#ifndef LIB_INPUT
-    Unity::HookInput();
-#endif
-
     auto images = Il2cpp::GetImages();
+    // GetImage 失败时返回 nullptr，列表里会混进空元素。
+    // 旧代码直接 images.front() / image->getClasses() 就是空指针解引用。
+    images.erase(std::remove_if(images.begin(), images.end(), [](Il2CppImage *img) { return img == nullptr; }),
+                 images.end());
 
     // "Assembly-CSharp" 并非所有 Unity 工程都有：游戏代码可能在别的 assembly，
     // 或者整个工程没建出这个默认名。GetAssembly 找不到时返回 null，
@@ -586,10 +575,16 @@ void on_init()
         // 一个 image 都没有时不能往下走：Tool::Init 会开第一个 ClassesTab，
         // 而它会直接 selectedImage->getClasses()，g_Image 为空就是必崩。
         LOGE("没有可用的 assembly，il2cpp 元数据可能尚未就绪，跳过类/方法枚举");
-        g_initFailed = true;
+        g_initState = INIT_FAILED;
         return;
     }
     Tool::Init(g_Image, images);
+
+    // 输入 hook 放在元数据校验之后：初始化一旦失败就返回，
+    // 此时若已装上输入 hook，还得专门摘掉，否则它会摸到被销毁的 ImGui context。
+#ifndef LIB_INPUT
+    Unity::HookInput();
+#endif
 
     for (auto image : images)
     {
@@ -620,6 +615,10 @@ void on_init()
     }
     LOGD("SORTED");
     LOGD("HOOKED!");
+
+    // 全部成功才算就绪。setupMenu 见到 INIT_READY 才会把菜单标记为可用并开始渲染。
+    // （早前各个失败/未就绪分支已经把状态置成 INIT_FAILED / INIT_PENDING 并 return 了。）
+    g_initState = INIT_READY;
 }
 
 // we will run our hacks in a new thread so our while loop doesn't block process main thread

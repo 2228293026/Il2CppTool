@@ -440,7 +440,20 @@ namespace Tool
             dobby_enable_near_branch_trampoline();
         }
 
-if (DobbyInstrument((void *)method->methodPointer, (dobby_instrument_callback_t)hookerHandler) == 0) {
+        // 旧代码在两个分支里都 return 了，后面那句 disable 是死代码：
+        // 短函数（开头就是 ret）一旦开过 near-branch trampoline 就再也关不掉，
+        // 会一直影响后续 hook 的性能和正确性。用 RAII 保证两条路径都恢复。
+        struct NearBranchGuard
+        {
+            bool active;
+            ~NearBranchGuard()
+            {
+                if (active)
+                    dobby_disable_near_branch_trampoline();
+            }
+        } nearBranchGuard{shortFunction};
+
+        if (DobbyInstrument((void *)method->methodPointer, (dobby_instrument_callback_t)hookerHandler) == 0) {
             printHex(method->methodPointer);
             std::lock_guard guard(hookerMtx);
             hookerMap[method->methodPointer].hitCount = 0;
@@ -449,10 +462,6 @@ if (DobbyInstrument((void *)method->methodPointer, (dobby_instrument_callback_t)
         } else {
             LOGE("Failed to instrument %s", method->getName());
             return false;
-        }
-
-        if (shortFunction) {
-            dobby_disable_near_branch_trampoline();
         }
     };
 

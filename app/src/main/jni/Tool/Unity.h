@@ -44,5 +44,9 @@ struct UnityEngine_Touch
 
 namespace Unity
 {
+    // ImGui context 存活标志。输入 hook 装在游戏的输入路径上，
+    // context 被销毁后必须靠它直通原函数，不能再摸 ImGui。
+    extern bool g_uiContextAlive;
     void HookInput();
+    void UninstallInputHooks();
 }

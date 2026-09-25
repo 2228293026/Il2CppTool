@@ -2,6 +2,7 @@
 #include "Il2cpp/Il2cpp.h"
 #include "Includes/Macros.h"
 #include "Includes/obfuscate.h"
+#include "dobby.h"
 #include "imgui/imgui.h"
 
 // this function hook will prevent touch pass through the ImGui window
@@ -12,6 +13,14 @@ bool Input_GetMouseButton(int n);
 
 static Il2CppClass *Input;
 
+// ImGui context 是否还活着。输入 hook 装在游戏的输入路径上，
+// 初始化失败销毁 context 后游戏仍会调进来，这时必须直通，不能摸 ImGui。
+// 由 Menu/ImGui.cpp 在创建/销毁 context 时维护。
+namespace Unity
+{
+bool g_uiContextAlive = false;
+} // namespace Unity
+
 extern bool collapsed;
 extern bool fullScreen;
 
@@ -20,6 +29,13 @@ bool Input_GetMouseButton(int n)
     // 同上：hook 失败时直通，绝不能调用空的原函数指针
     if (!oInput_GetMouseButton)
         return false;
+
+    // ImGui context 已被销毁（初始化失败后 setupMenu 会 DestroyContext）时，
+    // 不能再摸 ImGui::GetIO()：GImGui 为空 → 空指针解引用。
+    // 这两个 hook 装在游戏的输入路径上，销毁 context 前必须先摘掉。
+    // 这两个 hook 定义在 namespace Unity 之外，必须写全名
+    if (!Unity::g_uiContextAlive)
+        return oInput_GetMouseButton(n);
 
     ImGuiIO &io = ImGui::GetIO();
 
@@ -33,6 +49,10 @@ int get_touchCount()
     // 输入 hook 没装成功时必须直通原函数，不能去调还为空的 o_get_touchCount
     if (!o_get_touchCount)
         return 0;
+
+    // ImGui context 已销毁时不能摸 GetIO()，见上方说明
+    if (!Unity::g_uiContextAlive)
+        return o_get_touchCount();
 
     ImGuiIO &io = ImGui::GetIO();
 
@@ -116,5 +136,32 @@ namespace Unity
             return;
         }
         g_inputHooked = true;
+    }
+
+    void UninstallInputHooks()
+    {
+        if (!g_inputHooked)
+        {
+            return;
+        }
+        // 销毁 ImGui context 之前必须把输入 hook 摘掉：
+        // 否则游戏下一次调 Input.get_touchCount 会进来摸已经不存在的 ImGui 上下文。
+        // g_uiContextAlive 置 false 让两个 hook 先直通原函数，摘干净后再销毁 context。
+        g_uiContextAlive = false;
+        if (Input)
+        {
+            if (auto *m = Input->getMethod("get_touchCount"))
+            {
+                DobbyDestroy((void *)m->methodPointer);
+            }
+            if (auto *m = Input->getMethod("GetMouseButton"))
+            {
+                DobbyDestroy((void *)m->methodPointer);
+            }
+        }
+        o_get_touchCount = nullptr;
+        oInput_GetMouseButton = nullptr;
+        g_inputHooked = false;
+        LOGI("已卸载 Unity 输入 hook");
     }
 } // namespace Unity

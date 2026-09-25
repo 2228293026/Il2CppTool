@@ -700,9 +700,16 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
     {
         auto paramsInfo = method->getParamsInfo();
         auto params = paramMap[method];
-        auto arrayParams = (paramsInfo.size() > 0) ? new Il2CppObject *[paramsInfo.size()] : nullptr;
+        // 必须值初始化：new T[n] 是默认初始化（不填零）。只要有任何一个参数
+        // 没走到赋值分支，arrayParams[k] 就是野指针，随后被交给
+        // il2cpp_runtime_invoke 去解引用。
+        auto arrayParams =
+            (paramsInfo.size() > 0) ? new Il2CppObject *[paramsInfo.size()]() : nullptr;
 
         bool hasParams = true;
+        // 任一参数解析/构造失败就整体放弃这次调用：
+        // 与其把不确定的参数数组丢给 VM，不如直接不调用。
+        bool parseFailed = false;
         Il2CppObject *thisParam = nullptr;
         if (!methodIsStatic && !thiz)
         {
@@ -731,55 +738,75 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             LOGD("%s %s = %s", type->getName(), name, param.value.c_str());
             if (!param.value.empty())
             {
+                // 参数值是用户通过软键盘输进来的，std::stoi/stol/... 在遇到
+                // 非法文本或越界时会抛 std::invalid_argument / out_of_range。
+                // 这里在 Call 按钮的回调栈上，一旦抛出就会冲出 ImGui 渲染、
+                // 冲出 eglSwapBuffers 钩子 —— 整个游戏进程被 terminate。
+                // 统一走带保护的解析，失败就跳过该参数并提示。
+                auto parse = [&](auto tag, auto fn) {
+                    using T = decltype(tag);
+                    T raw{};
+                    try
+                    {
+                        raw = fn(param.value);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOGE("参数 %s 的值 \"%s\" 无法解析为数值: %s", name, param.value.c_str(), e.what());
+                        parseFailed = true;
+                        return;
+                    }
+                    auto *klass = type->getClass();
+                    if (!klass)
+                    {
+                        LOGE("参数 %s 的类型 %s 解析不到 Il2CppClass", name, type->getName());
+                        parseFailed = true;
+                        return;
+                    }
+                    ValueType<T> value{raw};
+                    arrayParams[k] = value.box(klass);
+                };
+
                 if (strcmp(type->getName(), "System.Int32") == 0)
-                {
-                    ValueType<int> value{std::stoi(param.value)};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(int{}, [](const std::string &s) { return std::stoi(s); });
                 else if (strcmp(type->getName(), "System.Int64") == 0)
-                {
-                    ValueType<long> value{std::stol(param.value)};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(int64_t{}, [](const std::string &s) { return std::stoll(s); });
                 else if (strcmp(type->getName(), "System.UInt32") == 0)
-                {
-                    ValueType<unsigned int> value{static_cast<unsigned int>(std::stoul(param.value))};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(uint32_t{}, [](const std::string &s) { return (uint32_t)std::stoul(s); });
                 else if (strcmp(type->getName(), "System.UInt64") == 0)
-                {
-                    ValueType<unsigned long> value{std::stoul(param.value)};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(uint64_t{}, [](const std::string &s) { return std::stoull(s); });
                 else if (strcmp(type->getName(), "System.Single") == 0)
-                {
-                    ValueType<float> value{std::stof(param.value)};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(float{}, [](const std::string &s) { return std::stof(s); });
                 else if (strcmp(type->getName(), "System.Double") == 0)
-                {
-                    ValueType<double> value{std::stod(param.value)};
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
-                }
+                    parse(double{}, [](const std::string &s) { return std::stod(s); });
                 else if (strcmp(type->getName(), "System.Boolean") == 0)
                 {
-                    ValueType<int> value{param.value == "True" ? 1 : 0}; // using true/false sometimes causing
-                                                                         // crash for me, don't know why
-                    auto boxedValue = value.box(type->getClass());
-                    arrayParams[k] = boxedValue;
+                    // using true/false sometimes causing crash for me, don't know why
+                    ValueType<int> value{param.value == "True" ? 1 : 0};
+                    if (auto *klass = type->getClass())
+                    {
+                        arrayParams[k] = value.box(klass);
+                    }
+                    else
+                    {
+                        parseFailed = true;
+                    }
                 }
                 else if (type->isEnum())
                 {
-                    arrayParams[k] = type->getClass()
-                                         ->getField(param.value.c_str())
-                                         ->getStaticValue<ValueType<int>>()
-                                         .box(type->getClass());
+                    // 枚举按名字取静态常量。getField 可能返回空（字段被重命名/裁剪），
+                    // 旧代码直接 ->getStaticValue 就是空指针解引用。
+                    auto *enumClass = type->getClass();
+                    auto *field = enumClass ? enumClass->getField(param.value.c_str()) : nullptr;
+                    if (field && enumClass)
+                    {
+                        arrayParams[k] = field->getStaticValue<ValueType<int>>().box(enumClass);
+                    }
+                    else
+                    {
+                        LOGE("枚举 %s 找不到成员 %s", type->getName(), param.value.c_str());
+                        parseFailed = true;
+                    }
                 }
                 else if (strcmp(type->getName(), "System.String") == 0)
                 {
@@ -791,11 +818,19 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 }
                 else
                 {
-                    LOGD("Unhandled type: %s %s", type->getName(), name);
+                    // 旧代码只打一行日志就继续，arrayParams[k] 保持未初始化，
+                    // 然后照样把这个野指针交给 il2cpp_runtime_invoke。
+                    LOGE("参数 %s 的类型 %s 暂不支持，无法传值", name, type->getName());
+                    parseFailed = true;
                 }
             }
             else
             {
+                hasParams = false;
+            }
+            if (parseFailed)
+            {
+                // 宁可拒绝这次调用，也不要把不确定的参数丢给 VM
                 hasParams = false;
             }
         }
