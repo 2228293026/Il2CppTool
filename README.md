@@ -79,8 +79,11 @@ build.bat
 ```powershell
 .\build.ps1                            # 走 ANDROID_NDK_HOME
 .\build.ps1 D:\android-ndk-r29         # 显式 NDK 路径
+.\build.ps1 D:\android-ndk-r29 -Debug  # 额外打开 D 级详细日志
 # 若执行策略拦截：powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
+
+> **日志**：正式构建里 `WARN` / `ERROR` / `INFO` **始终**输出到 logcat（`adb logcat -s MXP`）和工具内的日志窗口，只有非常吵的 `DEBUG` 级默认静默。`Patcher`、`Dumper`、软键盘等处的拒绝/失败原因都是 `ERROR` 级，所以“为什么没生效”在正式版里也能直接看到。需要完整 `DEBUG` 日志时用 `-Debug` 构建。
 
 或手动执行（Windows / Git Bash）：
 

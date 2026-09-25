@@ -15,7 +15,17 @@
 //
 // 直接流式写盘，不在内存里累积整个 .cs 内容。
 // 返回 false 表示失败或被用户中止（此时文件里是**不完整**的内容）。
-bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress);
+/**
+ * 导出 il2cpp 类型树为 .cs。
+ *
+ * progress 回调返回 false 表示请求中止（用户点了取消）。
+ * 返回 false 时，通过 cancelled 出参区分「用户主动取消」和
+ * 「真的出错了（磁盘满、写不了文件）」—— 这两件事给用户的处置
+ * 完全不同：前者不用管，后者得先去腾空间。
+ * 出参可为 nullptr。
+ */
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress,
+                 bool *cancelled = nullptr);
 
 namespace Il2cpp
 {

@@ -373,8 +373,33 @@ namespace Tool
             // 渲染线程点「取消」时置位；dump 线程在每个类的进度回调里检查
             std::atomic<bool> cancelRequested{false};
             std::thread worker;
+
+            // **故意不定义析构函数。**
+            //
+            // std::thread 的析构函数在仍 joinable 时直接 std::terminate。
+            // 而它原本是命名空间作用域的 static：会被注册进 atexit 列表，
+            // 在 exit() 时由 __cxa_finalize 析构。
+            //
+            // 正常路径没问题 —— lib_cleanup（.fini_array）会 join 掉 worker，
+            // bionic 是逆序执行 fini_array 的，所以 __cxa_finalize 最后跑。
+            // 但 **exit() 路径**不一样：__cxa_finalize 只跑 atexit 列表上的东西，
+            // 而 lib_cleanup 是 .fini_array 函数、**不在**那个列表里。
+            // 于是「dump 跑到一半进程 exit()」= SIGABRT。
+            //
+            // 改成不析构：worker 的回收交给 lib_cleanup 显式做。
+            // 万一走到 exit() 且没 join，也只是泄漏一个线程句柄，
+            // 不会 abort 掉用户的游戏。
+            ~DumpStatus() = default;
         };
-        DumpStatus g_dump;
+
+        // 这个 Dump() 同样**故意泄漏**：见上面 DumpStatus 的注释。
+        // 进程生命周期内一直有效，退出时由内核回收。
+        DumpStatus &Dump()
+        {
+            static DumpStatus *d = new DumpStatus();
+            return *d;
+        }
+
     } // namespace
 
     // 启动一次 dump。返回 false 表示已经有一次在跑。
@@ -383,21 +408,21 @@ namespace Tool
         // 上一次已经结束的话，先把旧线程 join 掉再开新的。
         // std::thread 析构时若仍 joinable 会直接 terminate —— 重复 dump
         // 时这条路径必经。
-        if (g_dump.worker.joinable())
+        if (Dump().worker.joinable())
         {
-            g_dump.worker.join();
+            Dump().worker.join();
         }
 
         {
-            std::lock_guard guard(g_dump.mutex);
-            g_dump.state = DumpState::Running;
-            g_dump.currentAssembly.clear();
-            g_dump.current = 0;
-            g_dump.total = 0;
-            g_dump.message = "正在统计类数量…";
-            g_dump.outputPath = outPath;
+            std::lock_guard guard(Dump().mutex);
+            Dump().state = DumpState::Running;
+            Dump().currentAssembly.clear();
+            Dump().current = 0;
+            Dump().total = 0;
+            Dump().message = "正在统计类数量…";
+            Dump().outputPath = outPath;
         }
-        g_dump.cancelRequested.store(false, std::memory_order_relaxed);
+        Dump().cancelRequested.store(false, std::memory_order_relaxed);
 
         // std::thread 的构造函数**会抛** std::system_error（线程创建失败，
         // 例如达到线程数上限、内存吃紧）。而 StartDump 是从 Tool::Dumper()
@@ -408,14 +433,14 @@ namespace Tool
         // 这里就地兜住：失败就报状态，UI 上显示「无法启动导出线程」。
         try
         {
-            g_dump.worker = std::thread(
+            Dump().worker = std::thread(
                 [](const std::string &path)
             {
                 auto setState = [](DumpState s, const std::string &msg)
                 {
-                    std::lock_guard guard(g_dump.mutex);
-                    g_dump.state = s;
-                    g_dump.message = msg;
+                    std::lock_guard guard(Dump().mutex);
+                    Dump().state = s;
+                    Dump().message = msg;
                 };
 
                 // dump 线程是 il2cpp 的 foreign thread：il2cpp_dump 会遍历
@@ -433,35 +458,44 @@ namespace Tool
 
                 try
                 {
+                    bool wasCancelled = false;
                     bool ok = il2cpp_dump(
                         path.c_str(),
                         [](const char *name, int current, int total) -> bool
                         {
                             // 返回 false = 请求中止。
-                            if (g_dump.cancelRequested.load(std::memory_order_relaxed))
+                            if (Dump().cancelRequested.load(std::memory_order_relaxed))
                             {
                                 return false;
                             }
-                            std::lock_guard guard(g_dump.mutex);
-                            g_dump.currentAssembly = name ? name : "";
-                            g_dump.current = current;
-                            g_dump.total = total;
+                            std::lock_guard guard(Dump().mutex);
+                            Dump().currentAssembly = name ? name : "";
+                            Dump().current = current;
+                            Dump().total = total;
                             // 每 64 个类刷一次状态即可：进度回调是每个类
                             // 都跑的，在里面抢锁没必要那么频繁。
                             if (current % 64 == 0 || current == total)
                             {
-                                g_dump.message = "正在导出…";
+                                Dump().message = "正在导出…";
                             }
                             return true;
-                        });
+                        },
+                        &wasCancelled);
 
                     if (ok)
                     {
                         setState(DumpState::Done, "完成");
                     }
+                    else if (wasCancelled)
+                    {
+                        setState(DumpState::Cancelled, "已取消（临时文件 .part 已丢弃，之前的导出未受影响）");
+                    }
                     else
                     {
-                        setState(DumpState::Cancelled, "已取消（文件内容不完整）");
+                        // 旧实现这里和「用户取消」共用一句话，于是磁盘满、
+                        // 权限不足、路径打不开全都告诉用户「你按了取消」。
+                        // 用户会一直重试，而不去腾空间/换路径。
+                        setState(DumpState::Failed, "导出失败：无法写入文件。请检查存储空间与目录权限。");
                     }
                 }
                 catch (const std::exception &e)
@@ -477,17 +511,17 @@ namespace Tool
         }
         catch (const std::system_error &e)
         {
-            std::lock_guard guard(g_dump.mutex);
-            g_dump.state = DumpState::Failed;
-            g_dump.message = std::string("无法启动导出线程: ") + e.what();
+            std::lock_guard guard(Dump().mutex);
+            Dump().state = DumpState::Failed;
+            Dump().message = std::string("无法启动导出线程: ") + e.what();
             LOGE("StartDump: 创建 dump 线程失败: %s", e.what());
             return false;
         }
         catch (const std::exception &e)
         {
-            std::lock_guard guard(g_dump.mutex);
-            g_dump.state = DumpState::Failed;
-            g_dump.message = std::string("启动导出失败: ") + e.what();
+            std::lock_guard guard(Dump().mutex);
+            Dump().state = DumpState::Failed;
+            Dump().message = std::string("启动导出失败: ") + e.what();
             LOGE("StartDump: %s", e.what());
             return false;
         }
@@ -498,13 +532,13 @@ namespace Tool
     void ShutdownDumper()
     {
         // dump 线程必须 join：std::thread 析构时如果仍 joinable 会直接
-        // std::terminate —— 而 g_dump 是全局静态对象，进程退出时析构。
+        // std::terminate —— 重复 dump 时这条路径必经。
         // 如果用户在导出中途关掉工具，这就是一条必崩的路径。
-        g_dump.cancelRequested.store(true, std::memory_order_relaxed);
-        if (g_dump.worker.joinable())
+        Dump().cancelRequested.store(true, std::memory_order_relaxed);
+        if (Dump().worker.joinable())
         {
             LOGI("等待 dump 线程退出…");
-            g_dump.worker.join();
+            Dump().worker.join();
         }
     }
 
@@ -517,13 +551,13 @@ namespace Tool
         int current = 0;
         int total = 0;
         {
-            std::lock_guard guard(g_dump.mutex);
-            state = g_dump.state;
-            currentAssembly = g_dump.currentAssembly;
-            message = g_dump.message;
-            outputPath = g_dump.outputPath;
-            current = g_dump.current;
-            total = g_dump.total;
+            std::lock_guard guard(Dump().mutex);
+            state = Dump().state;
+            currentAssembly = Dump().currentAssembly;
+            message = Dump().message;
+            outputPath = Dump().outputPath;
+            current = Dump().current;
+            total = Dump().total;
         }
 
         switch (state)
@@ -540,9 +574,9 @@ namespace Tool
                     // 拿不到包名/版本时会退化成 unknown_*，那会写出一个
                     // 用户根本认不出来的文件名。直接说明，不产出垃圾文件。
                     LOGE("无法确定输出文件名（包名/版本读取失败）");
-                    std::lock_guard guard(g_dump.mutex);
-                    g_dump.state = DumpState::Failed;
-                    g_dump.message = "无法确定输出文件名：读不到包名或版本号";
+                    std::lock_guard guard(Dump().mutex);
+                    Dump().state = DumpState::Failed;
+                    Dump().message = "无法确定输出文件名：读不到包名或版本号";
                 }
                 else
                 {
@@ -573,7 +607,7 @@ namespace Tool
             }
             if (ImGui::Button("取消"))
             {
-                g_dump.cancelRequested.store(true, std::memory_order_relaxed);
+                Dump().cancelRequested.store(true, std::memory_order_relaxed);
             }
             break;
         }
@@ -587,8 +621,8 @@ namespace Tool
             ImGui::SameLine();
             if (ImGui::Button("再导出一次"))
             {
-                std::lock_guard guard(g_dump.mutex);
-                g_dump.state = DumpState::Idle;
+                std::lock_guard guard(Dump().mutex);
+                Dump().state = DumpState::Idle;
             }
             break;
 
@@ -597,8 +631,8 @@ namespace Tool
             ImGui::TextDisabled("文件里是**不完整**的内容，不适合直接使用");
             if (ImGui::Button("再试一次"))
             {
-                std::lock_guard guard(g_dump.mutex);
-                g_dump.state = DumpState::Idle;
+                std::lock_guard guard(Dump().mutex);
+                Dump().state = DumpState::Idle;
             }
             break;
 
@@ -606,8 +640,8 @@ namespace Tool
             ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "导出失败：%s", message.c_str());
             if (ImGui::Button("重试"))
             {
-                std::lock_guard guard(g_dump.mutex);
-                g_dump.state = DumpState::Idle;
+                std::lock_guard guard(Dump().mutex);
+                Dump().state = DumpState::Idle;
             }
             break;
         }

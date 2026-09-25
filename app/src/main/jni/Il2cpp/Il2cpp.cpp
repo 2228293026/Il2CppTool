@@ -438,8 +438,17 @@ std::string dump_type(Il2CppType *type)
     return outPut.str();
 }
 
-bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress)
+bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int, int)> &progress,
+                 bool *cancelled)
 {
+    // 默认按「失败」处理；只有进度回调主动返回 false 时才翻成 true。
+    // 旧实现两种情况都只是 return false，UI 一律显示「已取消」——
+    // 磁盘满也告诉用户「你按了取消」，用户会一直重试，而不去腾空间。
+    if (cancelled != nullptr)
+    {
+        *cancelled = false;
+    }
+
     LOGI("dumping...");
     if (outDir == nullptr || *outDir == '\0')
     {
@@ -624,6 +633,11 @@ bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int,
                 {
                     LOGI("dump: 用户中止，已写入 %zu 个类", doneClasses);
                     outStream.flush();
+                    // 这条路径是**唯一**的「用户主动取消」。
+                    if (cancelled != nullptr)
+                    {
+                        *cancelled = true;
+                    }
                     return false;
                 }
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *)items[j]);

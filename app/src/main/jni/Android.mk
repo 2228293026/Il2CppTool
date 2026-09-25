@@ -12,6 +12,13 @@ LOCAL_MODULE := Il2CppTool
 LOCAL_CFLAGS := -w -s -Wno-error=format-security -fvisibility=hidden -fpermissive -fexceptions
 LOCAL_CPPFLAGS := -w -s -Wno-error=format-security -fvisibility=hidden -Werror -std=c++20
 LOCAL_CPPFLAGS += -Wno-error=c++11-narrowing -fpermissive -Wall -fexceptions
+
+# D 级日志开关。默认**不定义** —— Includes/Logger.h 里 D 级是静默的，
+# 而 W/E/I 永远开启（排障时唯一能拿到的信息就是它们）。
+# 需要完整日志时用 `.\build.ps1 -Debug` 构建，它会设 IL2CPPTOOL_DEBUG=1。
+ifeq ($(IL2CPPTOOL_DEBUG),1)
+    LOCAL_CPPFLAGS += -D__DEBUG__
+endif
 LOCAL_LDFLAGS += -Wl,--gc-sections,--strip-all,-llog
 LOCAL_LDLIBS += -llog -landroid -lEGL -lGLESv2 -lGLESv3 -lGLESv1_CM -lz -lm
 LOCAL_ARM_MODE := arm

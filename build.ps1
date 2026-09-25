@@ -5,18 +5,36 @@
 #  Usage:
 #    .\build.ps1                         use ANDROID_NDK_HOME (or ANDROID_NDK_ROOT)
 #    .\build.ps1 D:\android-ndk-r29      explicit NDK path
-#    .\build.ps1 APP_ABI=armeabi-v7a,arm64-v8a   extra make args
+#    .\build.ps1 D:\android-ndk-r29 -Debug    full D-level logging
+#    .\build.ps1 APP_ABI=arm64-v8a       extra make args
 #    .\build.ps1 D:\android-ndk-r29 APP_ABI=x    combined
 #
 #    If execution policy blocks scripts, run once:
 #      powershell -ExecutionPolicy Bypass -File .\build.ps1
 #
 #  Output: app\src\main\libs\<abi>\libIl2CppTool.so
+#
+#  Logging:
+#    Release (default): W/E/I always go to logcat and the in-app log window;
+#                       D-level is silenced (it's very chatty).
+#    -Debug:            D-level enabled too. Use this when diagnosing why
+#                       something didn't happen.
 # ================================================================
 # NOTE: no declared -param block on purpose; $args collects arguments VERBATIM so
 # build args like "APP_ABI=arm64-v8a" are never mistaken for PowerShell switches.
 $Arguments = @($args)
 $ErrorActionPreference = 'Stop'
+
+# ---- -Debug enables the D-level log macro ----
+# Passed as a **make command-line variable**, not an environment variable:
+# ndk-build does not forward the environment into make's $(VAR) namespace, so
+# an exported env var silently evaluates to empty and -D__DEBUG__ never reaches
+# the compiler. Command-line variables are always defined.
+$DebugBuild = $false
+if ($Arguments -contains '-Debug') {
+    $DebugBuild = $true
+    $Arguments = @($Arguments | Where-Object { $_ -ne '-Debug' })
+}
 
 # ---- resolve NDK from env vars ----
 $ndk = $env:ANDROID_NDK_HOME
@@ -51,6 +69,10 @@ if (-not (Test-Path $ndkBuild)) {
 }
 
 $jobs = if ($env:NUMBER_OF_PROCESSORS) { $env:NUMBER_OF_PROCESSORS } else { 8 }
+if ($DebugBuild) {
+    $makeArgs += 'IL2CPPTOOL_DEBUG=1'
+    Write-Host '[build] __DEBUG__ enabled (verbose D-level logging)'
+}
 
 Push-Location (Join-Path $PSScriptRoot 'app\src\main')
 try {
