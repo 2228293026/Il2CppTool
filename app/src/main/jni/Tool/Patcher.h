@@ -22,7 +22,7 @@ class Patcher
     asmjit::Error movInt32(int32_t value);
     asmjit::Error movUInt32(uint32_t value);
 
-    // FIXME: currently handled like 32 bit number so it wouldn't work on 64 bit number
+    // 64 位：arm64 走 x0 的四个 16 位片段，arm32 走 r0/r1 寄存器对。
     asmjit::Error movInt64(int64_t value);
     asmjit::Error movUInt64(uint64_t value);
 
@@ -32,7 +32,15 @@ class Patcher
 
     asmjit::Error movPtr(void *value);
 
+    // 成功返回原字节（用于 restore），失败返回空 vector。
     std::vector<uint8_t> patch();
+
+    // method 或 methodPointer 为空、asmjit 初始化失败时为 false，
+    // 此时 patch() 会直接失败而不是往空地址写。
+    bool valid() const
+    {
+        return m_valid;
+    }
 
   private:
     asmjit::CodeHolder code;
@@ -41,5 +49,6 @@ class Patcher
 #else
     asmjit::a32::Assembler assembler;
 #endif
-    void *target;
+    void *target = nullptr;
+    bool m_valid = false;
 };

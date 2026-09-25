@@ -264,12 +264,24 @@ namespace Tool
         }
     }
 
+    namespace
+    {
+        // Dumper 的共享状态。旧实现里 currentDump 是渲染线程读、dump 线程写的
+        // std::string —— 并发读写 std::string 会破坏堆（realloc 时可能一边
+        // 释放一边被另一侧解引用）。
+        std::mutex g_dumpMutex;
+        std::string g_dumpProgress;
+        std::string g_dumpOutputPath;
+    } // namespace
+
     void Dumper()
     {
-        static std::string currentDump = "";
-        if (!currentDump.empty())
         {
-            ImGui::Text("Dumping %s", currentDump.c_str());
+            std::lock_guard guard(g_dumpMutex);
+            if (!g_dumpProgress.empty())
+            {
+                ImGui::Text("Dumping %s", g_dumpProgress.c_str());
+            }
         }
 
         static bool dumping = false;
@@ -277,23 +289,63 @@ namespace Tool
         {
             if (dumping)
             {
-                currentDump = "are in progress or finished!";
+                std::lock_guard guard(g_dumpMutex);
+                g_dumpProgress = "are in progress or finished!";
             }
-            dumping = true;
+            else
+            {
+                dumping = true;
+            }
         }
         if (dumping)
         {
+            // 路径长度不受控（包名 + 数据目录 + 版本号），固定缓冲 + 无界
+            // sprintf 就是栈溢出。std::string 让它自然增长。
+            static char outFile[1024];
+            snprintf(outFile, sizeof(outFile), "%s/%s_%s.cs", Il2cpp::getDataPath().c_str(),
+                     Il2cpp::getPackageName().c_str(), Il2cpp::getGameVersion().c_str());
 
-            static char outFile[256];
-            sprintf(outFile, "%s/%s_%s.cs", Il2cpp::getDataPath().c_str(), Il2cpp::getPackageName().c_str(),
-                    Il2cpp::getGameVersion().c_str());
             static bool dumped = false;
-            static std::future<void> dump =
-                std::async(std::launch::async,
-                           [] { il2cpp_dump(outFile, [](const char *name, int i, int size) { currentDump = name; }); });
+            static std::future<void> dump = std::async(std::launch::async, [](const char *outPath) {
+                // dump 线程是 il2cpp 的 foreign thread：il2cpp_dump 会遍历
+                // domain / assembly / class，不 attach 到 VM 就是崩溃或错数据。
+                // 用完必须 detach，否则 attached-thread 表里留悬空条目。
+                if (!Il2cpp::EnsureAttached())
+                {
+                    std::lock_guard guard(g_dumpMutex);
+                    g_dumpProgress = "failed to attach to il2cpp VM";
+                    return;
+                }
+                struct DetachGuard
+                {
+                    ~DetachGuard() { Il2cpp::Detach(); }
+                } detachGuard;
+
+                try
+                {
+                    il2cpp_dump(outPath, [](const char *name, int i, int size) {
+                        std::lock_guard guard(g_dumpMutex);
+                        g_dumpProgress = name ? name : "";
+                    });
+                }
+                catch (const std::exception &e)
+                {
+                    std::lock_guard guard(g_dumpMutex);
+                    g_dumpProgress = std::string("dump failed: ") + e.what();
+                }
+                catch (...)
+                {
+                    std::lock_guard guard(g_dumpMutex);
+                    g_dumpProgress = "dump failed (unknown)";
+                }
+            },
+                                               outFile);
             if (!dumped && dump.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
             {
-                currentDump = "Done";
+                {
+                    std::lock_guard guard(g_dumpMutex);
+                    g_dumpProgress = "Done";
+                }
                 dumped = true;
             }
             if (dumped)

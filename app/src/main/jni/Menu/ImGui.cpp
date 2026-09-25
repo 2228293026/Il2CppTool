@@ -165,8 +165,24 @@ ImFontConfig font_cfg;
     // 装在游戏输入路径上的 hook 必须知道什么时候才可以安全地摸 ImGui::GetIO()。
     Unity::g_uiContextAlive = true;
 
-    if (onInitAddr)
-        onInitAddr();
+    // on_init 会做分配、JSON 解析、il2cpp 元数据遍历，任何一步抛异常都会
+    // 一路冲出 setupMenu → swapbuffers_hook。注入到别人进程里的库没有
+    // 「异常边界」，逃出去就是 std::terminate，用户的游戏直接没了。
+    try
+    {
+        if (onInitAddr)
+            onInitAddr();
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("on_init 抛出异常: %s", e.what());
+        g_initState = INIT_FAILED;
+    }
+    catch (...)
+    {
+        LOGE("on_init 抛出未知异常");
+        g_initState = INIT_FAILED;
+    }
 
     // INIT_PENDING：依赖还没就绪（例如 libil2cpp.so 还没加载）。
     // 直接跳过这一帧的菜单渲染 —— 游戏画面照常，钩子下一帧会再试。

@@ -6,10 +6,23 @@
 #include "imgui/imgui.h"
 
 // this function hook will prevent touch pass through the ImGui window
-int (*o_get_touchCount)();
-int get_touchCount();
-bool (*oInput_GetMouseButton)(int n);
-bool Input_GetMouseButton(int n);
+//
+// 注意 il2cpp 的 ABI：静态方法真实的签名末尾带一个隐藏的 MethodInfo*，
+// 本项目调用约定也是 T(*)(Args..., MethodInfo*)（见 il2cpp-class.h 的
+// MethodInfo::invoke_static）。旧代码把 orig/替换函数都声明成不带这个参数的
+// 形式，游戏调用时 x1 里带着的 MethodInfo* 就没有对应的形参接收 ——
+// 参数错位，既可能读垃圾元数据也可能踩坏寄存器。
+int (*o_get_touchCount)(MethodInfo *);
+int get_touchCount(MethodInfo *method);
+bool (*oInput_GetMouseButton)(int n, MethodInfo *method);
+bool Input_GetMouseButton(int n, MethodInfo *method);
+
+// hook 里要转发给原函数，需要用到当初解析出来的 MethodInfo。
+static MethodInfo *s_get_touchCount = nullptr;
+static MethodInfo *s_GetMouseButton = nullptr;
+// ImGui 侧左键是否处于「已按下」状态。用于补发抬起事件：
+// 触摸被系统取消、或手指数归零而 Unity 没给 Ended 时，靠它兜底。
+static bool s_pressed = false;
 
 static Il2CppClass *Input;
 
@@ -24,39 +37,45 @@ bool g_uiContextAlive = false;
 extern bool collapsed;
 extern bool fullScreen;
 
-bool Input_GetMouseButton(int n)
+bool Input_GetMouseButton(int n, MethodInfo *method)
 {
-    // 同上：hook 失败时直通，绝不能调用空的原函数指针
+    // hook 失败时直通，绝不能调用空的原函数指针
     if (!oInput_GetMouseButton)
         return false;
+
+    // 转发时必须把 il2cpp 传来的隐藏 MethodInfo* 原样传回去；
+    // 用我们解析出来的那个兜底。只在 ImGui 可用时才拦截，
+    // 否则直接透传，语义与原函数一致。
+    auto *mi = method ? method : s_GetMouseButton;
 
     // ImGui context 已被销毁（初始化失败后 setupMenu 会 DestroyContext）时，
     // 不能再摸 ImGui::GetIO()：GImGui 为空 → 空指针解引用。
     // 这两个 hook 装在游戏的输入路径上，销毁 context 前必须先摘掉。
-    // 这两个 hook 定义在 namespace Unity 之外，必须写全名
     if (!Unity::g_uiContextAlive)
-        return oInput_GetMouseButton(n);
+        return oInput_GetMouseButton(n, mi);
 
     ImGuiIO &io = ImGui::GetIO();
 
     ImVec2 size{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
     if (io.WantCaptureMouse && !(collapsed && fullScreen && (io.MousePos.x > size.x && io.MousePos.y > size.y)))
         return false;
-    return oInput_GetMouseButton(n);
+    return oInput_GetMouseButton(n, mi);
 }
-int get_touchCount()
+int get_touchCount(MethodInfo *method)
 {
     // 输入 hook 没装成功时必须直通原函数，不能去调还为空的 o_get_touchCount
     if (!o_get_touchCount)
         return 0;
 
+    auto *mi = method ? method : s_get_touchCount;
+
     // ImGui context 已销毁时不能摸 GetIO()，见上方说明
     if (!Unity::g_uiContextAlive)
-        return o_get_touchCount();
+        return o_get_touchCount(mi);
 
     ImGuiIO &io = ImGui::GetIO();
 
-    auto count = o_get_touchCount();
+    auto count = o_get_touchCount(mi);
     if (count > 0 && Input)
     {
         // auto mousePresent = Input->invoke_static_method<bool>("get_mousePresent");
@@ -77,22 +96,47 @@ int get_touchCount()
         {
             io.AddMousePosEvent(x, y);
             io.AddMouseButtonEvent(0, true);
+            s_pressed = true;
         }
         else if (touch.m_Phase == UnityEngine_TouchPhase::Ended)
         {
             io.AddMousePosEvent(x, y);
             io.AddMouseButtonEvent(0, false);
             io.AddMousePosEvent(-1, -1);
+            s_pressed = false;
         }
         else if (touch.m_Phase == UnityEngine_TouchPhase::Moved)
         {
             io.AddMousePosEvent(x, y);
         }
+        else if (touch.m_Phase == UnityEngine_TouchPhase::Canceled)
+        {
+            // 系统中断这次触摸（来电、通知、任务切换）。
+            // 旧代码漏了这个分支，ImGui 那边按钮会一直保持按下状态，
+            // 直到下一次 Began/Ended 才对上 —— 表现为界面卡在「按住」。
+            if (s_pressed)
+            {
+                io.AddMouseButtonEvent(0, false);
+                io.AddMousePosEvent(-1, -1);
+                s_pressed = false;
+            }
+        }
+    }
+    else if (s_pressed)
+    {
+        // 手指数量归零了。Unity 偶尔不会给出 Ended（比如触摸被系统吃掉），
+        // 这里兜底把按住状态松开，避免 ImGui 永远停在按下态。
+        io.AddMouseButtonEvent(0, false);
+        io.AddMousePosEvent(-1, -1);
+        s_pressed = false;
     }
 
     ImVec2 size{ImGui::GetFrameHeight() * 2.f, ImGui::GetFrameHeight() * 2.f};
     if (io.WantCaptureMouse && !(collapsed && fullScreen && (io.MousePos.x > size.x && io.MousePos.y > size.y)))
     {
+        // 正在把这次触摸交给菜单消费：让游戏认为没有手指，
+        // 否则同一次触摸会既点菜单又点游戏。
+        // 注意这里不碰 s_pressed —— 按下状态由上面的触摸阶段维护。
         return 0;
     }
 
@@ -123,15 +167,44 @@ namespace Unity
             return;
         }
 
+        // 先把 MethodInfo 留下来：hook 里转发给原函数时要用
+        // （游戏正常调用会把隐藏的 MethodInfo* 传进来，但兜底路径需要我们自己的）。
+        s_get_touchCount = Input->getMethod("get_touchCount");
+        s_GetMouseButton = Input->getMethod("GetMouseButton");
+        if (!s_get_touchCount || !s_GetMouseButton)
+        {
+            LOGE("找不到 Input.get_touchCount / GetMouseButton，跳过输入 hook");
+            s_get_touchCount = nullptr;
+            s_GetMouseButton = nullptr;
+            return;
+        }
+
         REPLACE_NAME_ORIG("UnityEngine.Input", "get_touchCount", get_touchCount,
                           o_get_touchCount); // TODO: pass image to REPLACE macro
         REPLACE_NAME_ORIG("UnityEngine.Input", "GetMouseButton", Input_GetMouseButton, oInput_GetMouseButton);
 
-        // 两个原函数指针都必须拿到，缺一个就不能接管输入
+        // 两个原函数指针都必须拿到，缺一个就不能接管输入。
+        // 旧实现只判 orig 为空；这里还要回滚已经装上的那一个 ——
+        // 否则 Input_GetMouseButton 会用空 orig 直接 return false，
+        // 等于把游戏鼠标输入整个禁掉了。
         if (!o_get_touchCount || !oInput_GetMouseButton)
         {
-            LOGE("输入 hook 安装不完整（touch=%p mouse=%p），直通原函数", (void *)o_get_touchCount,
+            LOGE("输入 hook 安装不完整（touch=%p mouse=%p），回滚并直通原函数", (void *)o_get_touchCount,
                  (void *)oInput_GetMouseButton);
+            if (o_get_touchCount)
+            {
+                DobbyDestroy((void *)s_get_touchCount->methodPointer);
+                MethodInfo::_removeFromHookedMap((uintptr_t)s_get_touchCount->methodPointer);
+                o_get_touchCount = nullptr;
+            }
+            if (oInput_GetMouseButton)
+            {
+                DobbyDestroy((void *)s_GetMouseButton->methodPointer);
+                MethodInfo::_removeFromHookedMap((uintptr_t)s_GetMouseButton->methodPointer);
+                oInput_GetMouseButton = nullptr;
+            }
+            s_get_touchCount = nullptr;
+            s_GetMouseButton = nullptr;
             g_inputHooked = false;
             return;
         }
@@ -148,14 +221,14 @@ namespace Unity
         // 否则游戏下一次调 Input.get_touchCount 会进来摸已经不存在的 ImGui 上下文。
         // g_uiContextAlive 置 false 让两个 hook 先直通原函数，摘干净后再销毁 context。
         g_uiContextAlive = false;
+        s_pressed = false;
         if (Input)
         {
             // 摘钩子的同时要把 alreadyHooked 里的登记清掉。
             // 只 DobbyDestroy 的话这张表还留着失效的 trampoline 记录，
             // 之后再 hook 同一个方法会被 _isAlreadyHooked 挡掉并返回 nullptr。
-            for (const char *name : {"get_touchCount", "GetMouseButton"})
+            for (MethodInfo *m : {s_get_touchCount, s_GetMouseButton})
             {
-                auto *m = Input->getMethod(name);
                 if (!m || !m->methodPointer)
                 {
                     continue;
@@ -166,10 +239,12 @@ namespace Unity
                 }
                 else
                 {
-                    LOGE("卸载 %s 失败", name);
+                    LOGE("卸载输入 hook 失败: %s", m->getName() ? m->getName() : "?");
                 }
             }
         }
+        s_get_touchCount = nullptr;
+        s_GetMouseButton = nullptr;
         o_get_touchCount = nullptr;
         oInput_GetMouseButton = nullptr;
         g_inputHooked = false;

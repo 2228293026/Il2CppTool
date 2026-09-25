@@ -1,5 +1,6 @@
 #include "ClassesTab.h"
 #include "Il2cpp/Il2cpp.h"
+#include "KittyMemory/KittyMemory.h"
 #include "Tool/Keyboard.h"
 #include "Tool/Patcher.h"
 #include "Tool/Tool.h"
@@ -970,7 +971,35 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
 
 bool ClassesTab::isMethodHooked(MethodInfo *method)
 {
+    // hook 回调会在游戏线程持 hookerMtx 改这张表；无锁查询是数据竞争，
+    // 而且 UI 可能正在遍历它（rehash 期间）。
+    std::lock_guard guard(hookerMtx);
     return hookerMap.find(method->methodPointer) != hookerMap.end();
+}
+
+// 恢复被 patch 过的方法。
+// 必须和 Patcher::patch() 走同样的流程：mprotect 成可写 → memcpy → 刷 I-cache →
+// 恢复 R+X。旧代码只有裸 memcpy，既没改页保护（只读页上直接写会 SIGSEGV），
+// 也没刷 I-cache（CPU 可能还在执行旧字节），等于恢复失败或跑飞。
+static bool RestorePatchedMethod(MethodInfo *method, const std::vector<uint8_t> &originalBytes)
+{
+    if (!method || !method->methodPointer || originalBytes.empty())
+    {
+        return false;
+    }
+    auto *target = (void *)method->methodPointer;
+    if (!KittyMemory::ProtectAddr(target, originalBytes.size(), PROT_READ | PROT_WRITE | PROT_EXEC))
+    {
+        LOGE("RestorePatchedMethod: mprotect(RWX) 失败");
+        return false;
+    }
+    memcpy(target, originalBytes.data(), originalBytes.size());
+    __builtin___clear_cache((char *)target, (char *)target + originalBytes.size());
+    if (!KittyMemory::ProtectAddr(target, originalBytes.size(), PROT_READ | PROT_EXEC))
+    {
+        LOGE("RestorePatchedMethod: 恢复 R+X 失败");
+    }
+    return true;
 }
 
 void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const MethodParamList &paramsInfo,
@@ -986,6 +1015,16 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
 
     auto &o = oMap[method];
     auto type = method->getReturnType();
+    // methodPointer 为空的方法（抽象/接口/泛型方法体）不能打补丁：
+    // 旧代码只是把标签染成红色，按钮照样可点，点了就是往空地址写。
+    if (method->methodPointer == nullptr)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+        ImGui::TextWrapped("该方法没有可执行代码（抽象/接口/泛型方法体），无法打补丁");
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+        return;
+    }
     if (strcmp(type->getName(), "System.Int16") == 0 || strcmp(type->getName(), "System.Int32") == 0 ||
         strcmp(type->getName(), "System.Int64") == 0 || strcmp(type->getName(), "System.UInt16") == 0 ||
         strcmp(type->getName(), "System.UInt32") == 0 || strcmp(type->getName(), "System.UInt64") == 0 ||
@@ -1010,14 +1049,25 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
             {
                 Patcher p{method};
                 p.ret();
-                o.bytes = p.patch();
+                auto patched = p.patch();
+                if (patched.empty())
+                {
+                    LOGE("NOP 补丁失败");
+                }
+                else
+                {
+                    o.bytes = std::move(patched);
+                }
             }
         }
         else
         {
             if (ImGui::Button("Restore"))
             {
-                memcpy(method->methodPointer, o.bytes.data(), o.bytes.size());
+                if (!RestorePatchedMethod(method, o.bytes))
+                {
+                    LOGE("恢复失败: %s", method->getName() ? method->getName() : "?");
+                }
                 o.bytes.clear();
                 o.text.clear();
             }
@@ -1046,7 +1096,12 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
         {
             if (!o.bytes.empty())
             {
-                memcpy(method->methodPointer, o.bytes.data(), o.bytes.size());
+                // 走和打补丁一致的恢复流程（mprotect + memcpy + 刷 I-cache + 恢复 R+X），
+                // 不能裸 memcpy：目标页此时通常是 R+X，直接写会 SIGSEGV。
+                if (!RestorePatchedMethod(method, o.bytes))
+                {
+                    LOGE("恢复失败: %s", method->getName() ? method->getName() : "?");
+                }
                 o.bytes.clear();
                 o.text.clear();
             }
@@ -1063,21 +1118,28 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                         poper.Open("BooleanSelector",
                                    [method](const std::string &b)
                                    {
-                                       using namespace asmjit;
                                        Patcher p{method};
-                                       bool value = b == "True";
-                                       p.movBool(value);
+                                       if (!p.valid())
+                                       {
+                                           LOGE("Patcher 初始化失败（该方法无 methodPointer?）");
+                                           return;
+                                       }
+                                       p.movBool(b == "True");
                                        p.ret();
 
-                                       if (oMap[method].bytes.empty())
-                                       {
-                                           oMap[method].bytes = p.patch();
-                                           oMap[method].text = b;
-                                       }
-                                       else
+                                       if (!oMap[method].bytes.empty())
                                        {
                                            LOGE("oMap is not empty for %s", method->getName());
+                                           return;
                                        }
+                                       auto patched = p.patch();
+                                       if (patched.empty())
+                                       {
+                                           LOGE("布尔补丁写入失败: %s", method->getName());
+                                           return;
+                                       }
+                                       oMap[method].bytes = std::move(patched);
+                                       oMap[method].text = b;
                                    });
                     }
                     else
@@ -1092,59 +1154,85 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                                     return;
 
                                 auto type = typ;
-                                Patcher p{method};
-                                // auto &assembler = p.assembler;
-                                if (strcmp(type->getName(), "System.Int16") == 0)
-                                {
-                                    int16_t value = std::stoi(text);
-                                    p.movInt16(value);
-                                }
-                                else if (strcmp(type->getName(), "System.UInt16") == 0)
-                                {
-                                    unsigned short value = std::stoi(text);
-                                    p.movUInt16(value);
-                                }
-                                else if (strcmp(type->getName(), "System.Int32") == 0)
-                                {
-                                    int value{std::stoi(text)};
-                                    p.movInt32(value);
-                                }
-                                else if (strcmp(type->getName(), "System.UInt32") == 0)
-                                {
-                                    unsigned int value{static_cast<unsigned int>(std::stoul(text))};
-                                    p.movUInt32(value);
-                                }
-                                else if (strcmp(type->getName(), "System.Int64") == 0)
-                                {
-                                    long value{std::stol(text)};
-                                    p.movInt64(value);
-                                }
-                                else if (strcmp(type->getName(), "System.UInt64") == 0)
-                                {
-                                    unsigned long value{std::stoul(text)};
-                                    p.movUInt64(value);
-                                }
-                                else if (strcmp(type->getName(), "System.Single") == 0)
-                                {
-                                    float value = std::stof(text);
-                                    p.movFloat(value);
-                                }
-                                else if (isString)
-                                {
-                                    p.movPtr(Il2cpp::NewString(text.c_str()));
-                                }
+                                // text 是用户从软键盘输进来的，stoi/stol/stof 遇到
+                                // 非法文本或越界会抛。Keyboard::Update 虽然有异常边界，
+                                // 但那只会 Reset 键盘并把异常吞掉，用户完全不知道自己
+                                // 输入无效。这里就地解析，失败给出明确提示。
+                                auto applyPatch = [&](const std::string &text) -> bool {
+                                    Patcher p{method};
+                                    if (!p.valid())
+                                    {
+                                        LOGE("Patcher 初始化失败（无 methodPointer?）");
+                                        return false;
+                                    }
+                                    try
+                                    {
+                                        if (strcmp(type->getName(), "System.Int16") == 0)
+                                        {
+                                            p.movInt16(static_cast<int16_t>(std::stoi(text)));
+                                        }
+                                        else if (strcmp(type->getName(), "System.UInt16") == 0)
+                                        {
+                                            p.movUInt16(static_cast<uint16_t>(std::stoul(text)));
+                                        }
+                                        else if (strcmp(type->getName(), "System.Int32") == 0)
+                                        {
+                                            p.movInt32(std::stoi(text));
+                                        }
+                                        else if (strcmp(type->getName(), "System.UInt32") == 0)
+                                        {
+                                            p.movUInt32(static_cast<uint32_t>(std::stoul(text)));
+                                        }
+                                        else if (strcmp(type->getName(), "System.Int64") == 0)
+                                        {
+                                            p.movInt64(std::stoll(text));
+                                        }
+                                        else if (strcmp(type->getName(), "System.UInt64") == 0)
+                                        {
+                                            p.movUInt64(std::stoull(text));
+                                        }
+                                        else if (strcmp(type->getName(), "System.Single") == 0)
+                                        {
+                                            p.movFloat(std::stof(text));
+                                        }
+                                        else if (strcmp(type->getName(), "System.Boolean") == 0)
+                                        {
+                                            p.movBool(text == "True" || text == "true" || text == "1");
+                                        }
+                                        else if (isString)
+                                        {
+                                            p.movPtr(Il2cpp::NewString(text.c_str()));
+                                        }
+                                        else
+                                        {
+                                            LOGE("不支持的补丁返回类型: %s", type->getName());
+                                            return false;
+                                        }
+                                    }
+                                    catch (const std::exception &e)
+                                    {
+                                        LOGE("返回值 \"%s\" 解析失败: %s", text.c_str(), e.what());
+                                        return false;
+                                    }
+                                    p.ret();
 
-                                p.ret();
-
-                                if (oMap[method].bytes.empty())
-                                {
-                                    oMap[method].bytes = p.patch();
+                                    if (!oMap[method].bytes.empty())
+                                    {
+                                        LOGE("oMap is not empty for %s", method->getName());
+                                        return false;
+                                    }
+                                    auto patched = p.patch();
+                                    if (patched.empty())
+                                    {
+                                        LOGE("补丁写入失败: %s", method->getName());
+                                        return false;
+                                    }
+                                    oMap[method].bytes = std::move(patched);
                                     oMap[method].text = text;
-                                }
-                                else
-                                {
-                                    LOGE("oMap is not empty for %s", method->getName());
-                                }
+                                    return true;
+                                };
+
+                                applyPatch(text);
                             });
                     }
                 }
@@ -1822,23 +1910,45 @@ void ClassesTab::DrawTabMap()
 
 void ensureIfValueType(Il2CppObject *currentObj, std::vector<std::string> &paths, Il2CppObject *rootObj)
 {
-    if (currentObj == rootObj)
+    // 这条路径把「被就地改写的值类型」写回它在父对象里的字段槽位。
+    // 注意：il2cpp_field_set_value(obj, f, ptr) 是从 ptr 拷贝 f 长度的那几个字节
+    // 到 obj+f 的偏移处，所以对值类型字段直接传 unboxed 的载荷指针是对的，
+    // 不需要自己再加偏移 —— 偏移是作用在目标端的。
+    if (!currentObj || !rootObj || currentObj == rootObj)
         return;
+
     bool isValueType = Il2cpp::GetClassType(currentObj->klass)->isValueType();
     if (isValueType)
     {
         if (paths.size() > 1)
         {
             auto pathsButLast = std::vector(paths.begin(), paths.end() - 1);
+            // dump() 在目标为空时会返回 {nullptr, ...}，旧代码直接
+            // beforeObject->klass 就是空指针解引用。
             auto [beforeObject, j] = rootObj->dump(pathsButLast, true);
+            if (!beforeObject || !beforeObject->klass)
+            {
+                LOGE("ensureIfValueType: 父对象为空，无法写回");
+                return;
+            }
 
             auto path = paths.rbegin();
             std::istringstream iss(path->c_str());
             std::string _, val;
             iss >> _ >> val;
             void *unboxed = Il2cpp::GetUnboxedValue(currentObj);
+            if (!unboxed)
+            {
+                return;
+            }
             // object->setField(val.c_str(), unboxed);
+            // getField 是单类查找，继承来的字段会返回 null。
             auto f = beforeObject->klass->getField(val.c_str());
+            if (!f)
+            {
+                LOGE("ensureIfValueType: 找不到字段 %s", val.c_str());
+                return;
+            }
             Il2cpp::SetFieldValue(beforeObject, f, unboxed);
             ensureIfValueType(beforeObject, pathsButLast, rootObj);
         }
@@ -1850,8 +1960,17 @@ void ensureIfValueType(Il2CppObject *currentObj, std::vector<std::string> &paths
             std::string _, val;
             iss >> _ >> val;
             void *unboxed = Il2cpp::GetUnboxedValue(currentObj);
+            if (!unboxed || !rootObj->klass)
+            {
+                return;
+            }
             // object->setField(val.c_str(), unboxed);
             auto f = rootObj->klass->getField(val.c_str());
+            if (!f)
+            {
+                LOGE("ensureIfValueType: 找不到字段 %s", val.c_str());
+                return;
+            }
             Il2cpp::SetFieldValue(rootObj, f, unboxed);
         }
     }
@@ -2006,10 +2125,19 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                             [type = std::move(type), val = std::move(val), currentObj](const std::string &value)
                             {
                                 LOGD("%s", value.c_str());
-                                auto f = currentObj->klass->getField(val.c_str());
+                                auto f = currentObj ? currentObj->klass->getField(val.c_str()) : nullptr;
+                                if (!f)
+                                {
+                                    LOGE("找不到字段 %s", val.c_str());
+                                    return;
+                                }
                                 auto newStr = Il2cpp::NewString(value.c_str());
-                                // Il2cpp::SetFieldValueObject(currentObj, f, newStr);
-                                Il2cpp::SetFieldValue(currentObj, f, newStr);
+                                // il2cpp_field_set_value(obj, field, ptr) 是「从 ptr 指向的
+                                // 地址拷贝 field 长度的那几个字节」，所以必须传 &newStr。
+                                // 旧代码直接传 newStr（托管对象本身），等于把对象头
+                                // （klass 指针 + monitor）当字段内容写进去，字段直接损坏。
+                                // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
+                                Il2cpp::SetFieldValue(currentObj, f, &newStr);
                                 doRefresh = true;
                             });
                     }
