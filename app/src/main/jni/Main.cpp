@@ -55,7 +55,12 @@ bool fullScreen = false;
 bool resetWindow = false;
 int selectedScale = 3;
 
+bool g_fontFullRangeRequested = false;
+
 bool doChangeScale = false;
+
+// 用户改了字形范围但还没重启。图集在第一帧就烘焙完了，运行中改不动。
+static bool g_fontRangeDirty = false;
 
 constexpr std::array<const char *, 7> possibleScale = {
     "最小", "更小", "小", "默认", "大", "更大", "最大",
@@ -311,6 +316,29 @@ void draw_thread()
                 ImGui::EndCombo();
             }
             ImGui::Checkbox("未接收到键盘输入时启用", &Keyboard::check);
+
+            // 字体字形范围。默认只用常用字：完整中日韩范围 2.1 万个字形，
+            // 光栅化在渲染线程上要好几秒，是启动卡顿的主因。
+            // 切换后需要重启工具才生效 —— 图集一旦烘焙就固定了。
+            ImGui::Separator();
+            ImGui::Text("字体");
+            if (ImGui::Checkbox("加载完整中日韩字形", &g_fontFullRangeRequested))
+            {
+                ConfigSet("fontFullRange", g_fontFullRangeRequested);
+                g_fontRangeDirty = true;
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("完整范围约 21000 个字形，首次启动会明显变慢。\n"
+                                  "默认的常用字范围约 3000 个，覆盖绝大多数界面文本。\n"
+                                  "改动需重启工具生效。");
+            }
+            if (g_fontRangeDirty)
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "重启工具后生效");
+            }
+            ImGui::TextDisabled("当前: %s", g_fontFullRangeRequested ? "完整中日韩 (21000 字形)" : "常用字 (~3000 字形)");
+
 #ifdef __DEBUG__
             if (ImGui::Checkbox("Show Demo Window", &showDemoWindow))
             {
@@ -477,6 +505,43 @@ T ConfigGet(const char *key, T defaultValue)
         ConfigSet(key, defaultValue);
     }
     return defaultValue;
+}
+
+// 字体字形范围。默认只加载常用字（约 3000 个），完整中日韩范围有 2.1 万个，
+// 光栅化要在渲染线程上花好几秒。
+//
+// 必须在 setupMenu 烘焙字体图集**之前**读到 —— 那发生在第一帧
+// eglSwapBuffers，而 on_init 跑在它之后。所以由 hack 线程上的
+// initModMenu 调 ReadFontConfigEarly() 提前读一次。
+//
+// 改动需要重启工具才生效：图集一旦烘焙就固定了。
+void ReadFontConfigEarly()
+{
+    Util::FileReader fileReader("tool_conf.json");
+    if (!fileReader.exists())
+    {
+        return;
+    }
+    auto data = fileReader.read();
+    if (data.empty())
+    {
+        return;
+    }
+    try
+    {
+        auto conf = nlohmann::json::parse(data);
+        if (conf.contains("fontFullRange") && conf["fontFullRange"].is_boolean())
+        {
+            g_fontFullRangeRequested = conf["fontFullRange"].get<bool>();
+            LOGD("字体范围: %s", g_fontFullRangeRequested ? "完整中日韩（启动会明显变慢）" : "常用字");
+        }
+    }
+    catch (const nlohmann::json::exception &e)
+    {
+        // 解析失败不是致命的：保持默认的常用字范围即可。
+        // 真正的问题会由 on_init 里的 ConfigInit 再报一次。
+        LOGE("提前读取字体配置失败: %s", e.what());
+    }
 }
 
 void ConfigInit()

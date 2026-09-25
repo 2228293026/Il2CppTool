@@ -25,6 +25,9 @@ bool isInitialized = false;
 // setupMenu 只应该试一次（失败时不要每帧重来重建 context）；没就绪时按帧重试。
 // 定义在 Main.cpp。
 int g_initState = INIT_PENDING;
+
+// g_fontFullRangeRequested 定义在 Main.cpp（和设置界面的开关在一起），
+// 声明见 ImGui.h。
 int glWidth = 0;
 int glHeight = 0;
 
@@ -60,6 +63,18 @@ void *initModMenu(void *menu_addr, void *on_init_addr, bool isJni)
 {
     menuAddress = (void (*)())menu_addr;
     onInitAddr = (void (*)())on_init_addr;
+
+    // 字体字形范围必须在字体图集烘焙之前读到，而图集是在 setupMenu
+    // （第一帧 eglSwapBuffers）里建的，on_init 跑在那之后。
+    // 所以这里 —— hack 线程、早于任何一帧 —— 单独把配置文件读一次。
+    // 真正的 ConfigInit 仍由 on_init 做（它还要初始化其余配置项），
+    // 这次只取需要提前决定的那一项。
+    {
+        // 声明在这里而不是靠 extern：ConfigGet/ConfigInit 在 Main.cpp，
+        // 由 on_init 负责整体初始化，这里只做一次只读解析。
+        extern void ReadFontConfigEarly();
+        ReadFontConfigEarly();
+    }
     // do
     // {
     //     sleep(1);
@@ -149,10 +164,75 @@ void setupMenu()
         return;
     }
 
-ImFontConfig font_cfg;
-        font_cfg.SizePixels = 22.0f;
-        io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, 28.0f, nullptr, io.Fonts->GetGlyphRangesChineseFull());
-        io.Fonts->AddFontDefault(&font_cfg);
+    // 注意 size_pixels 实参会覆盖 font_cfg.SizePixels，所以这里让两者一致，
+    // 免得以后有人只改其中一处而困惑。
+    ImFontConfig font_cfg;
+    font_cfg.SizePixels = 28.0f;
+
+    // 字体图集是启动耗时的大头，而且这份开销是**在渲染线程上**付的
+    // （eglSwapBuffers → setupMenu），用户看到的是游戏开屏后卡住好几秒。
+    //
+    // 旧代码写的是 GetGlyphRangesChineseFull()：实测 21761 个字形
+    // （0x4E00-0x9FA5 的 CJK 加上标点、假名、半角等），每个都要在 28px 下
+    // 做 4x 超采样光栅化。在中低端机上光这一项就要好几秒 —— 换一个
+    //「启动慢」的问题，却完全没换来对应的可用性：真正会被显示的汉字
+    // 绝大多数是常用字，2 万个字形里绝大部分永远用不到。
+    //
+    // 现在默认用「常用简体(2500) + 拉丁扩展(336) + 西里尔(656) + 希腊(368)
+    // + 基本拉丁与符号(224)」，合并重叠后约 3900 个码点，不到原来的 1/5.5。
+    // 确实需要生僻字时把 fontFullRange 设为 true（代价就是启动变慢，
+    // 界面上有开关和说明）。
+    static ImVector<ImWchar> glyphRanges;
+
+    // 由 hack 线程上的 initModMenu 提前从配置文件读好 —— 必须早于这里，
+    // 因为图集一旦烘焙就固定了。声明见 ImGui.h。
+    const bool fontFullRange = g_fontFullRangeRequested;
+
+    const auto fontStart = std::chrono::steady_clock::now();
+
+    if (fontFullRange)
+    {
+        glyphRanges.clear();
+        const ImWchar *full = io.Fonts->GetGlyphRangesChineseFull();
+        for (const ImWchar *p = full; p && *p; p++)
+        {
+            glyphRanges.push_back(*p);
+        }
+    }
+    else
+    {
+        // GetGlyphRangesChineseFull() 返回的是以 0 结尾的区间列表，
+        // 指向静态存储；ImFontAtlas 不会拷贝它，所以必须保证生命周期
+        // 足够长 —— 这里用 ImVector 存一份，之后一直活着。
+        glyphRanges.clear();
+        ImFontGlyphRangesBuilder builder;
+        builder.AddRanges(io.Fonts->GetGlyphRangesDefault()); // 基本拉丁 + 常用符号
+        // 拉丁扩展（带重音的欧洲语言）。这个 ImGui 版本没有
+        // GetGlyphRangesLatin()，直接手写区间。
+        static const ImWchar latinExtended[] = {0x0100, 0x017F, // Latin Extended-A
+                                                0x0180, 0x024F, // Latin Extended-B
+                                                0};
+        builder.AddRanges(latinExtended);
+        builder.AddRanges(io.Fonts->GetGlyphRangesGreek());    // 希腊
+        builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic()); // 西里尔（俄语游戏）
+        builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon()); // 常用简体
+        builder.BuildRanges(&glyphRanges);
+    }
+
+    // 这才是被真正使用的字体：ImGui 在 io.FontDefault 为空时用 Fonts[0]。
+    // 旧代码在这里之后又 AddFontDefault 加了个 ProggyClean，那份永远不会被
+    // 选中（Fonts[1]），纯属白占一份图集空间。
+    io.FontDefault = io.Fonts->AddFontFromMemoryTTF((void *)OPPOSans_H, OPPOSans_H_size, 28.0f, &font_cfg,
+                                                    glyphRanges.Size ? glyphRanges.Data : nullptr);
+
+    const auto fontEnd = std::chrono::steady_clock::now();
+    const auto fontMs = std::chrono::duration_cast<std::chrono::milliseconds>(fontEnd - fontStart).count();
+    LOGI("字体图集构建完成：%s 范围，%d 个字形，耗时 %lld ms", fontFullRange ? "完整中日韩" : "常用字",
+         glyphRanges.Size, (long long)fontMs);
+    if (fontFullRange)
+    {
+        LOGW("启用了完整字形范围，字体会明显拖慢首次启动");
+    }
 
         ImGui::GetStyle().ScaleAllSizes(2);
         ImGuiStyle &style = ImGui::GetStyle();
