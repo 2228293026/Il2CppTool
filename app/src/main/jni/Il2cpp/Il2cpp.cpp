@@ -1301,25 +1301,77 @@ namespace Il2cpp
         return imagesCache;
     }
 
-    std::string getUnityVersion()
+    // 安全地读 UnityEngine.Application 上的一个静态字符串属性。
+    //
+    // 旧代码是 `static auto Application = FindClass("UnityEngine.Application");
+    // static auto m = Application->getMethod(...)` —— 完全没判空。
+    // 而 GC::FindObjects 的第一件事就是调 getUnityVersion()，跑在后台扫描
+    // 线程上：只要元数据被裁剪、类名对不上、或者查取得太早（Application
+    // 还没加载），FindClass 返回 null，这里就是一个必崩的空指针解引用 ——
+    // 而且崩在后台线程上，用户只看到工具「没反应」+ 游戏 ANR。
+    static std::string getApplicationString(const char *property, const char *fallback)
     {
-        static auto Application = FindClass("UnityEngine.Application");
-        static auto get_unityVersion = Application->getMethod("get_unityVersion");
-        if (!get_unityVersion)
+        // 缓存结果：这些值在进程生命周期内不变。
+        // 注意 fallback 也要缓存 —— 否则每次失败都打一条日志，
+        // 扫描线程每秒调几次会把日志刷爆。
+        static std::mutex cacheMutex;
+        static std::unordered_map<std::string, std::string> cache;
+
         {
-            return "unknown_unity_version";
+            std::lock_guard<std::mutex> guard(cacheMutex);
+            auto it = cache.find(property);
+            if (it != cache.end())
+            {
+                return it->second;
+            }
         }
-        static auto unityVersion = Application->invoke_static_method<Il2CppString *>("get_unityVersion");
-        if (unityVersion)
+
+        std::string result = fallback;
+        auto *Application = FindClass("UnityEngine.Application");
+        if (Application == nullptr)
         {
-            static auto str = unityVersion->to_string();
-            return str;
+            LOGE("找不到 UnityEngine.Application（%s 退化为 %s）", property, fallback);
         }
         else
         {
-            LOGE("Failed to get unityVersion");
-            return "unknown_unity_version";
+            auto *method = Application->getMethod(property);
+            if (method == nullptr)
+            {
+                LOGE("UnityEngine.Application 没有 %s", property);
+            }
+            else
+            {
+                try
+                {
+                    auto *value = method->invoke_static<Il2CppString *>(property);
+                    if (value)
+                    {
+                        result = value->to_string();
+                    }
+                    else
+                    {
+                        LOGE("读取 %s 返回空", property);
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    LOGE("读取 %s 抛出异常: %s", property, e.what());
+                }
+                catch (...)
+                {
+                    LOGE("读取 %s 抛出未知异常", property);
+                }
+            }
         }
+
+        std::lock_guard<std::mutex> guard(cacheMutex);
+        cache[property] = result;
+        return result;
+    }
+
+    std::string getUnityVersion()
+    {
+        return getApplicationString("get_unityVersion", "unknown_unity_version");
     }
 
     // dataPath => /storage/emulated/0/Android/data/com.dxx.firenow/files
@@ -1327,65 +1379,16 @@ namespace Il2cpp
     // version => 2.4.2
     std::string getDataPath()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_persistentDataPath = Application->getMethod("get_persistentDataPath");
-        if (!get_persistentDataPath)
-        {
-            return "unknown_data_path";
-        }
-        static auto dataPath = get_persistentDataPath->invoke_static<Il2CppString *>("get_persistentDataPath");
-        if (dataPath)
-        {
-            static auto str = dataPath->to_string();
-            return str;
-        }
-        else
-        {
-            LOGE("Failed to get dataPath");
-            return "unknown_data_path";
-        }
+        return getApplicationString("get_persistentDataPath", "unknown_data_path");
     }
     std::string getPackageName()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_identifier = Application->getMethod("get_identifier");
-        if (!get_identifier)
-        {
-            return "unknown_package_name";
-        }
-        static auto identifier = get_identifier->invoke_static<Il2CppString *>("get_identifier");
-        if (identifier)
-        {
-            static auto str = identifier->to_string();
-            return str;
-        }
-
-        else
-        {
-            LOGE("Failed to get packageName");
-            return "unknown_package_name";
-        }
+        return getApplicationString("get_identifier", "unknown_package_name");
     }
 
     std::string getGameVersion()
     {
-        static auto Application = Il2cpp::FindClass("UnityEngine.Application");
-        static auto get_version = Application->getMethod("get_version");
-        if (!get_version)
-        {
-            return "unknown_game_version";
-        }
-        static auto version = get_version->invoke_static<Il2CppString *>("get_version");
-        if (version)
-        {
-            static auto str = version->to_string();
-            return str;
-        }
-        else
-        {
-            LOGE("Failed to get game version");
-            return "unknown_game_version";
-        }
+        return getApplicationString("get_version", "unknown_game_version");
     }
     namespace GC
     {

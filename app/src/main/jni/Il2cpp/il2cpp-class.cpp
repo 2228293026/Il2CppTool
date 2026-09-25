@@ -450,7 +450,8 @@ const char *Il2CppClass::getName()
 
 std::string Il2CppClass::getFullName()
 {
-    auto typeName = Il2cpp::GetClassType(this)->getName();
+    auto *classType = Il2cpp::GetClassType(this);
+    const char *typeName = classType ? classType->getName() : nullptr;
     // im sure i've encounter a case where `typeName` is nullptr
     if (typeName && strlen(typeName) > 0)
     {
@@ -458,8 +459,13 @@ std::string Il2CppClass::getFullName()
     }
     else
     {
-        std::string name = this->getName();
-        std::string_view namespaze = getNamespace();
+        std::string name = this->getName() ? this->getName() : "<null-class>";
+        // getNamespace() 对全局命名空间返回 nullptr。
+        // 直接 `std::string_view sv = getNamespace()` 会对空指针调用
+        // char_traits::length() —— 段错误。本项目自己的 dump 代码
+        // （Il2cpp.cpp 里处理 namespace 的地方）就是先判空的。
+        const char *ns = getNamespace();
+        std::string_view namespaze = ns ? std::string_view(ns) : std::string_view();
         if (!namespaze.empty())
         {
             name.insert(0, ".");
@@ -527,7 +533,14 @@ MethodInfo *Il2CppClass::getMethod(const char *name, std::vector<std::string> ar
         }
         if (matched == args.size())
         {
-            LOGD("%s - [%s] %s::%s: %p", getImage()->getName(), getNamespace(), getName(), name, m);
+            // getImage() 和 getNamespace() 都可能返回空：前者是装配还没解析好，
+            // 后者是「全局命名空间」（il2cpp 对它返回 NULL）。%s 传空指针是 UB，
+            // 而这里只是调试日志，不值得为它冒崩溃风险。
+            auto *image = getImage();
+            const char *imageName = image ? image->getName() : nullptr;
+            const char *ns = getNamespace();
+            LOGD("%s - [%s] %s::%s: %p", imageName ? imageName : "?", ns ? ns : "", getName() ? getName() : "?",
+                 name ? name : "?", m);
             return m;
         }
     }
@@ -859,12 +872,25 @@ bool Il2CppType::isPrimitive()
 
 bool Il2CppType::isValueType()
 {
-    return Il2cpp::GetClassIsValueType(this->getClass());
+    // 泛型参数、指针类型、byref 类型都可能没有对应的 Il2CppClass，
+    // 旧代码直接把它传给 GetClassIsValueType，那边会解引用空指针。
+    // 这两个查询在 UI 的类型分派里到处被调用，一个空指针就够了。
+    auto *klass = this->getClass();
+    if (klass == nullptr)
+    {
+        return false;
+    }
+    return Il2cpp::GetClassIsValueType(klass);
 }
 
 bool Il2CppType::isEnum()
 {
-    return Il2cpp::GetClassIsEnum(this->getClass());
+    auto *klass = this->getClass();
+    if (klass == nullptr)
+    {
+        return false;
+    }
+    return Il2cpp::GetClassIsEnum(klass);
 }
 
 bool Il2CppType::isList()

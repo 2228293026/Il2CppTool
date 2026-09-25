@@ -39,16 +39,32 @@ namespace KittyMemory {
 
 
     struct ProcMap {
-        void *startAddr;
-        void *endAddr;
-        size_t length;
+        // 必须有初值。旧代码这里是裸声明，KittyMemory.cpp 里 `ProcMap ret;`
+        // 之后只做条件赋值 —— 库没找到 / sscanf 没匹配上时，startAddr/endAddr
+        // 里是栈上的垃圾值，isValid() 判不出来（垃圾 != NULL），于是
+        // getAbsoluteAddress 返回「垃圾 + 相对地址」，拿它当函数指针/补丁
+        // 目标就是静默改写任意内存。
+        void *startAddr = nullptr;
+        void *endAddr = nullptr;
+        size_t length = 0;
         std::string perms;
-        long offset;
+        long offset = 0;
         std::string dev;
-        int inode;
+        int inode = 0;
         std::string pathname;
 
-        bool isValid() { return (startAddr != NULL && endAddr != NULL && !pathname.empty()); }
+        bool isValid() const { return (startAddr != NULL && endAddr != NULL && startAddr < endAddr && !pathname.empty()); }
+
+        // relativeAddr 是否落在这个映射内。
+        // getAbsoluteAddress 必须过这一关：越界的相对地址算出来的绝对地址
+        // 落在别的库里或干脆是野的，调用方拿它去读写就是内存破坏。
+        bool contains(uintptr_t relativeAddr) const
+        {
+            if (!isValid())
+                return false;
+            uintptr_t start = reinterpret_cast<uintptr_t>(startAddr);
+            return relativeAddr < length;
+        }
     };
 
     /*
@@ -159,6 +175,15 @@ namespace KittyMemory {
      * Gets info of a mapped library in self process
      */
     ProcMap getLibraryMap(const char *libraryName);
+
+    /*
+     * 找到包含 [addr, addr+len) 的那个映射。
+     * 用途：在拿一个算出来的/缓存的地址去读写之前，确认它真的落在
+     * 某个可读/可写映射里。野指针直接 memcpy 会 SIGSEGV，
+     * 而在 Android 上查 /proc/self/maps 是唯一稳妥的探测手段。
+     * 找不到返回无效的 ProcMap（isValid() 为 false）。
+     */
+    ProcMap getContainingMap(const void *addr, size_t len);
 
     /*
     * Expects a relative address in a library
