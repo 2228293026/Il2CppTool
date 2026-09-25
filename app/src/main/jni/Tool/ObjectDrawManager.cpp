@@ -22,6 +22,10 @@ std::vector<DrawObject> ObjectDrawManager::drawObjects;
 bool ObjectDrawManager::showObjectManager = false;
 ImVec2 ObjectDrawManager::screenCenter = ImVec2(0, 0);
 bool ObjectDrawManager::autoRefresh = true;
+// 最大绘制距离（世界单位/米）。<= 0 表示不限制。
+// 有了距离之后这个开关才真正有意义：场景里几百米外的东西画出来只是
+// 屏幕角落一堆看不清的点，纯属遮挡视线。
+float ObjectDrawManager::maxDrawDistance = 0.f;
 
 ObjectDrawManager g_ObjectDrawManager;
 
@@ -79,6 +83,9 @@ static Il2CppClass* g_TransformClass = nullptr;
 
 static bool g_drawAllObjects = false;
 static bool g_autoAddAll = false;
+// 是否在名字旁边显示到相机的距离。默认开：这是 ESP 里最有用的一个数值。
+static bool g_showDistance = true;
+static bool g_limitDistance = false;
 
 static Il2CppObject* g_MainCamera = nullptr;
 static MethodInfo* g_WorldToScreenPoint = nullptr;
@@ -179,6 +186,24 @@ void ObjectDrawManager::RefreshCamera() {
         }
     } catch (...) {
         g_MainCamera = nullptr;
+    }
+}
+
+// 相机在世界空间的位置。用来算目标到相机的距离 ——
+// 屏幕上「离得近/远」的信息丢失了，只有 3D 距离才对应用户心里的远近。
+//
+// 走 Camera.get_transform().get_position()：Camera 继承自 Behaviour→Component，
+// 「get_transform」是继承来的方法，所以必须从父类上取，单类查找拿不到。
+static bool CameraWorldPosition(Vector3 &out)
+{
+    if (!g_MainCamera || !g_GetTransform || !g_GetPosition) return false;
+    try {
+        auto transform = g_MainCamera->invoke_method<Il2CppObject*>(g_GetTransform);
+        if (!transform) return false;
+        out = transform->invoke_method<Vector3>(g_GetPosition);
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 
@@ -423,6 +448,11 @@ void ObjectDrawManager::Tick() {
         RefreshCamera();
     }
 
+    // 相机位置在循环外取一次：它对所有目标都是同一个值，
+    // 每个目标都去 invoke 一次 get_transform/get_position 是浪费。
+    Vector3 cameraPos{};
+    const bool haveCameraPos = CameraWorldPosition(cameraPos);
+
     std::lock_guard<std::mutex> lock(g_drawMutex);
 
     for (auto& drawObj : drawObjects) {
@@ -458,6 +488,19 @@ void ObjectDrawManager::Tick() {
             auto position = transform->invoke_method<Vector3>(g_GetPosition);
             drawObj.target.worldPosition = position;
 
+            // 到相机的 3D 距离。屏幕坐标把「远近」这个信息压扁掉了：
+            // 屏幕上 10 像素的两个物体，一个可能在脚边、一个在几百米外。
+            // 距离是 ESP 里最有用的一个数值（判断该不该打、打不打得到）。
+            if (haveCameraPos) {
+                const float dx = position.x - cameraPos.x;
+                const float dy = position.y - cameraPos.y;
+                const float dz = position.z - cameraPos.z;
+                drawObj.target.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                drawObj.target.hasDistance = true;
+            } else {
+                drawObj.target.hasDistance = false;
+            }
+
             // 世界坐标转屏幕坐标
             auto screen = g_WorldToScreenPoint->invoke_static<Vector3>(g_MainCamera, position);
             screen.y = ImGui::GetIO().DisplaySize.y - screen.y;
@@ -478,6 +521,12 @@ void ObjectDrawManager::DrawAll() {
         if (drawObj.target.screenPosition.z <= 0)
             continue;
 
+        // 距离过滤。放在这里（而不是 Tick）是为了不浪费后面的绘制开销。
+        if (maxDrawDistance > 0.f && drawObj.target.hasDistance &&
+            drawObj.target.distance > maxDrawDistance) {
+            continue;
+        }
+
         float x = drawObj.target.screenPosition.x;
         float y = drawObj.target.screenPosition.y;
         if (std::isnan(x) || std::isnan(y) || std::isinf(x) || std::isinf(y))
@@ -492,8 +541,51 @@ void ObjectDrawManager::DrawAll() {
         if (drawObj.drawCircle) {
             DrawCircle(drawObj);
         }
-        if (!drawObj.target.name.empty()) {
-            ImVec2 namePos(x, y - 18);
+
+        // 名称 + 距离画成两行。
+        // 距离是判断「该不该打 / 打不打得到」最直接的信息，而屏幕坐标本身
+        // 不含远近 —— 必须显式给出。
+        ImVec2 namePos(x, y - 18);
+        const bool showDist = g_showDistance && drawObj.target.hasDistance;
+        if (showDist) {
+            char distLabel[48];
+            // 小于 10 米保留一位小数，再远就取整 —— 10.0 米和 1000 米
+            // 没人需要看到小数。
+            const char *fmt = drawObj.target.distance < 10.f ? "%.1fm" : "%.0fm";
+            int written = snprintf(distLabel, sizeof(distLabel), fmt, drawObj.target.distance);
+            if (written < 0)
+            {
+                // 格式化失败（理论上不该发生）。别把未定义内容交给 AddText。
+                distLabel[0] = '\0';
+            }
+            else if ((size_t)written >= sizeof(distLabel))
+            {
+                // 被截断了。距离值不会长到这个程度，但真发生了要标出来，
+                // 而不是默默显示一个错误的数字。
+                // 48 字节装 "%.1fkm" 绰绰有余（最坏也就 "-12345.6km"），
+                // 所以这里不需要再判返回值。
+                (void)snprintf(distLabel, sizeof(distLabel), "%.1fkm", drawObj.target.distance / 1000.f);
+            }
+            if (distLabel[0] == '\0')
+            {
+                // 拿不到距离就只显示名字
+                if (!drawObj.target.name.empty())
+                {
+                    drawList->AddText(namePos, drawObj.color, drawObj.target.name.c_str());
+                }
+            }
+            else if (drawObj.target.name.empty()) {
+                drawList->AddText(namePos, drawObj.color, distLabel);
+            } else {
+                // 这个 ImGui 版本的 AddText 没有 printf 重载，得自己拼。
+                // 名字长度不受控（Unity 对象名可以很长），所以用 std::string
+                // 让它自然增长。
+                std::string label = drawObj.target.name;
+                label += "  ";
+                label += distLabel;
+                drawList->AddText(namePos, drawObj.color, label.c_str());
+            }
+        } else if (!drawObj.target.name.empty()) {
             drawList->AddText(namePos, drawObj.color, drawObj.target.name.c_str());
         }
     }
@@ -836,6 +928,26 @@ void ObjectDrawManager::DrawUI() {
 
     ImGui::NextColumn();
 
+    // 距离过滤 + 距离显示开关。
+    // 有了距离之后才可能有「只画近处」这种需求：场景里几百米外的东西
+    // 画出来只是屏幕角落一堆看不清的点，还会遮挡视线。
+    ImGui::Checkbox("显示距离", &g_showDistance);
+    if (ImGui::Checkbox("限制最大距离", &g_limitDistance))
+    {
+        if (!g_limitDistance)
+        {
+            maxDrawDistance = 0.f;
+        }
+        else if (maxDrawDistance <= 0.f)
+        {
+            maxDrawDistance = 100.f;
+        }
+    }
+    if (g_limitDistance)
+    {
+        ImGui::SetNextItemWidth(160.f);
+        ImGui::SliderFloat("##maxdist", &maxDrawDistance, 1.f, 1000.f, "%.0f m");
+    }
     if (ImGui::Button("手动刷新")) {
         g_needsRescan = true;
         RescanGameObjectsInBackground();

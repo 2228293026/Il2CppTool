@@ -20,6 +20,13 @@ struct GameObjectInfo {
     std::string name;
     bool isSelected = false;
 
+    // 到相机的 3D 距离（世界单位，通常就是米）。
+    // 屏幕坐标把远近信息压扁了 —— 屏幕上挨着的两个物体可能一个在脚边
+    // 一个在几百米外。hasDistance=false 表示这一帧没能取到相机位置，
+    // 此时 distance 无意义，不要显示。
+    float distance = 0.f;
+    bool hasDistance = false;
+
     // 强 GCHandle：只要我们还持有这个 GameObject，就给它加根，
     // 托管侧的 GC 就不会把它回收。gameObject/transform 这两个裸指针
     // 在此之前一直是被 GC 悬着的 —— 被回收后再拿去解引用就是随机崩溃。
@@ -64,6 +71,8 @@ public:
 
 public:
     static bool showObjectManager;
+    // 最大绘制距离（米）。<= 0 = 不限制。
+    static float maxDrawDistance;
     static void Initialize();
     static void Shutdown();
     static void Tick();
