@@ -829,10 +829,19 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
         }
         if (ImGui::BeginPopup("ThisObjectSelector"))
         {
+            // 同上：不捕获 &thisParam，改用 shared_ptr + key 重新定位。
+            auto paramMapRef = paramMap;
+            auto paramMethod = method;
             ImGuiObjectSelector(
                 ImGui::GetID("ThisObjectSelector"), klass, "this",
-                [&thisParam](Il2CppObject *object)
+                [paramMapRef, paramMethod](Il2CppObject *object)
                 {
+                    auto it = paramMapRef->find(paramMethod);
+                    if (it == paramMapRef->end()) return;
+                    auto pit = it->second.find("this");
+                    if (pit == it->second.end()) return;
+                    auto &thisParam = pit->second;
+
                     // 64 位下 "%p" 要 "0x" + 16 位十六进制 + '\0' = 19 字节，
                     // 旧的 char[16] 必然溢出 3 字节。
                     char objStr[32]{0};
@@ -874,7 +883,29 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 if (strcmp(type->getName(), "System.Boolean") == 0)
                 {
                     // ImGui::OpenPopup("BooleanSelector");
-                    poper.Open("BooleanSelector", [&param](const std::string &result) { param.value = result; });
+                    // 回调**按值捕获 paramMap 的 shared_ptr + 键**，而不是
+                    // 捕获 `&param`。
+                    //
+                    // 之前把 paramMap 改成 shared_ptr 是为了「tab 销毁后回调
+                    // 仍能安全写入」—— 但那只在**回调持有那份 shared_ptr**
+                    // 时才成立。而 lambda 捕获的是 `&param`（指向 map 节点里的
+                    // 引用），shared_ptr 本身还是 tab 的成员：tab 一析构，
+                    // refcount 归零，整个 map 连同节点一起被释放，回调再写
+                    // 就是写已释放内存。也就是说上一版的修复**根本没生效**。
+                    //
+                    // 现在回调自己持有一份 shared_ptr，并在触发时按 key
+                    // 重新定位 —— 数据一定还活着。
+                    auto paramMapRef = paramMap;
+                    auto paramMethod = method;
+                    auto paramKeyStr = std::string(paramKey);
+                    poper.Open("BooleanSelector", [paramMapRef, paramMethod, paramKeyStr](const std::string &result)
+                               {
+                                   auto it = paramMapRef->find(paramMethod);
+                                   if (it == paramMapRef->end()) return;
+                                   auto pit = it->second.find(paramKeyStr);
+                                   if (pit == it->second.end()) return;
+                                   pit->second.value = result;
+                               });
                 }
                 else
                 {
@@ -888,9 +919,23 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                     // 托管字符串对象，随后在 1044 行把这个指针当作该参数的类型
                     // 传给 VM → 垃圾值或崩溃。
                     const bool isStringParam = isString;
+                    auto paramMapRef = paramMap;
+                    auto paramMethod = method;
+                    auto paramKeyStr = std::string(paramKey);
                     Keyboard::Open(
-                        [this, &param, isStringParam](const std::string &text)
+                        [this, paramMapRef, paramMethod, paramKeyStr, isStringParam](const std::string &text)
                         {
+                            auto it = paramMapRef->find(paramMethod);
+                            if (it == paramMapRef->end())
+                            {
+                                return;
+                            }
+                            auto pit = it->second.find(paramKeyStr);
+                            if (pit == it->second.end())
+                            {
+                                return;
+                            }
+                            auto &param = pit->second;
                             if (isStringParam)
                             {
                                 param.object = Il2cpp::NewString(text.c_str());
@@ -909,8 +954,21 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             }
             else if (type->isEnum())
             {
+                // 同上：持有 shared_ptr + 按 key 重新定位，而不是捕获 &param。
+                auto paramMapRef = paramMap;
+                auto paramMethod = method;
+                auto paramKeyStr = std::string(paramKey);
                 poper.Open(
-                    "EnumSelector", [&param](const std::string &result) { param.value = result; }, type);
+                    "EnumSelector",
+                    [paramMapRef, paramMethod, paramKeyStr](const std::string &result)
+                    {
+                        auto it = paramMapRef->find(paramMethod);
+                        if (it == paramMapRef->end()) return;
+                        auto pit = it->second.find(paramKeyStr);
+                        if (pit == it->second.end()) return;
+                        pit->second.value = result;
+                    },
+                    type);
             }
             // else if (!type->isValueType() && !(type->isArray() || type->isList()
             // ||
@@ -924,20 +982,31 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
         }
         if (ImGui::BeginPopup("ParamObjectSelector"))
         {
+            // 同样按 key 重新定位，不捕获 &param。理由见上面 BooleanSelector
+            // 那处的注释（共享出来的 map 活得比回调久，&param 不行）。
+            auto paramMapRef = paramMap;
+            auto paramMethod = method;
+            auto paramKeyStr = std::string(paramKey);
             ImGuiObjectSelector(ImGui::GetID("ParamObjectSelector"), type->getClass(), name,
-                                [&param](Il2CppObject *object)
+                                [paramMapRef, paramMethod, paramKeyStr](Il2CppObject *object)
                                 {
+                                    auto it = paramMapRef->find(paramMethod);
+                                    if (it == paramMapRef->end()) return;
+                                    auto pit = it->second.find(paramKeyStr);
+                                    if (pit == it->second.end()) return;
+                                    auto &param = pit->second;
+
                                     // 同上：64 位 %p 需要 19 字节，char[16] 必溢出
                                     char objStr[32]{0};
                                     snprintf(objStr, sizeof(objStr), "%p", (const void *)object);
                                     param.value = objStr;
                                     param.object = object;
-                    // 参数对象要活到用户按下「调用」，中间可能隔几帧，
-                    // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
-                    if (object)
-                    {
-                        SaveObjectWithRoot(object);
-                    }
+                                    // 参数对象要活到用户按下「调用」，中间可能隔几帧，
+                                    // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
+                                    if (object)
+                                    {
+                                        SaveObjectWithRoot(object);
+                                    }
                                     ImGui::CloseCurrentPopup();
                                 });
             ImGui::EndPopup();

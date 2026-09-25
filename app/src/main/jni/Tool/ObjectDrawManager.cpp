@@ -122,6 +122,16 @@ static Il2CppObject* g_MainCamera = nullptr;
 // 取当前主相机；句柄为空（没相机 / 已被回收）时返回 nullptr。
 //
 // 必须替换掉所有直接用 g_MainCamera 解引用的地方。
+//
+// 【线程约束】这个句柄**只由渲染线程访问，不需要加锁**：
+//   Initialize / Tick / Shutdown 以及它们内部的 ProcessScannedObjects
+//   和 RefreshCamera 全部跑在 draw_thread 上（Main.cpp:504 的 Tick、
+//   Tool::Init 的 Initialize/Shutdown），没有别的线程会碰它。
+//
+// 这条不变量是「碰巧成立」的，没有任何机制强制。如果哪天有人想
+// 「检测到场景切换就顺便在后台线程里刷新相机」，就会静默引入
+// 竞态（句柄被换掉的同时渲染线程正在读，读到的是撕裂的中间态）。
+// 真要跨线程用，必须先给句柄加一把专门的锁。
 static inline Il2CppObject* ResolveMainCamera()
 {
     if (g_MainCameraHandle == 0)
