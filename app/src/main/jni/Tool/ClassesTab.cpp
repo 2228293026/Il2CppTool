@@ -2636,7 +2636,7 @@ void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> 
             }
             // object->setField(val.c_str(), unboxed);
             // getField 是单类查找，继承来的字段会返回 null。
-            auto f = beforeObject->klass->getField(val.c_str());
+            auto f = beforeObject->klass->getFieldInHierarchy(val.c_str());
             if (!f)
             {
                 LOGE("ensureIfValueType: 找不到字段 %s", val.c_str());
@@ -2658,7 +2658,7 @@ void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> 
                 return;
             }
             // object->setField(val.c_str(), unboxed);
-            auto f = rootObj->klass->getField(val.c_str());
+            auto f = rootObj->klass->getFieldInHierarchy(val.c_str());
             if (!f)
             {
                 LOGE("ensureIfValueType: 找不到字段 %s", val.c_str());
@@ -3002,7 +3002,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                              rootObj](const std::string &value)
                             {
                                 LOGD("%s", value.c_str());
-                                auto f = currentObj ? currentObj->klass->getField(val.c_str()) : nullptr;
+                                auto f = currentObj ? currentObj->klass->getFieldInHierarchy(val.c_str()) : nullptr;
                                 if (!f)
                                 {
                                     LOGE("找不到字段 %s", val.c_str());
@@ -3020,7 +3020,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     }
                     else
                     {
-                        auto field = currentObj ? currentObj->klass->getField(val.c_str()) : nullptr;
+                        auto field = currentObj ? currentObj->klass->getFieldInHierarchy(val.c_str()) : nullptr;
                         if (!field)
                         {
                             LOGE("找不到字段 %s", val.c_str());

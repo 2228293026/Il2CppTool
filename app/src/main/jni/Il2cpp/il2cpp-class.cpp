@@ -438,10 +438,10 @@ std::pair<Il2CppObject *, nlohmann::ordered_json> Il2CppObject::dump(const std::
                 // 喂回来当路径 —— 于是这里必然拿到 null，直接传给
                 // il2cpp_field_get_value_object 就是空指针解引用。
                 // 旧代码没有任何判空。
-                auto *field = objKlass->getField(val.c_str());
+                auto *field = objKlass->getFieldInHierarchy(val.c_str());
                 if (field == nullptr)
                 {
-                    LOGE("dump: 类 %s 上找不到字段 %s（继承字段请用父类路径）",
+                    LOGE("dump: 类 %s 及其父类上都找不到字段 %s",
                          objKlass->getName() ? objKlass->getName() : "?", val.c_str());
                     return {nullptr, nlohmann::ordered_json()};
                 }
@@ -759,12 +759,52 @@ uintptr_t MethodInfo::_getHookedMap(uintptr_t ptr)
 
 uintptr_t Il2CppObject::_getFieldOffset(const char *name)
 {
-    return Il2cpp::GetFieldOffset(this->klass->getField(name));
+    // 沿继承链找，否则继承字段的偏移取不到。
+    return Il2cpp::GetFieldOffset(this->klass->getFieldInHierarchy(name));
 }
 
 FieldInfo *Il2CppClass::getField(const char *fieldName)
 {
     return Il2cpp::GetClassField(this, fieldName);
+}
+
+FieldInfo *Il2CppClass::getFieldInHierarchy(const char *fieldName)
+{
+    if (fieldName == nullptr)
+    {
+        return nullptr;
+    }
+    // 先在自身上找（最常见的情况，避免沿链上溯的固定开销）
+    if (auto *own = Il2cpp::GetClassField(this, fieldName))
+    {
+        return own;
+    }
+    // 再逐级父类。继承深度在正常类层次里很浅（1~3 层）。
+    //
+    // 除了正确性之外还必须防环：il2cpp 的元数据被裁剪/造假时，
+    // 父类指针有可能自指或成环，无保护的上溯就是死循环 ——
+    // 而这里跑在渲染线程上。
+    Il2CppClass *parent = Il2cpp::GetClassParent(this);
+    int guard = 0;
+    constexpr int kMaxDepth = 64; // C# 单继承链，正常远小于此
+    while (parent != nullptr && guard++ < kMaxDepth)
+    {
+        if (auto *found = Il2cpp::GetClassField(parent, fieldName))
+        {
+            return found;
+        }
+        auto *next = Il2cpp::GetClassParent(parent);
+        if (next == parent)
+        {
+            break; // 自指
+        }
+        parent = next;
+    }
+    if (guard >= kMaxDepth)
+    {
+        LOGW("getFieldInHierarchy: 继承链超过 %d 层，放弃查找 %s", kMaxDepth, fieldName);
+    }
+    return nullptr;
 }
 
 size_t Il2CppClass::getSize()

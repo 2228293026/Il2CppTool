@@ -307,6 +307,20 @@ struct Il2CppClass
     MethodInfo *findMethod(const char *name, size_t idx = 0);
 
     FieldInfo *getField(const char *fieldName);
+    // 沿继承链找字段（先自己，再逐级父类）。
+    //
+    // getField 是 **单类** 查找（il2cpp_class_get_field_from_name），
+    // 继承来的字段一律返回 null。但本项目的 getFields(includeParents=true)
+    // 是会枚举父类字段的 —— 于是出现一个很糟的不一致：
+    // **继承字段会出现在 dump 出来的 JSON 里，点进去却打不开。**
+    // 用户看到字段有值，展开却报「对象已失效」，完全不知道发生了什么。
+    //
+    // getField<T> 那边更糟：找不到就 LOGW 一句然后**返回默认值** ——
+    // 读一个继承字段静默拿到 0，而不是报错。
+    //
+    // 所以凡是「按名字取字段」的地方都该用这个。FieldInfo 里的偏移是
+    // 绝对偏移，拿到之后直接用即可，不需要自己加什么。
+    FieldInfo *getFieldInHierarchy(const char *fieldName);
 
     std::vector<FieldInfo *> getFields(bool includeParents = false);
 
@@ -562,12 +576,17 @@ T MethodInfo::invoke(Il2CppObject *instance, Args &&...args)
 template <typename T>
 T Il2CppObject::getField(const char *name)
 {
-    auto field = klass ? klass->getField(name) : nullptr;
-    // 字段可能不存在（改名/裁剪过元数据），或者是继承自父类的字段
-    // （getField 是单类查找）。旧代码直接 field->getValue<T>() 就是空指针解引用。
+    auto field = klass ? klass->getFieldInHierarchy(name) : nullptr;
+    // 字段可能不存在（改名/裁剪过元数据）。
+    // 旧代码直接 field->getValue<T>() 就是空指针解引用。
+    //
+    // 用 getFieldInHierarchy 而不是 getField：后者是**单类**查找，
+    // 读继承来的字段会返回 null，于是落到下面的「返回默认值」分支 ——
+    // 用户读一个继承字段静默拿到 0，看起来就像「这个字段本来就是 0」，
+    // 比报错更糟。
     if (field == nullptr)
     {
-        LOGW("getField: 找不到字段 %s，返回默认值", name);
+        LOGW("getField: 找不到字段 %s（已沿继承链查找），返回默认值", name);
         if constexpr (!std::is_void_v<T>)
             return T{};
         else
@@ -579,11 +598,11 @@ T Il2CppObject::getField(const char *name)
 template <typename T>
 void Il2CppObject::setField(const char *name, T newValue)
 {
-    auto field = klass ? klass->getField(name) : nullptr;
-    // 同 getField：字段不存在时不要解引用空 FieldInfo
+    auto field = klass ? klass->getFieldInHierarchy(name) : nullptr;
+    // 同 getField：沿继承链找，否则写不进继承来的字段。
     if (field == nullptr)
     {
-        LOGW("setField: 找不到字段 %s，写入被忽略", name);
+        LOGW("setField: 找不到字段 %s（已沿继承链查找），写入被忽略", name);
         return;
     }
     return field->setValue<T>(this, newValue);
