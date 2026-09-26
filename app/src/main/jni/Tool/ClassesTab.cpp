@@ -3082,44 +3082,173 @@ static std::string FormatFieldForEdit(const std::string &type, const nlohmann::o
     return std::to_string(value.get<float>());
 }
 
+// 上一次字段写入失败的原因。空串 = 没有待显示的错误。
+//
+// 键盘回调是在**之后的某一帧**才被调用的，和绘制路径不在同一帧，
+// 所以不能在里面直接 ImGui::Text —— 那时 ImGui 帧上下文早就不在了。
+// 用文件级变量传回绘制路径显示。
+static std::string g_fieldError;
+static double g_fieldErrorAt = 0.0;
+
+static void ReportFieldError(const std::string &msg)
+{
+    g_fieldError = msg;
+    g_fieldErrorAt = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    LOGW("字段写入失败: %s", msg.c_str());
+}
+
 // 解析用户输入并按声明类型写回字段。
 // 任何解析失败都返回 false，**绝不把异常抛进 ImGui 帧**。
 static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &type,
                                     const std::string &fieldName, const std::string &text)
 {
+    // 必须整串都吃掉。std::stoll / stod **接受部分输入**：
+    // std::stoll("12abc") 静默返回 12，std::stod("1.5e") 静默返回 1.5。
+    // 那意味着用户敲错一个字符，工具就把一个**不同的值**写进游戏内存，
+    // 而界面上看不出任何异常 —— 比直接报错糟得多。
+    auto allConsumed = [&text](size_t pos)
+    {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])))
+        {
+            ++pos;
+        }
+        return pos == text.size();
+    };
+
+    // 带**范围检查**的整数解析。
+    //
+    // 旧代码是 `static_cast<int16_t>(std::stoll(text))`：往 Int16 字段里
+    // 填 40000，stoll 正常返回 40000，转 int16_t 变成 -25536，
+    // **静默写进游戏**。用户看着自己填的 40000，字段却变成负数。
+    //
+    // 范围不合法时宁可拒绝写入：宁可用户知道「填不下」，
+    // 也不能悄悄把一个错误的值写进别人的进程。
+    auto parseInteger = [&text, &allConsumed](long long lo, long long hi, long long &out) -> bool
+    {
+        size_t pos = 0;
+        long long v = 0;
+        try
+        {
+            v = std::stoll(text, &pos, 10);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        if (!allConsumed(pos) || v < lo || v > hi)
+        {
+            return false;
+        }
+        out = v;
+        return true;
+    };
+
+    auto parseFloat = [&text, &allConsumed](double &out) -> bool
+    {
+        size_t pos = 0;
+        double v = 0.0;
+        try
+        {
+            v = std::stod(text, &pos);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        if (!allConsumed(pos))
+        {
+            return false;
+        }
+        out = v;
+        return true;
+    };
+
     try
     {
-        if (type == "Single")
+        if (type == "Single" || type == "Double")
         {
-            object->setField(fieldName.c_str(), std::stof(text));
-        }
-        else if (type == "Double")
-        {
-            object->setField(fieldName.c_str(), std::stod(text));
-        }
-        else if (type == "Int16")
-        {
-            object->setField(fieldName.c_str(), static_cast<int16_t>(std::stoll(text)));
-        }
-        else if (type == "UInt16")
-        {
-            object->setField(fieldName.c_str(), static_cast<uint16_t>(std::stoull(text)));
-        }
-        else if (type == "Int32")
-        {
-            object->setField(fieldName.c_str(), static_cast<int32_t>(std::stoll(text)));
-        }
-        else if (type == "UInt32")
-        {
-            object->setField(fieldName.c_str(), static_cast<uint32_t>(std::stoull(text)));
-        }
-        else if (type == "Int64")
-        {
-            object->setField(fieldName.c_str(), static_cast<int64_t>(std::stoll(text)));
+            double d = 0.0;
+            if (!parseFloat(d))
+            {
+                return false;
+            }
+            if (type == "Single")
+            {
+                // Single 只有约 7 位有效数字。填一个超出范围的值进去
+                // 会被静默舍入成 inf，这里拦下来。
+                const float f = static_cast<float>(d);
+                if (!std::isfinite(f))
+                {
+                    LOGW("字段 %s: %g 超出 Single 可表示范围", fieldName.c_str(), d);
+                    return false;
+                }
+                object->setField(fieldName.c_str(), f);
+            }
+            else
+            {
+                object->setField(fieldName.c_str(), d);
+            }
         }
         else if (type == "UInt64")
         {
-            object->setField(fieldName.c_str(), static_cast<uint64_t>(std::stoull(text)));
+            // UInt64 上界超过 long long，单独走 stoull
+            size_t pos = 0;
+            unsigned long long u = 0;
+            try
+            {
+                u = std::stoull(text, &pos, 10);
+            }
+            catch (...)
+            {
+                return false;
+            }
+            if (!allConsumed(pos))
+            {
+                return false;
+            }
+            object->setField(fieldName.c_str(), static_cast<uint64_t>(u));
+        }
+        else if (type == "Int16" || type == "UInt16" || type == "Int32" ||
+                 type == "UInt32" || type == "Int64")
+        {
+            long long lo = 0, hi = 0, v = 0;
+            if (type == "Int16")
+            {
+                lo = -32768; hi = 32767;
+            }
+            else if (type == "UInt16")
+            {
+                lo = 0; hi = 65535;
+            }
+            else if (type == "Int32")
+            {
+                lo = -2147483648LL; hi = 2147483647LL;
+            }
+            else if (type == "UInt32")
+            {
+                lo = 0; hi = 4294967295LL;
+            }
+            else // Int64
+            {
+                lo = std::numeric_limits<long long>::min();
+                hi = std::numeric_limits<long long>::max();
+            }
+            if (!parseInteger(lo, hi, v))
+            {
+                return false;
+            }
+            if (type == "Int16")
+                object->setField(fieldName.c_str(), static_cast<int16_t>(v));
+            else if (type == "UInt16")
+                object->setField(fieldName.c_str(), static_cast<uint16_t>(v));
+            else if (type == "Int32")
+                object->setField(fieldName.c_str(), static_cast<int32_t>(v));
+            else if (type == "UInt32")
+                object->setField(fieldName.c_str(), static_cast<uint32_t>(v));
+            else
+                object->setField(fieldName.c_str(), static_cast<int64_t>(v));
         }
         else
         {
@@ -3157,6 +3286,23 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
     {
         ImGui::TextDisabled("对象已失效（可能已被 GC 回收），请重新 Inspect");
         return;
+    }
+
+    // 上一次字段写入失败的原因（键盘回调在别的帧里设置的）。
+    // 显示 8 秒后自动消失，避免一直挂在界面上。
+    if (!g_fieldError.empty())
+    {
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (now - g_fieldErrorAt > 8.0)
+        {
+            g_fieldError.clear();
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "字段写入失败：%s", g_fieldError.c_str());
+        }
     }
 
     for (auto it = paths.begin() + (paths.size() > 3 ? paths.size() - 4 : 0); it != paths.end(); ++it)
@@ -3432,6 +3578,13 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
                                        }
+                                       else
+                                       {
+                                           // 旧代码失败时什么都不做 —— 用户填了值、点了确认，然后没有任何反应。
+                                           // 他无法判断是「写不进去」还是「工具没收到」，只会反复重试。
+                                           ReportFieldError(std::string(val) + ": 无法解析或超出 " + type +
+                                                                    " 的取值范围（输入: " + text + "）");
+                                       }
                                    });
                 }
             }
@@ -3459,6 +3612,13 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        {
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
+                                       }
+                                       else
+                                       {
+                                           // 旧代码失败时什么都不做 —— 用户填了值、点了确认，然后没有任何反应。
+                                           // 他无法判断是「写不进去」还是「工具没收到」，只会反复重试。
+                                           ReportFieldError(std::string(val) + ": 无法解析或超出 " + type +
+                                                                    " 的取值范围（输入: " + text + "）");
                                        }
                                    });
                 }
