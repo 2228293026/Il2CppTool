@@ -216,6 +216,28 @@ static Il2CppObject* ResolveTransform(const GameObjectInfo& info)
 }
 
 static std::vector<Il2CppObject*> g_cachedGameObjects;
+    // 与 g_cachedGameObjects **一一对应**的 GC 强根。
+    // 裸指针本身不做任何保活 —— 有了它才能安全地解引用（第 100 轮）。
+    static std::vector<uint32_t> g_cachedHandles;
+
+    // 清缓存**必须连句柄一起放**。
+    //
+    // 只 clear() 裸指针 vector 的话，句柄会一直留在 GC 的句柄表里 ——
+    // 而那正是第 82 轮修好的那个 GC 强根计数器要抓的「句柄只增不减」。
+    // 每切一次场景走一次这条路，所以这不是「理论上会涨」，是必然涨。
+    // 必须在持有 g_objectsMutex 时调用。
+    static void ClearCachedObjectListLocked()
+    {
+        for (auto h : g_cachedHandles)
+        {
+            if (h)
+            {
+                Il2cpp::GC::FreeHandle(h);
+            }
+        }
+        g_cachedHandles.clear();
+        g_cachedGameObjects.clear();
+    }
 static std::atomic<bool> g_needsRescan{false};
 static std::atomic<bool> g_hasNewList{false};
 static std::atomic<bool> g_rescanBusy{false};
@@ -380,8 +402,34 @@ static void RescanGameObjectsInBackground() {
             g_rescanInProgress.store(false);
             return;
         }
+        // **当场加根**，在扫描线程里就做完（第 100 轮改）。
+        //
+        // 旧代码把裸指针存进 g_cachedGameObjects 就完事，而这个列表最长
+        // 要活 5 秒（下一次重扫之前）才被替换。BuildUIObjectList 在这期间
+        // 会对每个条目做 IsValidGameObject() —— 那个函数要读 o->klass 并
+        // invoke。而扫描结果里的对象**没有任何 GC 根**（FindObjects 找到
+        // 它们只是说明「此刻还活着」，不是「它们会被保活」）：
+        // 游戏侧一放手，GC 随时可以收走，于是这里就是 use-after-free。
+        //
+        // 5 秒里游戏做一次 GC（切场景、切图鉴）是完全正常的。
+        std::vector<uint32_t> newHandles;
+        newHandles.reserve(objs.size());
+        for (auto *o : objs)
+        {
+            newHandles.push_back(o ? Il2cpp::GC::NewHandle(o) : 0);
+        }
         {
             std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
+            // 旧句柄随旧列表一起退休。放在锁外做 FreeHandle 更安全，
+            // 但 NewHandle/FreeHandle 都不碰 drawObjects，这里足够。
+            for (auto h : g_cachedHandles)
+            {
+                if (h)
+                {
+                    Il2cpp::GC::FreeHandle(h);
+                }
+            }
+            g_cachedHandles = std::move(newHandles);
             g_cachedGameObjects = std::move(objs);
         }
         g_rescanFinishTime.store(NowSeconds());
@@ -438,7 +486,7 @@ static void ProcessScannedObjects() {
             }
             {
                 std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
-                g_cachedGameObjects.clear();
+                ClearCachedObjectListLocked();
             }
             g_lastObjectCount.store(0);
             ReleaseMainCamera();
@@ -1039,7 +1087,7 @@ void ObjectDrawManager::Shutdown() {
 
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
-        g_cachedGameObjects.clear();
+        ClearCachedObjectListLocked();
     }
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
@@ -1342,18 +1390,24 @@ void ObjectDrawManager::DrawCircle(const DrawObject& drawObj) {
 // 构建UI用的对象列表（从缓存读取，不做坐标转换）
 static std::vector<GameObjectInfo> BuildUIObjectList() {
     std::vector<GameObjectInfo> result;
-    std::vector<Il2CppObject*> snapshot;
+    // 拷**句柄**，不拷裸指针：句柄在列表被替换之前一直是有效的根，
+    // 而裸指针随时可能因为一次 GC 变成野的（第 100 轮）。
+    std::vector<uint32_t> handles;
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_objectsMutex);
-        snapshot = g_cachedGameObjects;
+        handles = g_cachedHandles;
     }
 
     auto *cam = ResolveMainCamera();
     if (!cam || !g_WorldToScreenPoint || !g_GetTransform || !g_GetPosition)
         return result;
 
-    result.reserve(snapshot.size());
-    for (auto go : snapshot) {
+    result.reserve(handles.size());
+    for (auto h : handles) {
+        // 句柄为 0 = 扫描时就没加上根；对象可能已经被回收。
+        // **不解引用裸指针**，直接跳过。
+        Il2CppObject *go = h ? Il2cpp::GC::GetHandleTarget(h) : nullptr;
+        if (!go) continue;
         if (!IsValidGameObject(go)) continue;
 
         try {
