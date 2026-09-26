@@ -99,3 +99,6 @@ Lib/
 
 # Kilo 编辑器工作区（含 node_modules 与 worktree）
 .kilo/
+
+# 门禁自检的缓存（每次绿了才写，机器本地状态，不进版本库）
+.ci/.selftest-cache

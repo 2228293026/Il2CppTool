@@ -81,6 +81,36 @@ $uiGate = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1', '-Quiet')
 }
 
+# ---- 缓存：脚本和被注入的文件都没动过，就不用真跑一遍 ----
+#
+# 第 90 轮的教训：我提交前习惯性 `-SkipSelfTest`，而这一步是**唯一**能
+# 抓住「规则静默失效」的东西 —— 代价是 60 多秒，于是我一直在跳过它。
+#
+# 只靠「请不要跳过」是没用的（第 85 轮的教训：靠记忆的门禁等于没有）。
+# 所以让它**默认就快**：内容指纹没变就秒过，变了就真跑。
+# 这样 -SkipSelfTest 就不再是一个「为了省时间而放弃保护」的选项。
+$cacheFile = Join-Path $root '.ci/.selftest-cache'
+$watch = @(
+    '.ci/selftest-gates.ps1', '.ci/check-ui-patterns.ps1',
+    '.ci/check-structure.ps1', '.ci/check-hosts.ps1',
+    'app/src/main/jni/Tool/Tool.cpp', 'app/src/main/jni/Tool/ClassesTab.cpp',
+    'app/src/main/jni/Main.cpp'
+)
+$sb = [System.Text.StringBuilder]::new()
+foreach ($w in $watch) {
+    $p = Join-Path $root $w
+    if (Test-Path $p) { [void]$sb.AppendLine("$w " + (Get-FileHash $p -Algorithm SHA256).Hash) }
+}
+$head = (& git -C $root rev-parse HEAD 2>$null)
+[void]$sb.AppendLine("HEAD $head")
+$fingerprint = $sb.ToString()
+$cached = ''
+if (Test-Path $cacheFile) { $cached = [IO.File]::ReadAllText($cacheFile) }
+if ($cached -eq $fingerprint) {
+    Write-Host '门禁自检：门禁脚本和被注入的文件都没动过，跳过（上一次是绿的）'
+    exit 0
+}
+
 # ---- 1. 规则 A2：相邻重复行 ----
 Test-Rule 'A2 相邻重复行' {
     param($t)
@@ -343,5 +373,7 @@ if ($failed -gt 0) {
     Write-Host "$failed 条检查抓不到它要防的东西 —— 它们一直是装饰。" -ForegroundColor Red
     exit 1
 }
+    # 只有全绿才写缓存 —— 写了就等于「这次验过了」
+    [IO.File]::WriteAllText($cacheFile, $fingerprint, (New-Object Text.UTF8Encoding($false)))
 Write-Host "全部 $($results.Count) 条检查都验证过：能红，也能绿。" -ForegroundColor Green
 exit 0

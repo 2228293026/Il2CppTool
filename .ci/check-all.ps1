@@ -78,7 +78,15 @@ if (-not $SkipClangTidy) {
 # 一个从不失败的检查和没有检查，在输出上无法区分 ——
 # 所以必须真的去制造一次违规，看它会不会红。
 #
-# 这一步会临时改几个文件再改回来，耗时几十秒，所以可以 -SkipSelfTest 跳过。
+# 这一步会临时改几个文件再改回来，耗时 60 多秒。
+#
+# 第 90 轮踩过的坑：我在提交前习惯性加了 -SkipSelfTest，
+# 而这一步**恰恰是唯一能抓住「规则静默失效」的东西** ——
+# 我把 `std::ofstream` 改写成 `std::(o|f)stream`（匹配不到 ofstream），
+# 本地「检查通过」，CI 红了才发现。
+#
+# 现在脚本和被注入的文件都没动过时，selftest-gates.ps1 会走缓存秒过；
+# 动过了就真跑。**省时间不需要靠 -SkipSelfTest 换取。**
 if (-not $SkipSelfTest) {
     Invoke-Check '门禁自检（每条检查都必须能红）' {
         powershell -ExecutionPolicy Bypass -File .\.ci\selftest-gates.ps1
