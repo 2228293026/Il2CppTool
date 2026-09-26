@@ -638,6 +638,17 @@ $hookNames = @{}
 #   il2cpp-class.h 模板 DobbyHook(methodPointer, (void *)func, ...)
 #   OpenGL.h       reinterpret_cast 转发的十几个 GL 钩子
 # 那三个来源实测把名单撑成 6 个，其中 5 个报的是无关函数。
+# 同一族的另外两个模板：进托管代码的入口。
+#
+# `MethodInfo::invoke` / `invoke_static` 是**唯一**几处「从 C++ 跳进托管」的地方，
+# 而托管抛的异常会被 il2cpp 翻成 C++ 异常。第 110 轮发现
+# `get_touchCount` 里的 `invoke_static_method<UnityEngine_Touch>("GetTouch", 0)`
+# 没有任何边界 —— 手指在「数出个数」和「取第 0 个」之间收回去就会抛，
+# 那个栈上是**游戏的 get_touchCount**，逃出去 = 整局游戏崩掉。
+#
+# 只包住其中两个重载没用：第三个调用点照样能崩。所以这里要求
+# **每个重载各自都有** try。
+$invFamily = @('invoke_static', 'invoke')
 $castNames = @('reinterpret_cast', 'const_cast', 'static_cast', 'dynamic_cast')
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
@@ -661,6 +672,40 @@ foreach ($f in $files) {
         $hookNames[$m.Groups[1].Value] = $true
     }
 }
+foreach ($name in $invFamily) {
+    foreach ($f in $files) {
+        if ($f.Extension -ne '.cpp' -and $f.Extension -ne '.h') { continue }
+        $lines = Get-Content -Encoding UTF8 $f.FullName
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $t = $lines[$i].Trim()
+            if ($t -match '^(//|\*|/\*)') { continue }
+            if ($t -notmatch ('\b' + [regex]::Escape($name) + '\(.*\)\s*$')) { continue }
+            # `{` 可以在**下一行**（这三个模板的定义都是这样写的）。
+            # 一开始只认同行，结果规则一条都没匹配上 —— 静默地什么都查不到。
+            $openAt = $i
+            if ($t -notmatch '\{\s*$') {
+                if (($i + 1) -lt $lines.Count -and $lines[$i + 1].Trim() -eq '{') { $openAt = $i }
+                else { continue }
+            }
+            $ind = ($lines[$openAt] -replace '^(\s*).*', '$1').Length
+            $body = @()
+            for ($m = $openAt; $m -lt $lines.Count; $m++) {
+                $body += $lines[$m]
+                if ($lines[$m].Trim() -eq '}' -and ($lines[$m] -replace '^(\s*).*', '$1').Length -eq $ind) { break }
+            }
+            $bt = $body -join "`n"
+            if ($bt -notmatch '\btry\s*\{') {
+                $hits += [pscustomobject]@{
+                    File = $f.Name
+                    Line = $i + 1
+                    Rule = "N: 进托管代码的 $name 没有异常边界（托管异常会被 il2cpp 翻成 C++ 异常，逃出去就崩游戏）"
+                    Text = $t
+                }
+            }
+        }
+    }
+}
+
 foreach ($name in $hookNames.Keys) {
     foreach ($f in $files) {
         $lines = Get-Content -Encoding UTF8 $f.FullName

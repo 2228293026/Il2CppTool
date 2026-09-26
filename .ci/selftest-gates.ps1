@@ -297,6 +297,33 @@ Test-Rule 'N Dobby 替换函数要有异常边界' {
     return $true
 } $nCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 19. 规则 N 的另一半：进托管代码的 invoke 也要有边界（第 110 轮）----
+#
+# 这条一开始**一条都没匹配上**（规则本体把 `{` 要求在定义那一行，
+# 而这三个模板的 `{` 都在下一行）—— 也就是又一条「从写下来起就是死的」检查，
+# 而且它显示为「通过」。靠反向验证才发现（第 110 轮）。
+$n2Check = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'N 进托管代码的 invoke 要有边界' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'T MethodInfo::invoke\(Il2CppObject \*instance\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ty = -1
+    for ($k = $i; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*try\s*$') { $ty = $k; break }
+    }
+    if ($ty -lt 0) { return $false }
+    $ls[$ty] = '    ; // 第 110 轮之前的样子'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Il2cpp/il2cpp-class.h'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $n2Check 'app/src/main/jni/Il2cpp/il2cpp-class.h'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

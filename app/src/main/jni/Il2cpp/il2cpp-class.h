@@ -582,7 +582,24 @@ T MethodInfo::invoke(Il2CppObject *instance)
     using Invoker = T (*)(Il2CppObject *, MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(instance, this);
+    // 异常边界 —— 和上面两个 invoke 同理（第 110 轮）。
+    // 三个重载都必须包：只包两个的话，第三个调用点照样能把游戏带崩。
+    try
+    {
+        return invoker(instance, this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T, typename... Args>
