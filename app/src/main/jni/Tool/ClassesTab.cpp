@@ -142,6 +142,10 @@ constexpr int MAX_CLASSES = 500;
 //    走类型分派，N 个关注项每帧跑是不必要的开销。
 //    又不是几秒一次 —— 那样「盯着看」就没意义了。
 static std::vector<ClassesTab::Watch> g_watches;
+// 前向声明：冻结的每帧写回要调它，而它的定义在文件更靠后（字段编辑那段）。
+static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &paths,
+                            std::string value);
+
 static double g_watchLastPoll = 0.0;
 
 void ClassesTab::AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
@@ -256,6 +260,40 @@ void ClassesTab::DrawWatches()
         return;
     }
 
+    // ---- 冻结：每帧把钉住的值写回去 ----
+    //
+    // 每帧都跑（不是按 200ms）：冻结的意义就是压过游戏自己的更新 ——
+    // 如果也按 200ms 写一次，两次之间血量会掉下去，表现为「闪一下又回来」。
+    //
+    // 代价：N 个冻结项 × 一次原始类型字段写入。int/float/bool 的 setField
+    // 就是一次 il2cpp_field_set_value，几十项完全不是问题。
+    for (auto &w : g_watches)
+    {
+        if (!w.frozen || w.frozenValue.empty() || w.paths.empty())
+        {
+            continue;
+        }
+        Il2CppObject *live = w.handle ? Il2cpp::GC::GetHandleTarget(w.handle) : nullptr;
+        if (!live)
+        {
+            // 对象都被回收了，冻结没有意义 —— 自动解除，
+            // 而不是继续对着野指针每帧写一次。
+            w.invalid = true;
+            w.frozen = false;
+            ChangeLog::Record(ChangeLog::Kind::Field, w.label, "已解除冻结：对象已失效");
+            continue;
+        }
+        std::string value = w.frozenValue; // setField 按值传，不能用 const 引用
+        if (!WriteWatchValue(live, w.paths, value))
+        {
+            // 写不进去（路径断了 / 类型变了）。每帧重试只会刷屏，
+            // 所以解除冻结并明确记一笔。
+            w.frozen = false;
+            ChangeLog::Record(ChangeLog::Kind::Field, w.label,
+                              "已解除冻结：写不进去（路径失效或类型不支持）");
+        }
+    }
+
     // 低频轮询。放在画之前一次性更新所有条目。
     const double now = std::chrono::duration<double>(
                            std::chrono::steady_clock::now().time_since_epoch())
@@ -307,11 +345,13 @@ void ClassesTab::DrawWatches()
         // 而值是这一行唯一真正要看的**东西**，标签只是定位用的。
         // 表格给标签列一个上限宽度，超出部分被裁掉。
         ImGui::PushID(static_cast<int>(i));
-        if (ImGui::BeginTable("##watchrow", 2, ImGuiTableFlags_SizingStretchProp))
+        if (ImGui::BeginTable("##watchrow", 4, ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
-                                    ImGui::GetContentRegionAvail().x * 0.55f);
+            const float rowAvail = ImGui::GetContentRegionAvail().x;
+            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed, rowAvail * 0.36f);
             ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("freeze", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+            ImGui::TableSetupColumn("del", ImGuiTableColumnFlags_WidthFixed, 28.0f);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             if (w.changed)
@@ -332,10 +372,49 @@ void ClassesTab::DrawWatches()
                 ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s",
                                    w.lastValue.empty() ? "<对象已失效>" : w.lastValue.c_str());
             }
+            else if (w.frozen)
+            {
+                // 冻结中的值要和普通值**一眼能分开**：冻结后它可能一直不变
+                // （因为我们每帧写回）。配色和普通行一样的话，用户会以为
+                // 「加了冻结之后游戏就不动了」，其实是工具在写。
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.f, 1.f), "%s", w.lastValue.c_str());
+            }
             else
             {
                 ImGui::TextUnformatted(w.lastValue.c_str());
             }
+
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton(w.frozen ? "解冻" : "冻结"))
+            {
+                w.frozen = !w.frozen;
+                if (w.frozen)
+                {
+                    // 钉住的是**当前看到的值**。
+                    // 对象失效 / 值不是标量时**不许冻结** ——
+                    // 否则会对着一个没意义的值每帧写一次。
+                    if (w.invalid || w.lastValue.empty() || w.lastValue == "<非标量>")
+                    {
+                        w.frozen = false;
+                    }
+                    else
+                    {
+                        w.frozenValue = w.lastValue;
+                        ChangeLog::Record(ChangeLog::Kind::Field, w.label,
+                                          "已冻结在 " + w.frozenValue);
+                    }
+                }
+                else
+                {
+                    ChangeLog::Record(ChangeLog::Kind::Field, w.label, "已解除冻结");
+                }
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip(w.frozen ? "停止每帧写回"
+                                           : "每帧把这个值写回去，压过游戏自己的更新");
+            }
+
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("x"))
             {
@@ -3691,6 +3770,68 @@ static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &typ
         return false;
     }
     return true;
+}
+
+// 按完整路径把一个**原始类型**字段写成 value（文本形式）。
+//
+// 路径元素形如 "System.Int32 health"（类型名 + 字段名，空格分隔），
+// 和 dump(paths) 用的是同一套表示 —— 读和写必须走同样的解析，否则
+// 「读得到但写不进去」，而用户完全看不出为什么。
+//
+// 返回 false 表示写不进去（路径中途断了 / 字段找不到 / 类型不认识 /
+// 解析失败）。调用方据此**解除冻结**，而不是每帧对着一个写不进去的
+// 路径空转 —— 那既浪费又会在日志里刷屏。
+static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &paths,
+                            std::string value)
+{
+    if (paths.empty())
+    {
+        return false;
+    }
+    Il2CppObject *object = root;
+    for (size_t i = 0; i < paths.size(); i++)
+    {
+        if (object == nullptr)
+        {
+            return false;
+        }
+        const std::string &path = paths[i];
+        const bool isLast = (i + 1 == paths.size());
+        std::string type, name;
+        const size_t sp = path.find(' ');
+        if (sp == std::string::npos)
+        {
+            name = path;
+        }
+        else
+        {
+            type = path.substr(0, sp);
+            name = path.substr(sp + 1);
+        }
+        if (isLast)
+        {
+            if (name.empty())
+            {
+                return false;
+            }
+            // 走字段编辑那套严格的解析（整串吃掉 + 范围检查），
+            // 否则「12abc」会静默写成 12 —— 第 44 轮修过的坑。
+            return ParseAndSetNumericField(object, type, name, value);
+        }
+        // 中间段：取子对象
+        auto *klass = Il2cpp::GetObjectClass(object);
+        if (klass == nullptr)
+        {
+            return false;
+        }
+        auto *field = klass->getFieldInHierarchy(name.c_str());
+        if (field == nullptr)
+        {
+            return false;
+        }
+        object = Il2cpp::GetFieldValueObject(object, field);
+    }
+    return object != nullptr;
 }
 
 void ClassesTab::ImGuiJson(Il2CppObject *rootObj)

@@ -103,9 +103,17 @@ struct ClassesTab
     // 所以：把某个叶子字段钉进关注列表，之后每 200ms 自动重读一次，
     // 值变了就高亮。这样「看一个数」从「反复手动刷新」变成「盯着看」。
     //
-    // 刻意保持**只读**：写入已经在字段编辑里做过了，而且写入需要用户
-    // 明确输入新值。自动化的写入风险太高（写错一个偏移就是改坏游戏状态），
-    // 收益也不明确。
+    // **冻结**（可选）：把当前值钉住，每帧写回。
+    // 没有它的话，改完的值经常撑不过一帧 —— 游戏自己的 Update 里
+    // `health -= damage` 或者从服务器同步，下一帧就覆盖回去了。
+    // 于是用户的体验是「我明明改了，它弹回来了」，却查不出原因。
+    // 冻结之后值真正立住，这才算改成功。
+    //
+    // 安全边界：只有**原始类型**（int/float/bool/string 引用）的叶子字段
+    // 才会出现在关注列表里（见 canWatch），所以每帧写回的是
+    // 「一个已加 GC 根的对象上的一个原始类型字段」—— 不会写到野内存，
+    // 也不会写坏对象结构。字符串字段写回的是**托管字符串指针**，
+    // 而 NewString 出来的对象由 GC 托管，引用计数由运行时维护。
     struct Watch
     {
         Il2CppObject *object;             // 原始指针，仅用于显示和去重
@@ -115,6 +123,8 @@ struct ClassesTab
         std::string lastValue;            // 上一次读到的值（用于判断是否变化）
         bool changed;                     // 本次轮询里值变了
         bool invalid;                     // 对象已被 GC 或路径失效
+        bool frozen = false;              // 冻结中：每帧把 frozenValue 写回去
+        std::string frozenValue;          // 冻结时钉住的那个值（文本形式）
     };
     static void AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
                          const std::string &label);
