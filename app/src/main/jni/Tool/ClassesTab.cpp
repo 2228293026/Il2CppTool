@@ -3757,7 +3757,6 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                 savedSet[currentObj->klass].insert(currentObj);
                 SaveObjectWithRoot(currentObj);
                 RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根");
-                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根");
             }
             if (ImGui::IsItemHovered())
             {
