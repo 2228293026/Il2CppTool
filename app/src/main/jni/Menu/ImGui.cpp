@@ -29,6 +29,8 @@ bool isInitialized = false;
 // setupMenu 只应该试一次（失败时不要每帧重来重建 context）；没就绪时按帧重试。
 // 定义在 Main.cpp。
 int g_initState = INIT_PENDING;
+// 「等待中」只提示一次。static，因为要跨帧保持。
+static bool s_waitLogged = false;
 
 // g_fontFullRangeRequested 定义在 Main.cpp（和设置界面的开关在一起），
 // 声明见 ImGui.h。
@@ -273,14 +275,26 @@ void setupMenu()
     // 这样「等依赖」不再占用渲染线程，不会造成首帧卡死 / ANR。
     if (g_initState == INIT_PENDING)
     {
-        static int attempts = 0;
-        if (++attempts == 1)
+        // 预算必须按**时间**算，不能按帧。
+        //
+        // 旧实现是「等 N 帧」，而 N 固定。于是同一个预算在 30fps 下是 2 分钟、
+        // 在 120fps 下只有 30 秒 —— 帧率越高越早放弃，**恰好和用户的直觉相反**
+        // （高帧率设备往往是新手机，更该等得住）。
+        //
+        // 而且日志写的是「帧」，用户根本换算不出等了多久。
+        static const auto waitStart = std::chrono::steady_clock::now();
+        if (!s_waitLogged)
         {
-            LOGI("等待 il2cpp 就绪中…（菜单暂不显示，游戏不受影响）");
+            s_waitLogged = true;
+            LOGI("等待 il2cpp 就绪中…（最多 %d 秒；菜单暂不显示，游戏不受影响）",
+                 INIT_TIMEOUT_SECONDS);
         }
-        if (attempts >= INIT_MAX_ATTEMPTS)
+        const double elapsed = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - waitStart)
+                                   .count();
+        if (elapsed >= INIT_TIMEOUT_SECONDS)
         {
-            LOGE("等待 %d 帧仍未就绪，放弃菜单初始化", attempts);
+            LOGE("等待 %.1f 秒仍未就绪，放弃菜单初始化", elapsed);
             g_initState = INIT_FAILED;
         }
     }

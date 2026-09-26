@@ -21,7 +21,12 @@ enum InitState
 extern int g_initState;
 
 // 重试多少次后放弃（按帧计，60fps 下 3600 帧约合 60 秒）
-#define INIT_MAX_ATTEMPTS 3600
+// 等待 il2cpp 就绪的时间预算（**秒**，不是帧）。
+//
+// 曾经是「3600 帧」。问题是帧率越高预算越短：30fps 下等于 2 分钟，
+// 120fps 下只有 30 秒 —— 和直觉正好相反，高帧率设备（往往更新）
+// 反而更容易被过早放弃。
+#define INIT_TIMEOUT_SECONDS 60
 
 // 是否加载完整中日韩字形范围（约 21000 个字形）。
 //
