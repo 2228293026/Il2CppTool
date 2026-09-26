@@ -4038,6 +4038,16 @@ void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
 std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> ClassesTab::objectMap;
 std::unordered_map<Il2CppClass *, Il2cpp::GC::RootedObjectList> ClassesTab::newObjectMap;
 std::unordered_map<Il2CppClass *, std::set<Il2CppObject *>> ClassesTab::savedSet;
+
+size_t ClassesTab::SavedObjectCount()
+{
+    size_t total = 0;
+    for (const auto &[klass, objects] : savedSet)
+    {
+        total += objects.size();
+    }
+    return total;
+}
 std::unordered_map<MethodInfo *, ClassesTab::OriginalMethodBytes> ClassesTab::oMap;
 std::unordered_map<Il2CppClass *, bool> ClassesTab::states;
 PopUpSelector ClassesTab::poper;

@@ -141,6 +141,13 @@ std::vector<Result> Collect()
         out.push_back(Info("数据目录", buf));
     }
 
+    // ---- 已保存的对象数 ----
+    // 这些是用户手动标记的，靠 GC 强根保活。数量异常偏大通常意味着
+    // 「关掉了标签页但根没释放」——那会让游戏对象永远回收不掉。
+    {
+        out.push_back(Info("已保存对象", std::to_string(ClassesTab::SavedObjectCount())));
+    }
+
     // ---- 构建信息 ----
     // 出问题时能一眼确认跑的是哪个版本，省掉一轮来回。
     {
@@ -154,6 +161,42 @@ std::vector<Result> Collect()
         char buf[256]{0};
         snprintf(buf, sizeof(buf), "Unity %s / 游戏 %s", unity.c_str(), game.c_str());
         out.push_back(Info("目标", buf));
+    }
+
+    // ---- 构建期开关 ----
+    //
+    // 这一项的价值在于**诚实**：源码里能看到的特性，不一定在你的构建里。
+    // 以前只有 README 里的一段文字说明，界面上完全看不出来 ——
+    // 看到代码里有回溯功能、却始终没反应，很难想到是「根本没编进去」。
+    // 现在直接列出来，并给出启用方法。
+    {
+        struct Feature
+        {
+            const char *name;
+            const char *note;
+            bool enabled;
+        };
+        const Feature features[] = {
+#ifdef USE_FRIDA
+            {"Frida 回溯", "已编译启用", true},
+#else
+            {"Frida 回溯", "未编译启用（Android.mk 的 LOCAL_CPPFLAGS 加 -DUSE_FRIDA 后重新构建）", false},
+#endif
+#ifdef LIB_INPUT
+            {"JNI 触摸注入", "已编译启用", true},
+#else
+            {"JNI 触摸注入", "未编译启用（当前走 UnityEngine.Input hook，无需此项）", false},
+#endif
+#ifdef __DEBUG__
+            {"D 级详细日志", "已启用（build.ps1 -Debug）", true},
+#else
+            {"D 级详细日志", "已静默（W/E/I 级始终输出；需要 D 级请用 build.ps1 -Debug）", false},
+#endif
+        };
+        for (const auto &f : features)
+        {
+            out.push_back(Info(std::string("构建开关 · ") + f.name, f.note));
+        }
     }
 
     return out;

@@ -88,6 +88,10 @@ struct ClassesTab
     // UI 上正在输入的新预设名
     std::string newPresetName;
 
+    // savedSet 里一共保存了多少个对象（自检页用）。
+    // savedSet 是 static 的，但计数要走它所在的那个 TU。
+    static size_t SavedObjectCount();
+
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
     MethodList &buildMethodMap(Il2CppClass *klass);
