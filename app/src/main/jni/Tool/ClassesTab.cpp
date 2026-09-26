@@ -4463,160 +4463,160 @@ namespace
             }
             else
             {
-            if (st->includeAllImages)
-            {
-                for (auto image : st->images)
+                if (st->includeAllImages)
                 {
-                    if (image == nullptr)
+                    for (auto image : st->images)
                     {
-                        continue;
+                        if (image == nullptr)
+                        {
+                            continue;
+                        }
+                        auto imageClasses = image->getClasses();
+                        allClasses.insert(allClasses.end(), imageClasses.begin(), imageClasses.end());
                     }
-                    auto imageClasses = image->getClasses();
-                    allClasses.insert(allClasses.end(), imageClasses.begin(), imageClasses.end());
                 }
-            }
-            else if (st->selectedImage != nullptr)
-            {
-                allClasses = st->selectedImage->getClasses();
-            }
+                else if (st->selectedImage != nullptr)
+                {
+                    allClasses = st->selectedImage->getClasses();
+                }
 
-            // 大小写不敏感包含匹配。
-            //
-            // 旧实现是 `auto newA = a; auto newB = b; transform(tolower); find`
-            // —— 每比较一次就分配两个完整副本。这个比较跑在
-            // 「每个类 × 每个方法 × 每个字段」上：5000 个类、平均 20 个方法
-            // 就是十万次比较、二十万次堆分配。现在只转换**模式串**
-            // （长度固定，几百字节）并预先算好，遍历 haystack 时逐字符
-            // tolower 比较，全程零分配。
-            std::string loweredFilter;
-            if (!st->caseSensitive && !st->filter.empty())
-            {
-                loweredFilter.resize(st->filter.size());
-                std::transform(st->filter.begin(), st->filter.end(), loweredFilter.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            }
+                // 大小写不敏感包含匹配。
+                //
+                // 旧实现是 `auto newA = a; auto newB = b; transform(tolower); find`
+                // —— 每比较一次就分配两个完整副本。这个比较跑在
+                // 「每个类 × 每个方法 × 每个字段」上：5000 个类、平均 20 个方法
+                // 就是十万次比较、二十万次堆分配。现在只转换**模式串**
+                // （长度固定，几百字节）并预先算好，遍历 haystack 时逐字符
+                // tolower 比较，全程零分配。
+                std::string loweredFilter;
+                if (!st->caseSensitive && !st->filter.empty())
+                {
+                    loweredFilter.resize(st->filter.size());
+                    std::transform(st->filter.begin(), st->filter.end(), loweredFilter.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                }
 
-            auto finder = [&](const char *haystack) -> bool
-            {
-                if (haystack == nullptr)
+                auto finder = [&](const char *haystack) -> bool
                 {
-                    return false;
-                }
-                if (st->caseSensitive)
-                {
-                    return std::strstr(haystack, st->filter.c_str()) != nullptr;
-                }
-                if (loweredFilter.empty())
-                {
-                    return true;
-                }
-                const size_t n = loweredFilter.size();
-                for (const char *p = haystack; *p != '\0'; ++p)
-                {
-                    size_t i = 0;
-                    while (i < n && p[i] != '\0' &&
-                           static_cast<char>(std::tolower(static_cast<unsigned char>(p[i]))) == loweredFilter[i])
+                    if (haystack == nullptr)
                     {
-                        ++i;
+                        return false;
                     }
-                    if (i == n)
+                    if (st->caseSensitive)
+                    {
+                        return std::strstr(haystack, st->filter.c_str()) != nullptr;
+                    }
+                    if (loweredFilter.empty())
                     {
                         return true;
                     }
-                }
-                return false;
-            };
-
-            // 三个搜索范围是「或」关系：类名/方法名/字段名命中任意一个都算。
-            // 都不勾时回退到只按类名筛（UI 上也会兜底，这里再兜一层，
-            // 因为 ConfigSave/Load 能从旧配置里读出三者皆 false 的状态）。
-            const bool searchClass = st->filterByClass || (!st->filterByMethod && !st->filterByField);
-            const bool searchMethod = st->filterByMethod;
-            const bool searchField = st->filterByField;
-
-            const size_t limit = st->showAllClasses ? allClasses.size() : (size_t)MAX_CLASSES;
-
-            for (size_t i = 0; i < allClasses.size() && filtered.size() < limit; i++)
-            {
-                auto klass = allClasses[i];
-                if (klass == nullptr)
-                {
-                    continue;
-                }
-                if (Il2cpp::GetClassIsEnum(klass))
-                {
-                    continue;
-                }
-
-                bool found = false;
-                // 命中的方法先攒着，确认命中后再填 methodMap ——
-                // 否则没命中的类也白填一遍（那才是最贵的部分）。
-                std::vector<MethodInfo *> matchedMethods;
-                // 类名**本身**是否命中。只有靠方法名/字段名才捞出来的类，
-                // 才应该只展示相关方法；类名命中的类是「整类都相关」，
-                // 应当展示全部方法。
-                bool classNameMatched = false;
-
-                if (searchClass && finder(klass->getFullName().c_str()))
-                {
-                    found = true;
-                    classNameMatched = true;
-                }
-                if (searchMethod)
-                {
-                    for (auto m : klass->getMethods())
+                    const size_t n = loweredFilter.size();
+                    for (const char *p = haystack; *p != '\0'; ++p)
                     {
-                        if (finder(m->getName()))
+                        size_t i = 0;
+                        while (i < n && p[i] != '\0' &&
+                               static_cast<char>(std::tolower(static_cast<unsigned char>(p[i]))) == loweredFilter[i])
                         {
-                            found = true;
-                            matchedMethods.push_back(m);
+                            ++i;
+                        }
+                        if (i == n)
+                        {
+                            return true;
                         }
                     }
-                }
-                if (searchField && !found)
+                    return false;
+                };
+
+                // 三个搜索范围是「或」关系：类名/方法名/字段名命中任意一个都算。
+                // 都不勾时回退到只按类名筛（UI 上也会兜底，这里再兜一层，
+                // 因为 ConfigSave/Load 能从旧配置里读出三者皆 false 的状态）。
+                const bool searchClass = st->filterByClass || (!st->filterByMethod && !st->filterByField);
+                const bool searchMethod = st->filterByMethod;
+                const bool searchField = st->filterByField;
+
+                const size_t limit = st->showAllClasses ? allClasses.size() : (size_t)MAX_CLASSES;
+
+                for (size_t i = 0; i < allClasses.size() && filtered.size() < limit; i++)
                 {
-                    for (auto f : klass->getFields())
+                    auto klass = allClasses[i];
+                    if (klass == nullptr)
                     {
-                        if (finder(f->getName()))
+                        continue;
+                    }
+                    if (Il2cpp::GetClassIsEnum(klass))
+                    {
+                        continue;
+                    }
+
+                    bool found = false;
+                    // 命中的方法先攒着，确认命中后再填 methodMap ——
+                    // 否则没命中的类也白填一遍（那才是最贵的部分）。
+                    std::vector<MethodInfo *> matchedMethods;
+                    // 类名**本身**是否命中。只有靠方法名/字段名才捞出来的类，
+                    // 才应该只展示相关方法；类名命中的类是「整类都相关」，
+                    // 应当展示全部方法。
+                    bool classNameMatched = false;
+
+                    if (searchClass && finder(klass->getFullName().c_str()))
+                    {
+                        found = true;
+                        classNameMatched = true;
+                    }
+                    if (searchMethod)
+                    {
+                        for (auto m : klass->getMethods())
                         {
-                            found = true;
-                            break;
+                            if (finder(m->getName()))
+                            {
+                                found = true;
+                                matchedMethods.push_back(m);
+                            }
                         }
                     }
-                }
-                if (!found)
-                {
-                    continue;
-                }
-
-                filtered.push_back(klass);
-
-                // 什么时候只列命中的方法？
-                //
-                // 仅当这个类**是靠方法名捞出来的**（类名本身没命中）。
-                // 那种情况下「按方法搜索」的语义成立：展开它只该看到相关方法。
-                //
-                // 而如果类名本身就命中了，整个类都是相关的 —— 哪怕恰好有
-                // 几个方法名也含这个关键字，也应该展示**全部**方法。
-                // 旧实现没区分这两种情况，于是「同时勾选类名+方法名」时，
-                // 用户明明是奔着这个类去的，展开却只看到零星几个方法。
-                const bool narrowToMatches = !matchedMethods.empty() && !classNameMatched;
-                if (narrowToMatches)
-                {
-                    for (auto m : matchedMethods)
+                    if (searchField && !found)
                     {
-                        methodMap[klass].push_back({m, m->getParamsInfo()});
+                        for (auto f : klass->getFields())
+                        {
+                            if (finder(f->getName()))
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
                     }
-                }
-                else
-                {
-                    for (auto m : klass->getMethods())
+                    if (!found)
                     {
-                        methodMap[klass].push_back({m, m->getParamsInfo()});
+                        continue;
                     }
-                }
-            } // ← 关闭遍历类的 for
-            }   // ← 关闭 `else`（attach 成功分支）
+
+                    filtered.push_back(klass);
+
+                    // 什么时候只列命中的方法？
+                    //
+                    // 仅当这个类**是靠方法名捞出来的**（类名本身没命中）。
+                    // 那种情况下「按方法搜索」的语义成立：展开它只该看到相关方法。
+                    //
+                    // 而如果类名本身就命中了，整个类都是相关的 —— 哪怕恰好有
+                    // 几个方法名也含这个关键字，也应该展示**全部**方法。
+                    // 旧实现没区分这两种情况，于是「同时勾选类名+方法名」时，
+                    // 用户明明是奔着这个类去的，展开却只看到零星几个方法。
+                    const bool narrowToMatches = !matchedMethods.empty() && !classNameMatched;
+                    if (narrowToMatches)
+                    {
+                        for (auto m : matchedMethods)
+                        {
+                            methodMap[klass].push_back({m, m->getParamsInfo()});
+                        }
+                    }
+                    else
+                    {
+                        for (auto m : klass->getMethods())
+                        {
+                            methodMap[klass].push_back({m, m->getParamsInfo()});
+                        }
+                    }
+                } // ← 关闭遍历类的 for
+                }   // ← 关闭 `else`（attach 成功分支）
         }       // ← 关闭 try
         catch (const std::exception &e)
         {
