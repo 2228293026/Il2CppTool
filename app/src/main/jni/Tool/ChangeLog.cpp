@@ -246,7 +246,11 @@ size_t UndoAll(size_t *skipped, size_t *failed)
             const Entry &e = entries()[i];
             if (!CanUndoLocked(e))
             {
-                // 句柄没了（对象被回收）或已经恢复过 —— 这一条恢复不了。
+                // 两条不同的原因都在这里，而它们**都不该被当成错误**：
+                //   1. 已经逐条恢复过 —— UndoById 把 handle 和 oldValue 都清了
+                //   2. 当初就没记原值（比如只有记录、没有可回退的原字节）
+                // 真正「对象被回收了」不在这里：那种情况 handle 仍然非 0，
+                // 会进 ids 并在 UndoById 里失败，落到 **failed** 桶里。
                 if (skipped) (*skipped)++;
                 continue;
             }
@@ -445,24 +449,42 @@ void DrawUI()
         cached.clear();
         cachedCount = 0;
 
-        char msg[224]{0};
+        // 三种说法必须分开，而且**颜色要跟着语义走**（第 103 轮改）。
+        //
+        // 我第一版把「本来就不可恢复」说成「对象已失效跳过」，把
+        // 「恢复失败」和它并列 —— 方向正好反了：
+        //   · 已经逐条恢复过的条目（很常见）被说成「对象已失效」，
+        //     用户会以为游戏在丢对象；
+        //   · 真正的恢复失败（对象真的没了）反而和良性情况混在一起，
+        //     一句「已恢复 N 条」就过去了。
+        //
+        // 唯独 failed > 0 时必须**用警告色**，并直说
+        // 「游戏现在不是原样」—— 用户会据此决定要不要重开游戏。
+        char msg[256]{0};
         if (done == 0 && skipped == 0 && failed == 0)
         {
             snprintf(msg, sizeof(msg), "没有可恢复的记录");
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "%s", msg);
         }
-        else if (failed == 0 && skipped == 0)
+        else if (failed > 0)
         {
-            snprintf(msg, sizeof(msg), "已恢复 %zu 条", done);
+            snprintf(msg, sizeof(msg),
+                     "已恢复 %zu 条；%zu 条恢复失败 —— 游戏现在【不是】原样。另有 %zu 条本来就不可恢复",
+                     done, failed, skipped);
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", msg);
+        }
+        else if (skipped > 0)
+        {
+            snprintf(msg, sizeof(msg),
+                     "已恢复 %zu 条（另有 %zu 条本来就不可恢复：已经恢复过或没记原值）",
+                     done, skipped);
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.f, 1.f), "%s", msg);
         }
         else
         {
-            // 关键：**必须**说出有多少条没恢复，以及为什么。
-            // 少恢复几条在界面上和「全恢复了」长得一模一样。
-            snprintf(msg, sizeof(msg),
-                     "已恢复 %zu 条；%zu 条对象已失效跳过，%zu 条恢复失败",
-                     done, skipped, failed);
+            snprintf(msg, sizeof(msg), "已恢复 %zu 条", done);
+            ImGui::TextColored(ImVec4(0.55f, 0.95f, 0.6f, 1.f), "%s", msg);
         }
-        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.f, 1.f), "%s", msg);
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("清空"))

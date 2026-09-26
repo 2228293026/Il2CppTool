@@ -404,9 +404,13 @@ struct Il2CppString : Il2CppObject
     //    int32_t len;
     //    char chars[32];
 
+    // 唯一的取值接口。
+    //
+    // 旧声明里还有一个 `const char *to_char();` —— **从未实现**，也没有任何
+    // 调用点，而它的签名看起来正好是「把托管字符串转成 C 字符串」。
+    // 下一个人很可能顺手调它，然后拿到指向 **UTF-16** 缓冲区的指针，
+    // 中文全变乱码。第 102 轮扫出来，第 103 轮删掉（第 103 轮）。
     std::string to_string();
-
-    const char *to_char();
 };
 
 template <typename T>
