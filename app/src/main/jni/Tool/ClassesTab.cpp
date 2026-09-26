@@ -3637,9 +3637,18 @@ static void FreeUndoHandle(uint32_t handle)
 //
 // ownerObj 是**持有该字段的那个对象**（可能是嵌套对象或装箱的
 // 值类型），不是整棵树的根 —— 字段路径就是相对它而言的。
+// fieldPath 必须是**从 rootObj 到该字段的完整路径**（= paths + {key}）。
+//
+// 这样撤销时 WriteWatchValue(rootObj, fieldPath, old) 会从根一路走到字段，
+// 并且结尾的 ensureIfValueType(object, fieldPath, rootObj) 能对
+// **嵌在 struct 里的字段**把改动写回父对象的字段槽位。
+//
+// 第 76 轮曾经只存单元素 {key} 并钉住 currentObj —— 那样能读对值，
+// 但 root 就是 currentObj，ensureIfValueType 直接返回，于是 struct
+// 里的字段撤销**写进了装箱副本**，和第 67 轮的冻结是同一个坑。
 static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
                               const std::string &type, const std::string &value,
-                              Il2CppObject *ownerObj, const std::vector<std::string> &paths,
+                              const std::vector<std::string> &fieldPath,
                               const std::string &oldValue)
 {
     if (!rootObj || !rootObj->klass || !rootObj->klass->getName())
@@ -3648,13 +3657,16 @@ static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
     }
     const std::string target = std::string(rootObj->klass->getName()) + "." + field;
 
-    // 能撤销的充要条件：读到了旧值、知道字段在哪个对象上、路径非空。
-    if (ownerObj != nullptr && !paths.empty() && !oldValue.empty())
+    // 能撤销的充要条件：读到了旧值、路径非空。
+    if (!fieldPath.empty() && !oldValue.empty())
     {
         // 记录表**接管**这个句柄：条目被淘汰 / 恢复过 / 清空时它自己会还回来。
         // 不接管的话对象会被一直钉着不回收；不接管也没法撤销。
-        uint32_t handle = Il2cpp::GC::NewHandle(ownerObj);
-        ChangeLog::RecordUndoable(ChangeLog::Kind::Field, target, oldValue, value, handle, paths);
+        //
+        // 钉的是**根对象**：从根出发才能重建完整路径，而路径上的中间
+        // 对象本来就是被根持有的，不需要单独钉。
+        uint32_t handle = Il2cpp::GC::NewHandle(rootObj);
+        ChangeLog::RecordUndoable(ChangeLog::Kind::Field, target, oldValue, value, handle, fieldPath);
         return;
     }
     const std::string detail = type.empty() ? value : (type + " = " + value);
@@ -4065,7 +4077,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             {
                 savedSet[currentObj->klass].insert(currentObj);
                 SaveObjectWithRoot(currentObj);
-                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", nullptr, {}, "");
+                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", {}, "");
             }
             if (ImGui::IsItemHovered())
             {
@@ -4218,7 +4230,12 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                         // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug：
                         // 撤销因此在任何深度都无效）。必须在 lambda **外面**声明 ——
                         // lambda 只捕获它，不捕获 key。
-                        const std::vector<std::string> fieldPath{std::string(key)};
+                        // 字段的**完整**路径 = paths + {key}。
+                        // 钉住**根对象**、从根走完整条路，WriteWatchValue 结尾的
+                        // ensureIfValueType 才能对 struct 字段写回父对象的槽位 ——
+                        // 只存 {key} 的话 root 就是 currentObj，它会直接返回。
+                        std::vector<std::string> fieldPath = paths;
+                        fieldPath.push_back(std::string(key));
                         Keyboard::Open(
                             text.c_str(),
                             [type = std::move(type), val = std::move(val), currentObj, paths, fieldPath,
@@ -4234,9 +4251,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                 auto newStr = Il2cpp::NewString(value.c_str());
                                 // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
                                 // 旧值必须在 SetFieldValue **之前**读。
-                                const std::string prevValue = ReadScalarText(currentObj, fieldPath);
+                                const std::string prevValue = ReadScalarText(rootObj, fieldPath);
                                 Il2cpp::SetFieldValue(currentObj, f, &newStr);
-                                RecordFieldChange(rootObj, val, "字符串", value, currentObj, fieldPath, prevValue);
+                                RecordFieldChange(rootObj, val, "字符串", value, fieldPath, prevValue);
                                 RequestRefresh(rootObj);
                             });
                     }
@@ -4256,7 +4273,12 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                 // 直接父对象，key 是它的直接子字段。传整条 paths 会从
                                 // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug）。
                                 // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
-                                const std::vector<std::string> fieldPath{std::string(key)};
+                                // 字段的**完整**路径 = paths + {key}。
+                                // 钉住**根对象**、从根走完整条路，WriteWatchValue 结尾的
+                                // ensureIfValueType 才能对 struct 字段写回父对象的槽位 ——
+                                // 只存 {key} 的话 root 就是 currentObj，它会直接返回。
+                                std::vector<std::string> fieldPath = paths;
+                                fieldPath.push_back(std::string(key));
                                 poper.Open(
                                     "EnumSelector",
                                     [fieldType, currentObj, field, paths, fieldPath, rootObj](const std::string &result)
@@ -4282,7 +4304,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                         // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
                                         // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
                                         // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
-                                        const std::string prevValue = ReadScalarText(currentObj, fieldPath);
+                                        const std::string prevValue = ReadScalarText(rootObj, fieldPath);
 
                                         if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
                                                          strcmp(baseName, "System.UInt64") == 0))
@@ -4297,7 +4319,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                         }
                                         RecordFieldChange(rootObj,
                                                           field && field->getName() ? field->getName() : "?",
-                                                          "枚举", result, currentObj, fieldPath, prevValue);
+                                                          "枚举", result, fieldPath, prevValue);
                                         RequestRefresh(rootObj);
                                     },
                                     fieldType);
@@ -4325,18 +4347,23 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     // 直接父对象，key 是它的直接子字段。传整条 paths 会从
                     // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug）。
                     // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
-                    const std::vector<std::string> fieldPath{std::string(key)};
+                    // 字段的**完整**路径 = paths + {key}。
+                    // 钉住**根对象**、从根走完整条路，WriteWatchValue 结尾的
+                    // ensureIfValueType 才能对 struct 字段写回父对象的槽位 ——
+                    // 只存 {key} 的话 root 就是 currentObj，它会直接返回。
+                    std::vector<std::string> fieldPath = paths;
+                    fieldPath.push_back(std::string(key));
                     poper.Open("BooleanSelector",
                                [currentObj, val, paths, fieldPath, rootObj](const std::string &value)
                                {
                                    bool b = value == "True";
                                    // split key by space
                                    // 旧值必须在 setField **之前**读。
-                                   const std::string prevValue = ReadScalarText(currentObj, fieldPath);
+                                   const std::string prevValue = ReadScalarText(rootObj, fieldPath);
                                    currentObj->setField(val.c_str(), (int)b);
                                    ensureIfValueType(currentObj, paths, rootObj);
                                    RequestRefresh(rootObj);
-                                   RecordFieldChange(rootObj, val, "布尔", value, currentObj, fieldPath,
+                                   RecordFieldChange(rootObj, val, "布尔", value, fieldPath,
                                                                      prevValue);
                                 });
                 }
@@ -4363,7 +4390,12 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     // 父对象，key 是它的直接子字段。传整条 paths 会从 currentObj
                     // 再走一遍树，读到的不是这个字段（第 74 轮的 bug：撤销在任何
                     // 深度都无效）。而 ensureIfValueType 仍要**整条 paths**。
-                    const std::vector<std::string> fieldPath{std::string(key)};
+                    // 字段的**完整**路径 = paths + {key}。
+                    // 钉住**根对象**、从根走完整条路，WriteWatchValue 结尾的
+                    // ensureIfValueType 才能对 struct 字段写回父对象的槽位 ——
+                    // 只存 {key} 的话 root 就是 currentObj，它会直接返回。
+                    std::vector<std::string> fieldPath = paths;
+                    fieldPath.push_back(std::string(key));
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
                                    [type, currentObj, val, paths, fieldPath, rootObj](const std::string &text)
                                    {
@@ -4379,10 +4411,10 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
                                        // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
                                        // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
-                                       const std::string prevValue = ReadScalarText(currentObj, fieldPath);
+                                       const std::string prevValue = ReadScalarText(rootObj, fieldPath);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text, currentObj, fieldPath,
+                                           RecordFieldChange(rootObj, val, type, text, fieldPath,
                                                              prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
@@ -4414,7 +4446,12 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     // 父对象，key 是它的直接子字段。传整条 paths 会从 currentObj
                     // 再走一遍树，读到的不是这个字段（第 74 轮的 bug：撤销在任何
                     // 深度都无效）。而 ensureIfValueType 仍要**整条 paths**。
-                    const std::vector<std::string> fieldPath{std::string(key)};
+                    // 字段的**完整**路径 = paths + {key}。
+                    // 钉住**根对象**、从根走完整条路，WriteWatchValue 结尾的
+                    // ensureIfValueType 才能对 struct 字段写回父对象的槽位 ——
+                    // 只存 {key} 的话 root 就是 currentObj，它会直接返回。
+                    std::vector<std::string> fieldPath = paths;
+                    fieldPath.push_back(std::string(key));
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
                                    [type, currentObj, val, paths, fieldPath, rootObj](const std::string &text)
                                    {
@@ -4430,10 +4467,10 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
                                        // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
                                        // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
-                                       const std::string prevValue = ReadScalarText(currentObj, fieldPath);
+                                       const std::string prevValue = ReadScalarText(rootObj, fieldPath);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text, currentObj, fieldPath,
+                                           RecordFieldChange(rootObj, val, type, text, fieldPath,
                                                              prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);

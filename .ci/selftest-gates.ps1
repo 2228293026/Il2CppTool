@@ -79,7 +79,7 @@ $uiGate = {
 # ---- 1. 规则 A2：相邻重复行 ----
 Test-Rule 'A2 相邻重复行' {
     param($t)
-$needle = '                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", nullptr, {}, "");'
+$needle = '                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", {}, "");'
     if (-not $t.Contains($needle)) { return $false }
     [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
         $t.Replace($needle, $needle + "`r`n" + $needle), (New-Object Text.UTF8Encoding($false)))
