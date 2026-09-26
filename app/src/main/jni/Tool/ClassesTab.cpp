@@ -3826,8 +3826,7 @@ namespace
         // 无论成功还是失败，这里都是「这一轮有结论了」的出口。
         // 失败时**照样**发布结果（空的 + 带失败原因），这样 UI 不会永远
         // 卡在「筛选中…」，而是明确显示失败。
-        std::lock_guard guard(st->mutex);
-        st->classes = std::move(allClasses);
+        std::lock_guard guard(st->mutex);        st->classes = std::move(allClasses);
         st->filteredClasses = std::move(filtered);
         st->methodMap = std::move(methodMap);
         st->resultGen = st->requestGen;
@@ -3937,8 +3936,40 @@ void ClassesTab::FilterClasses(const std::string &filterArg)
     {
         std::lock_guard guard(g_queueMutex);
         g_queue.push_back(filterState);
+        const bool workerUp = g_workerRunning;
+        if (!workerUp)
+        {
+            // 请求入队后立刻清掉 —— 下面要改成同步做，队列里留着它
+            // 会让下一次 EnsureStarted 起来后重复处理一遍。
+            g_queue.clear();
+        }
+        g_queueCv.notify_one();
+
+        if (!workerUp)
+        {
+            // **工作线程没起来 → 在当前（渲染）线程上同步做。**
+            //
+            // 旧代码这里只入队就走。如果 EnsureStarted 失败（线程资源耗尽），
+            // 就**没有任何人会去取这个队列**：
+            //   hasResult 永远是 false、resultGen 永远对不上 requestGen
+            //   → IsFilterPending() 恒为 true
+            //   → 标签页**永久**显示「筛选中…」，列表永远是空的。
+            //
+            // 也就是第 31 轮修的那个「失败无出口」的 bug，从「线程没起来」
+            // 这扇门又回来了。
+            //
+            // 同步跑会阻塞渲染线程（这就是日志里「可能略有卡顿」的由来），
+            // 但功能可用**远好过**永久卡住 —— 而且 DoFilterWork 里
+            // EnsureAttached 对已在 VM 上的渲染线程是幂等的。
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                LOGW("筛选工作线程未运行，搜索改为**在渲染线程同步执行**（可能卡顿）");
+            }
+            DoFilterWork(filterState);
+        }
     }
-    g_queueCv.notify_one();
 }
 
 bool ClassesTab::IsFilterPending()
