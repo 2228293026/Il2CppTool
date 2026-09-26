@@ -112,8 +112,10 @@ jobs:
           "NDK_PATH=$ndk" >> $env:GITHUB_ENV
 
       - name: Check UI patterns (invisible-defect guards)
-    run: .\.ci\check-ui-patterns.ps1
-  - name: Run clang-tidy on project sources
+        shell: pwsh
+        run: .\.ci\check-ui-patterns.ps1
+
+      - name: Run clang-tidy on project sources
         shell: pwsh
         run: .\.ci\run-clang-tidy.ps1
 

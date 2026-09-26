@@ -93,8 +93,41 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
+#
+# 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
+# 结果 **CI 在 0 秒就失败** —— workflow 本身语法不合法，一个步骤都没跑。
+# 而当时的门禁只检查「文件里有没有出现 check-ui-patterns 这个字符串」，
+# 字符串是在的，所以门禁放行了。
+#
+# 0 秒失败是「workflow 语法错误」的指纹，不是某个步骤失败。
+#
+# 规则刻意做得**很粗**：jobs.steps 的键（run/shell/with/id）必须缩进 >= 6
+# （jobs=0, steps=2, 键=4... 实际文件里是 8）。不检查更细的关系 ——
+# 试过逐步骤比对缩进，`static-analysis:` 这种 job 级的键会误报，
+# 而**误报的检查会被调低或干脆删掉**，那才是真正的损失。
+$workflow = Join-Path $root '.github/workflows/ci.yml'
+if (Test-Path $workflow) {
+    $wl = Get-Content $workflow
+    for ($i = 0; $i -lt $wl.Count; $i++) {
+        $cur = $wl[$i]
+        $trim = $cur.Trim()
+        if ($trim -eq '' -or $trim.StartsWith('#')) { continue }
+        if ($trim -notmatch '^(run|shell|with|id|env|if|continue-on-error):') { continue }
+        $ind = $cur.Length - $cur.TrimStart().Length
+        if ($ind -lt 6) {
+            $hits += [pscustomobject]@{
+                File = 'ci.yml'
+                Line = $i + 1
+                Rule = "C: 步骤键缩进 $ind < 6（workflow 语法会直接报错，CI 0 秒失败）"
+                Text = $cur.Trim()
+            }
+        }
+    }
+}
+
 if ($hits.Count -eq 0) {
-    if (-not $Quiet) { Write-Host "界面模式检查通过（SameLine 宽度 / 每帧深拷贝）" -ForegroundColor Green }
+    if (-not $Quiet) { Write-Host "界面模式检查通过（SameLine 宽度 / 每帧深拷贝 / workflow 缩进）" -ForegroundColor Green }
     exit 0
 }
 
