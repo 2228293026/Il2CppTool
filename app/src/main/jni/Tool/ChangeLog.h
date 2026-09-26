@@ -43,6 +43,7 @@ struct Entry
     // 「退回去」比「看」常用得多：冻了个值玩够了、补丁打错了、
     // 想让游戏恢复正常 —— 每一次都需要撤销，而不是「记得当时
     // 改成了多少」再手填回去。
+    uint64_t id = 0;                     // 单调递增，**条目的唯一身份**
     std::string oldValue;               // 改动**之前**的值（文本形式）
     std::vector<std::string> paths;     // 从被钉住的对象到这个叶子字段的路径
     uint32_t handle = 0;                // 持有该字段的对象的 GC 句柄（0 = 不可恢复）
@@ -82,7 +83,11 @@ bool CanUndo(const Entry &entry);
 // 真正执行恢复。
 bool Undo(const Entry &entry);
 // 恢复成功后调用：这一条的可恢复状态作废（再点一次会跳过）。
-void MarkUndone(const Entry &entry);
+// 按 **id** 撤销。不能用「target+detail 找同一条」—— 见 .cpp 里的说明：
+// 同一个字段来回改几次就会出现两条一模一样的记录，而按内容找
+// 只会命中**最新**那条，于是把**别人的**句柄还了回去，
+// 下一帧那条再点「恢复」就是**用已释放的句柄**。
+bool UndoById(uint64_t id);
 
 // 快照。返回的副本之后随便改，不影响内部状态。
 std::vector<Entry> Snapshot();

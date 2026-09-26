@@ -102,6 +102,9 @@ std::string ExportText(const std::vector<Entry> &list)
 } // namespace
 
 namespace {
+// 条目 id 计数器。id 是条目的**唯一身份** ——
+// 按内容（target+detail）定位条目是不安全的，见 UndoById 的说明。
+uint64_t g_nextId = 1;
 Restorer g_restorer = nullptr;
 // 句柄释放器。由外部注入（和撤销器一样，ChangeLog 不认识 il2cpp）。
 HandleReleaser g_handleReleaser = nullptr;
@@ -109,14 +112,14 @@ HandleReleaser g_handleReleaser = nullptr;
 // 找到这条记录并就地修改。用 target+detail 定位：同一条记录
 // （同样的字段、同样的值）**只会有一条**，因为每次改动都会记一条，
 // 而「改回同样的值」也会单独记一条。所以按内容定位是够的。
-Entry *FindEntry(const std::string &target, const std::string &detail)
+Entry *FindById(uint64_t id)
 {
     auto &v = entries();
-    for (auto it = v.rbegin(); it != v.rend(); ++it)
+    for (auto &e : v)
     {
-        if (it->target == target && it->detail == detail)
+        if (e.id == id)
         {
-            return &(*it);
+            return &e;
         }
     }
     return nullptr;
@@ -182,8 +185,9 @@ void RecordUndoable(Kind kind, const std::string &target, const std::string &old
         std::string detail = newValue.empty() ? oldValue : (oldValue + " -> " + newValue);
         std::lock_guard guard(mutex());
         auto &v = entries();
-        v.push_back({kind, Truncate(target, kMaxTarget), Truncate(detail, kMaxDetail),
-                     Truncate(oldValue, kMaxDetail), paths, handle});
+        v.push_back({.kind = kind, .target = Truncate(target, kMaxTarget),
+                     .detail = Truncate(detail, kMaxDetail), .id = g_nextId++,
+                     .oldValue = Truncate(oldValue, kMaxDetail), .paths = paths, .handle = handle});
         if (v.size() > kMaxEntries)
         {
             // 淘汰最老的，**连同它们持有的 GC 句柄**。
@@ -200,60 +204,72 @@ void RecordUndoable(Kind kind, const std::string &target, const std::string &old
     }
 }
 
+// 界面用这个（不加锁：只读 Entry 的副本，够用）。
 bool CanUndo(const Entry &entry)
 {
     return entry.handle != 0 && !entry.oldValue.empty() && g_restorer != nullptr;
 }
 
-bool Undo(const Entry &entry)
+// UndoById 在**已经持锁**时用它 —— 锁不可重入，CanUndo 不能在里面再加一次。
+static bool CanUndoLocked(const Entry &entry)
 {
-    if (!CanUndo(entry))
-    {
-        return false;
-    }
-    Restorer fn = g_restorer;
-    if (fn == nullptr)
-    {
-        return false;
-    }
-    try
-    {
-        return fn(entry);
-    }
-    catch (...)
-    {
-        return false;
-    }
+    return entry.handle != 0 && !entry.oldValue.empty() && g_restorer != nullptr;
 }
 
-void MarkUndone(const Entry &entry)
+
+// 按 id 撤销。**全程只用锁内的活数据**，不用界面传来的快照 ——
+// 快照最多滞后 1 秒（DrawUI 的缓存），而句柄在这期间可能已经被释放。
+//
+// 为什么不能按 target+detail 找：同一个字段来回改几次就会出现两条
+// 一模一样的记录（「100 -> 999」出现两次），按内容找只会命中**最新**
+// 那条。于是用户点**旧**那条的「恢复」，被作废（并释放句柄）的是**新**
+// 那条 —— 下一帧新那条的按钮还在，再点就是**用已释放的句柄**，
+// 直接崩在用户的游戏里。
+bool UndoById(uint64_t id)
 {
     try
     {
         std::lock_guard guard(mutex());
-        Entry *e = FindEntry(entry.target, entry.detail);
-        if (e == nullptr)
+        Entry *e = FindById(id);
+        if (e == nullptr || !CanUndoLocked(*e))
         {
-            return;
+            return false;
+        }
+        // 先复制出来再放开调用：恢复器会去碰 il2cpp，不能在锁里做。
+        const uint32_t handle = e->handle;
+        const std::vector<std::string> paths = e->paths;
+        const std::string oldValue = e->oldValue;
+        const std::string target = e->target;
+        Restorer fn = g_restorer;
+        if (fn == nullptr)
+        {
+            return false;
+        }
+        Entry snapshot;
+        snapshot.handle = handle;
+        snapshot.paths = paths;
+        snapshot.oldValue = oldValue;
+        snapshot.target = target;
+        if (!fn(snapshot))
+        {
+            return false;
         }
         // 只作废「可恢复」，条目本身留着 —— 它仍然是一条记录。
         //
         // **句柄必须归还**，不能只置零。置零 = 那个对象永远不会被回收，
-        // 而用户每点一次「恢复」就漏一个 —— 这是第 73 轮引入的泄漏，
-        // 第 74 轮审出来。
-        if (e->handle != 0)
+        // 而用户每点一次「恢复」就漏一个 —— 这是第 73 轮引入的泄漏。
+        if (e->handle != 0 && g_handleReleaser != nullptr)
         {
-            if (g_handleReleaser != nullptr)
-            {
-                g_handleReleaser(e->handle);
-            }
-            e->handle = 0;
+            g_handleReleaser(e->handle);
         }
+        e->handle = 0;
         e->oldValue.clear();
         e->paths.clear();
+        return true;
     }
     catch (...)
     {
+        return false;
     }
 }
 
@@ -267,7 +283,8 @@ void Record(Kind kind, const std::string &target, const std::string &detail)
     {
         std::lock_guard guard(mutex());
         auto &v = entries();
-        v.push_back({kind, Truncate(target, kMaxTarget), Truncate(detail, kMaxDetail)});
+        v.push_back({.kind = kind, .target = Truncate(target, kMaxTarget),
+                     .detail = Truncate(detail, kMaxDetail), .id = g_nextId++});
         if (v.size() > kMaxEntries)
         {
             v.erase(v.begin(), v.begin() + (v.size() - kMaxEntries));
@@ -413,9 +430,8 @@ void DrawUI()
             {
                 if (ImGui::SmallButton("恢复"))
                 {
-                    if (Undo(*it))
+                    if (UndoById(it->id))
                     {
-                        MarkUndone(*it);
                         // 立刻重取快照，否则界面上这一条还会显示最多 1 秒，
                         // 用户会以为「点了没反应」。
                         lastRefresh = 0.0;
