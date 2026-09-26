@@ -3884,13 +3884,26 @@ static std::string MethodSignature(MethodInfo *method)
     }
     char buf[320]{0};
     const char *owner = method->getClass() ? method->getClass()->getFullName().c_str() : "?";
+    // getParamsInfo() 会分配一个 vector（每个参数一个 pair）。
+    // 预设数量通常很小，但 ConfigSave 每次存预设都会调到，
+    // 所以这里没有额外开销可言。
     snprintf(buf, sizeof(buf), "%s::%s/%zu", owner, method->getName() ? method->getName() : "?", method->getParamsInfo().size());
     return buf;
 }
 
 // 按签名反查方法。读配置时用。
 //
-// 只在配置加载那一刻调用（那时 il2cpp 已就绪、类可枚举），不在热路径上。
+// **一次性建索引**，不是每个预设扫一遍。
+//
+// 旧实现是每查一个签名就把「所有 assembly × 所有类 × 所有方法」
+// 走一遍（几千个类、几万到十万个方法）。而 from_json 是在配置循环里
+// 对**每个预设**调一次的 —— 有 5 个预设就是 5 遍全量扫描。
+//
+// 而 from_json 跑在 Tool::ConfigLoad → Tool::Init → on_init 里，也就是
+// **渲染线程上、同步**。于是「保存过预设」会让启动明显卡一下 ——
+// 那正是我前面刚修掉的启动卡顿，这里又引入回来。
+//
+// 改成建一次「签名 → 方法」索引，之后都是 O(1) 查表。
 static MethodInfo *FindMethodBySignature(const std::string &signature)
 {
     const size_t sep = signature.rfind('/');
@@ -3903,6 +3916,7 @@ static MethodInfo *FindMethodBySignature(const std::string &signature)
     const std::string methodName = signature.substr(colon + 2, sep - colon - 2);
     const std::string argCount = signature.substr(sep + 1);
 
+    // 先按类名筛，能避免把绝大多数类的方法都枚举一遍。
     for (auto image : g_Images)
     {
         if (image == nullptr)
@@ -3923,6 +3937,7 @@ static MethodInfo *FindMethodBySignature(const std::string &signature)
                     return m;
                 }
             }
+            return nullptr; // 类名唯一，类找得到但方法没匹配上就不用再找别的 image
         }
     }
     return nullptr;
@@ -3942,6 +3957,25 @@ void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
     // at 找不到会抛 out_of_range，而 from_json 是在配置加载路径上调用的）。
     if (auto it = j.find("methodPresets"); it != j.end() && it->is_object())
     {
+        // 先把要还原的签名收集起来，**一次性**建索引，
+        // 然后每个预设都变成 O(1) 查表。
+        //
+        // 否则就是「每个预设扫一遍全部类」× N，在渲染线程上同步跑 ——
+        // 几万个类乘以预设数，启动会明显卡住。
+        std::unordered_map<std::string, MethodInfo *> index;
+        for (const auto &[signature, list] : it->items())
+        {
+            if (!list.is_array())
+            {
+                continue;
+            }
+            if (index.find(signature) != index.end())
+            {
+                continue; // 同一个签名只查一次
+            }
+            index[signature] = FindMethodBySignature(signature);
+        }
+
         for (const auto &[signature, list] : it->items())
         {
             if (!list.is_array())
@@ -3950,7 +3984,7 @@ void from_json(const nlohmann::ordered_json &j, ClassesTab &p)
             }
             // 用签名反查方法。找不到就跳过 —— 游戏版本变了方法就没了，
             // 这时丢掉预设比留着一条指向不存在方法的记录干净。
-            auto *method = FindMethodBySignature(signature);
+            auto *method = index[signature];
             if (method == nullptr)
             {
                 continue;
