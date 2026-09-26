@@ -70,6 +70,11 @@ if (-not $SkipClangTidy) {
     }
 }
 
+Invoke-Check '跨界面内容的宿主（挂错宿主 = 功能消失）' {
+    powershell -ExecutionPolicy Bypass -File .\.ci\check-hosts.ps1
+    if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
+}
+
 Invoke-Check '源码编码（无 U+FFFD / 无控制字符）' {
     $bad = 0
     Get-ChildItem app/src/main/jni -Recurse -Include *.cpp, *.h -File | ForEach-Object {
