@@ -2892,7 +2892,37 @@ void ClassesTab::Draw(int index, bool closeable)
         if (!filteredClasses.empty())
         {
             ImGui::BeginChild("Child", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
-            for (int i = 0; i < filteredClasses.size(); i++)
+            // **只渲染前 N 个**，其余用「显示更多」逐步展开。
+            //
+            // 旧代码把**每一个**匹配到的类都画成一个 CollapsingHeader，
+            // 每帧一次。代价是每个类都要：
+            //   - klass->getFullName() —— 返回 std::string（**按值**），
+            //     也就是一次堆分配 + 释放；全限定名普遍超过 SSO 的 15 字符
+            //   - ImGui 的 ID 哈希 + 树节点入栈
+            // 过滤器留空时是「显示全部」，一个正常规模的 Unity 游戏
+            // 几万个类 —— 每帧几万次堆分配，界面会直接卡住。
+            //
+            // 逐个渲染上万个 ImGui 控件本来也没有意义：列表太长时
+            // 可见区就那么几行，其余的都在屏幕外。
+            static int renderLimit = 200;
+            const int total = static_cast<int>(filteredClasses.size());
+            // 换了搜索词就收回上限 —— 否则上一次「显示更多」到 2000 的状态
+            // 会一直跟着，换个词还是渲染两千个。
+            // （只按 total 判断是不够的：新查询结果数相近时不会触发。）
+            static std::string lastFilterKey;
+            const std::string filterKey = filter + "|" +
+                                          (selectedImage ? selectedImage->getName() : "") + "|" +
+                                          std::to_string(filterByClass) +
+                                          std::to_string(filterByMethod) +
+                                          std::to_string(filterByField) +
+                                          std::to_string(showAllClasses);
+            if (filterKey != lastFilterKey)
+            {
+                lastFilterKey = filterKey;
+                renderLimit = 200;
+            }
+            const int shown = std::min(renderLimit, total);
+            for (int i = 0; i < shown; i++)
             {
                 auto klass = filteredClasses[i];
                 if (klass == nullptr)
@@ -2936,6 +2966,20 @@ void ClassesTab::Draw(int index, bool closeable)
                 {
                     ImGui::PopStyleColor(pushedColor);
                     pushedColor = 0;
+                }
+            }
+            if (shown < total)
+            {
+                ImGui::Separator();
+                ImGui::TextDisabled("已显示 %d / %d 个类（渲染上万个控件会明显卡顿）", shown, total);
+                if (ImGui::Button("显示更多"))
+                {
+                    renderLimit += 500;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("全部展开（可能卡）"))
+                {
+                    renderLimit = total;
                 }
             }
             ImGui::ScrollWhenDraggingOnVoid();
