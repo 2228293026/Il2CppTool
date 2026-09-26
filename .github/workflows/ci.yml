@@ -111,11 +111,6 @@ jobs:
           if (-not $ndk) { throw "没有找到可用的 Android NDK" }
           "NDK_PATH=$ndk" >> $env:GITHUB_ENV
 
-      - name: Check UI patterns (invisible-defect guards)
+      - name: Pre-commit checks (single entry point)
         shell: pwsh
-        run: .\.ci\check-ui-patterns.ps1
-
-      - name: Run clang-tidy on project sources
-        shell: pwsh
-        run: .\.ci\run-clang-tidy.ps1
-
+        run: .\.ci\check-all.ps1

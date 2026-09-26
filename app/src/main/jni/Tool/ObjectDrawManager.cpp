@@ -1533,7 +1533,6 @@ void ObjectDrawManager::DrawUI() {
             // 否则 SameLine 会把颜色/移除按钮顶到屏幕外，等于按钮点不到。
             if (ImGui::BeginTable("##drawrow", 3, ImGuiTableFlags_SizingStretchProp))
             {
-                const float avail = ImGui::GetContentRegionAvail().x;
                 ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("color", ImGuiTableColumnFlags_WidthFixed, 24.0f);
                 ImGui::TableSetupColumn("act", ImGuiTableColumnFlags_WidthFixed, 64.0f);
@@ -1557,7 +1556,10 @@ void ObjectDrawManager::DrawUI() {
                 ImGui::EndTable();
             }
 
-            ImGui::SameLine();
+            // 这里**不能**接 SameLine：EndTable 之后光标已经在新的一行，
+            // 而「上一个控件」是表格内部的项。SameLine 会按表格的裁剪矩形
+            // 定位，把三个勾选框塞进表格右边那条窄缝里。
+            // 直接另起一行，简单且可预期。
             bool drawLine = drawSnapshot[i].drawLine;
             bool drawBox = drawSnapshot[i].drawBox;
             bool drawCircle = drawSnapshot[i].drawCircle;

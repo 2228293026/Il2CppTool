@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
   静态检查：clang-tidy (bugprone-*, cert-*)
@@ -64,7 +64,25 @@ $entries | ConvertTo-Json -Depth 4 | Set-Content -Path $dbFile -Encoding UTF8
 Write-Host "clang-tidy: $($targets.Count) 个文件"
 
 $checks = '-*,bugprone-*,cert-*,-bugprone-easily-swappable-parameters'
-$output = & $tidy -p $dbDir -quiet "--checks=$checks" @($targets -replace '\\','/') 2>&1 | Out-String
+
+# 本文件顶部是 $ErrorActionPreference = 'Stop'。而 clang-tidy 会把逐文件进度
+# （"[1/10] Processing file ..."）写到 **stderr** —— PowerShell 把原生命令的
+# stderr 转成错误记录（NativeCommandError），在 'Stop' 下**直接终止脚本**。
+# 于是「正常跑完」和「脚本崩了」变成同一件事，退出码 1，而真正的告警列表
+# 根本没机会被解析。
+#
+# 表现：本机跑失败、CI 上却一直是绿的（那边 -quiet 的输出时机不同）。
+# 最坏的一种不一致 —— 本地红、CI 绿，两边都不知道该信谁。
+#
+# 做法：调用期间临时放宽偏好，之后恢复；成败只看**退出码**。
+$prevPref = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $output = & $tidy -p $dbDir -quiet "--checks=$checks" @($targets -replace '\\','/') 2>&1 | Out-String
+}
+finally {
+    $ErrorActionPreference = $prevPref
+}
 
 # 只保留指向我们自己源文件的告警（第三方头文件里的不进来）
 $projectPattern = '(Includes|Menu|Tool|Il2cpp)[/\\][A-Za-z0-9_.-]*\.(cpp|h):\d+:\d+: warning:'
