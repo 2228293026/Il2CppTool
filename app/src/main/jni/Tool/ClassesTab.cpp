@@ -288,6 +288,34 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                                      std::function<void(Il2CppObject *)> onSelect, bool canNew)
 {
     ImGui::PushID(id);
+    // liveObjects() 的结果**按低频缓存**，不要每帧重算。
+    //
+    // 它对每个对象做一次 il2cpp_gchandle_get_target（还分配一整个 vector）。
+    // 「Find Objects」扫一个大类可能有几万个对象 —— 每帧几万次句柄解析，
+    // 打开选择器时界面会明显卡顿。
+    //
+    // 但它只需要回答「哪些对象还活着」，这个信息**不逐帧变化**：
+    // 对象被 GC 回收是低频事件。所以 250ms 刷新一次完全够用，
+    // 开销降到 1/15 左右。
+    //
+    // 列表变空时立刻重算，否则刚重扫完会一直显示空列表。
+    // 返回**拷贝**而不是引用：下面的循环会 `live.erase(...)`（按位置删，
+    // 删完不递增下标），直接给引用会把缓存改坏。
+    // 拷贝只是 memcpy，比 N 次句柄解析便宜得多 —— 真正要省的是后者。
+    static std::unordered_map<void *, std::pair<double, std::vector<Il2CppObject *>>> liveCache;
+    auto liveOf = [&](Il2cpp::GC::RootedObjectList &list) -> std::vector<Il2CppObject *>
+    {
+        auto &entry = liveCache[klass];
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (entry.second.empty() || now - entry.first > 0.25)
+        {
+            entry.second = list.liveObjects();
+            entry.first = now;
+        }
+        return entry.second;
+    };
     // 扫描标记用 shared_ptr<atomic<bool>> 持有：后台线程拿到的地址必须稳定。
     // 旧代码是 std::unordered_map<void*,bool> + 捕获 bool&，UI 往 map 里再插一个
     // key 就会 rehash，那个引用当场悬空，后台线程再写就是堆破坏。
@@ -429,7 +457,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
             {
                 // liveObjects() 会剔除已被 GC 回收的条目（并释放其句柄），
                 // 下面遍历的是仍然有效的对象 —— 之后 object->klass 才安全。
-                auto live = objects.liveObjects();
+                auto live = liveOf(objects);
                 if (live.size() > 100)
                 {
                     ImGui::Text("Showing 100 of %zu objects", live.size());
@@ -783,7 +811,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 }
                 else
                 {
-                    auto live = objects.liveObjects();
+                    auto live = liveOf(objects);
                     for (size_t i = 0; i < live.size();)
                     {
                         auto object = live[i];
