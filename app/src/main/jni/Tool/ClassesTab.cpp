@@ -286,9 +286,15 @@ void ClassesTab::WatchStats(size_t *total, size_t *frozen, size_t *frozenInvalid
             continue;
         }
         if (frozen) (*frozen)++;
-        // 冻结中但对象已经失效：正常情况下第 66 轮的自动解冻会先跑，
-        // 所以这里非零说明**这一帧还没解冻**（比如 DrawWatches 所在的
-        // CollapsingHeader 正好是收起的 —— 冻结循环在 DrawWatches 里！）。
+        // 冻结中但对象已失效 —— 按理这**不可能发生**：ApplyFreezes 每帧先跑，
+        // 见到失效对象就会当场解冻。所以这个计数非零 = 有东西坏了，
+        // 它是自检页上的一个不变量探针，不是「正常的两种情况之一」。
+        //
+        // 旧注释写的是「CollapsingHeader 收起时冻结循环没跑」——
+        // 那是第 83 轮**之前**的世界：冻结循环当时在 DrawWatches 里，
+        // 折叠面板就真的会让冻结停掉。第 83 轮把它搬到了 ApplyFreezes，
+        // 但这段说明留在了原地，于是它和上面 PatchStats 头上那段
+        // 变成了自相矛盾的两段（第 106 轮发现）。
         if (frozenInvalid && w.handle && Il2cpp::GC::GetHandleTarget(w.handle) == nullptr)
         {
             (*frozenInvalid)++;
@@ -296,11 +302,6 @@ void ClassesTab::WatchStats(size_t *total, size_t *frozen, size_t *frozenInvalid
     }
 }
 
-// 冻结的每帧写回。**必须每帧无条件执行**，所以它不能待在 DrawWatches 里 ——
-// 那个函数在 `ImGui::CollapsingHeader("关注值")` 里面才被调用，
-// 用户一折叠，冻结就**静默失效**，而那一行的按钮还显示「解冻」。
-//
-// 形状和第 82 轮那个一样：**作用在游戏状态上的东西，不该挂在界面上**。
 void ClassesTab::PatchStats(size_t *patched, size_t *restorable)
 {
     if (patched) *patched = 0;
@@ -312,16 +313,35 @@ void ClassesTab::PatchStats(size_t *patched, size_t *restorable)
             continue;
         }
         if (patched) (*patched)++;
-        // 方法体被卸载 / 重新加载之后，methodPointer 会变，
-        // 这时那份原字节对应的已经不是当前代码了 —— 写回去等于破坏。
+        // 「可恢复」现在能**精确**判断了，不用再靠「methodPointer 非空」
+        // 那个近似（第 105/106 轮）。
+        //
+        // 旧判断只要 methodPointer 非空就算可恢复。可它非空**说明不了**
+        // 「这段代码还是不是当初取原字节的那一段」—— 而那恰恰是
+        // RestorePatchedMethod 现在会拒绝的情况。
+        // 于是自检页可能在「其实恢复不了」的时候报绿。
+        //
+        // appliedAt == 0 = 该字段加进来之前的老数据，一律按可恢复算，
+        // 和写入路径的取舍保持一致（拒绝一个本来没问题的恢复比放行更糟）。
         MethodInfo *m = entry.first;
-        if (restorable && m != nullptr && m->methodPointer != nullptr)
+        const bool sameCode = entry.second.appliedAt == nullptr ||
+                              (m != nullptr && m->methodPointer == entry.second.appliedAt);
+        if (restorable && sameCode)
         {
             (*restorable)++;
         }
     }
 }
 
+// 冻结的每帧写回。**必须每帧无条件执行**，所以它不能待在 DrawWatches 里 ——
+// 那个函数在 `ImGui::CollapsingHeader("关注值")` 里面才被调用，
+// 用户一折叠，冻结就**静默失效**，而那一行的按钮还显示「解冻」。
+//
+// 形状和第 82 轮那个一样：**作用在游戏状态上的东西，不该挂在界面上**。
+//
+// （这段说明在第 83 轮搬函数的时候被落在了 PatchStats 头上 —— 第 106 轮发现：
+//  一个修好了的 bug，会留下一段**描述旧世界**的注释，而它看起来还挺合理，
+//  只有把两个地方并排读才会发现自相矛盾。）
 void ClassesTab::ApplyFreezes()
 {
     // 每帧都跑（不是按 200ms）：冻结的意义就是压过游戏自己的更新 ——
