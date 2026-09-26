@@ -59,21 +59,27 @@ static std::unordered_map<Il2CppClass *, std::string> g_pendingScanErrors;
 // 因为是 set（按指针去重），用一个并行的句柄表来管 GC 根。
 static std::unordered_map<Il2CppObject *, uint32_t> g_savedHandles;
 
-static void SaveObjectWithRoot(Il2CppObject *obj)
+// 返回**是不是真的保住了活**。调用方据此决定要不要把它存进别处
+// —— 加根失败却照样存进 savedSet，那个对象就会以裸指针的形式被解引用。
+static bool SaveObjectWithRoot(Il2CppObject *obj)
 {
     if (!obj)
     {
-        return;
+        return false;
     }
-    if (g_savedHandles.find(obj) == g_savedHandles.end())
+    auto it = g_savedHandles.find(obj);
+    if (it != g_savedHandles.end())
     {
-        auto handle = Il2cpp::GC::NewHandle(obj);
-        if (handle == 0)
-        {
-            LOGW("保存对象加根失败: %p", static_cast<void *>(obj));
-        }
-        g_savedHandles[obj] = handle;
+        return it->second != 0;
     }
+    auto handle = Il2cpp::GC::NewHandle(obj);
+    if (handle == 0)
+    {
+        LOGW("保存对象加根失败: %p", static_cast<void *>(obj));
+        return false;
+    }
+    g_savedHandles[obj] = handle;
+    return true;
 }
 
 static void UnsaveObjectWithRoot(Il2CppObject *obj)
@@ -94,11 +100,16 @@ static Il2CppObject *ResolveSaved(Il2CppObject *obj)
         return nullptr;
     }
     auto it = g_savedHandles.find(obj);
-    if (it != g_savedHandles.end() && it->second)
+    if (it == g_savedHandles.end() || !it->second)
     {
-        return Il2cpp::GC::GetHandleTarget(it->second);
+        // 没有句柄 = 没有 GC 根 = 这个地址随时可能是野的。**不退回裸指针**（第 99 轮改）。
+        //
+        // 旧代码这里 `return obj;`，于是「保存时加根失败」的对象照样留在
+        // savedSet 里、照样被检视器显示、照样被解引用 —— 而下面 1983 行那处
+        // 的注释其实已经把这件事写清楚了，只是代码没照做。
+        return nullptr;
     }
-    return obj;
+    return Il2cpp::GC::GetHandleTarget(it->second);
 }
 
 // 「剩下多少宽度可用」，**并且保证不为负**。
@@ -1980,8 +1991,19 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 //
                 // JSON 检视器那条路径一直是对的（SaveObjectWithRoot），这里
                 // 却是裸 insert —— 调用结果绕过了整套 GC 保活机制。
-                savedSet[resultType->getClass()].insert(result);
-                SaveObjectWithRoot(result);
+                // **先加根，成功了才进 savedSet。**
+                //
+                // 顺序反过来时：加根失败 → savedSet 里躺着一个没有根的裸指针
+                // → 检视器照样显示它 → ResolveSaved 原样返回它 → 解引用野指针。
+                // 旧代码正是这个顺序（第 99 轮改）。
+                if (SaveObjectWithRoot(result))
+                {
+                    savedSet[resultType->getClass()].insert(result);
+                }
+                else
+                {
+                    ReportFieldError("保存返回值失败：加根没成功，这个对象随时可能被回收，已不加入列表");
+                }
                 // setJsonObject(result);
             }
             else if (!managedException)

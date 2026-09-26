@@ -521,9 +521,20 @@ foreach ($f in $files) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
         # 只看形如 `return info.<字段>;` 的裸退回
-        if ($t -notmatch '^return\s+\w+\.(gameObject|transform|gameObjectHandle|transformHandle)\s*;') { continue }
+        # 两种形状都要覆盖（第 99 轮的教训）：
+        #   `return info.gameObject;`  —— 成员访问（ObjectDrawManager）
+        #   `return obj;`              —— 裸参数  （ClassesTab::ResolveSaved）
+        # 第一版只写了前一种，于是 ResolveSaved **从门禁底下溜过去了**，
+        # 而它和前一个是**完全同一个 bug**。
+        if ($t -notmatch '^return\s+(\w+\.(gameObject|transform|gameObjectHandle|transformHandle)|obj|object)\s*;') { continue }
         # 必须紧跟着「if (handle) return GetHandleTarget(...)」这种形状才值得报
-        $ctx = $lines[[Math]::Max(0, $i - 8)..$i] -join "`n"
+        # GetHandleTarget 可能在**前面**也可能在**后面**：
+        #   `if (handle) return GetHandleTarget(...); return obj;`   （前）
+        #   `if (!handle) return obj; return GetHandleTarget(...);` （后）
+        # 第 99 轮第一版只往前看，于是后一种形状又溜过去了。
+        $from = [Math]::Max(0, $i - 8)
+        $to = [Math]::Min($i + 8, $lines.Count - 1)
+        $ctx = $lines[$from..$to] -join "`n"
         if ($ctx -notmatch 'GetHandleTarget') { continue }
         $hits += [pscustomobject]@{
             File = $f.Name

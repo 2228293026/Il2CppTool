@@ -206,6 +206,29 @@ Test-Rule 'J 不许退回裸指针' {
     }
     return $false
 } $jCheck 'app/src/main/jni/Tool/ObjectDrawManager.cpp'
+# ---- 15. 规则 J 扩到「没有成员访问」的形状（ResolveSaved）----
+# 第 99 轮：规则 J 第一版只认 return info.gameObject;（成员访问），
+# 于是 return obj;（裸参数）**从门禁底下溜过去了** ——
+# 而它和前一个是**完全同一个 bug**，只是写的人不同。
+#
+# 这条自检锚在 ClassesTab::ResolveSaved 上，专门盯这个形状。
+$j2Check = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'J 裸参数形状（ResolveSaved）' {
+    param($t)
+    # 锚点就是那一行 return nullptr —— 换回 return obj 就复现出
+    # 第 99 轮那个 bug 的**原样形状**。
+    $good = '        return nullptr;'
+    $bad  = '        return obj;'
+    if ($t.Contains($good)) {
+        [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+            $t.Replace($good, $bad), (New-Object Text.UTF8Encoding($false)))
+        return $true
+    }
+    return $false
+} $j2Check 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
