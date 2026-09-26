@@ -445,7 +445,11 @@ std::string g_hookError;
     //
     // 共同点：**设置和显示/清除必须在同一个、一直都在的地方**。
     ClassesTab::DrawFieldErrorBanner();
-    if (ImGui::CollapsingHeader("关注值"))
+    // 冻结每帧写回：**无条件**执行，放在 CollapsingHeader 外面。
+// 折叠「关注值」不应该让冻结停掉 —— 冻结是作用在**游戏状态**上的，
+// 不是界面的事（第 82 轮那条教训：DrawUI 也是这么把绘制列表搬空的）。
+ClassesTab::ApplyFreezes();
+if (ImGui::CollapsingHeader("关注值"))
     {
         ClassesTab::DrawWatches();
     }

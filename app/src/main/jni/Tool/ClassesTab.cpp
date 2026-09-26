@@ -262,23 +262,36 @@ void ClassesTab::InitChangeLogUndo()
     ChangeLog::SetHandleReleaser(&FreeUndoHandle);
 }
 
-void ClassesTab::DrawWatches()
+void ClassesTab::WatchStats(size_t *total, size_t *frozen, size_t *frozenInvalid)
 {
-    if (g_watches.empty())
+    if (total) *total = 0;
+    if (frozen) *frozen = 0;
+    if (frozenInvalid) *frozenInvalid = 0;
+    for (const auto &w : g_watches)
     {
-        return;
+        if (total) (*total)++;
+        if (!w.frozen)
+        {
+            continue;
+        }
+        if (frozen) (*frozen)++;
+        // 冻结中但对象已经失效：正常情况下第 66 轮的自动解冻会先跑，
+        // 所以这里非零说明**这一帧还没解冻**（比如 DrawWatches 所在的
+        // CollapsingHeader 正好是收起的 —— 冻结循环在 DrawWatches 里！）。
+        if (frozenInvalid && w.handle && Il2cpp::GC::GetHandleTarget(w.handle) == nullptr)
+        {
+            (*frozenInvalid)++;
+        }
     }
-    ImGui::Separator();
-    ImGui::Text("关注值（每 200ms 自动刷新）");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("全部清除"))
-    {
-        ClearWatches();
-        return;
-    }
+}
 
-    // ---- 冻结：每帧把钉住的值写回去 ----
-    //
+// 冻结的每帧写回。**必须每帧无条件执行**，所以它不能待在 DrawWatches 里 ——
+// 那个函数在 `ImGui::CollapsingHeader("关注值")` 里面才被调用，
+// 用户一折叠，冻结就**静默失效**，而那一行的按钮还显示「解冻」。
+//
+// 形状和第 82 轮那个一样：**作用在游戏状态上的东西，不该挂在界面上**。
+void ClassesTab::ApplyFreezes()
+{
     // 每帧都跑（不是按 200ms）：冻结的意义就是压过游戏自己的更新 ——
     // 如果也按 200ms 写一次，两次之间血量会掉下去，表现为「闪一下又回来」。
     //
@@ -313,6 +326,23 @@ void ClassesTab::DrawWatches()
                               "已解除冻结：写不进去（路径失效、类型不支持或值非法）");
         }
     }
+}
+
+void ClassesTab::DrawWatches()
+{
+    if (g_watches.empty())
+    {
+        return;
+    }
+    ImGui::Separator();
+    ImGui::Text("关注值（每 200ms 自动刷新）");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("全部清除"))
+    {
+        ClearWatches();
+        return;
+    }
+
 
     // 低频轮询。放在画之前一次性更新所有条目。
     const double now = std::chrono::duration<double>(

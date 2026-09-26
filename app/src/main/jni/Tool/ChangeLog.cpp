@@ -204,7 +204,13 @@ void RecordUndoable(Kind kind, const std::string &target, const std::string &old
     }
 }
 
-// 界面用这个（不加锁：只读 Entry 的副本，够用）。
+// 撤销器有没有注入。刻意**不持锁**：g_restorer 只在 Init 时赋值一次，读一个
+// 未初始化的 bool 无害；自检页在渲染线程，没必要为此和 ImGuiJson 抢锁。
+bool UndoAvailable()
+{
+    return g_restorer != nullptr;
+}
+
 bool CanUndo(const Entry &entry)
 {
     return entry.handle != 0 && !entry.oldValue.empty() && g_restorer != nullptr;

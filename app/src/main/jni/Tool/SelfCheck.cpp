@@ -1,4 +1,5 @@
 #include "SelfCheck.h"
+#include "ChangeLog.h"
 #include "Il2cpp/Il2cpp.h"
 #include "Includes/Logger.h"
 #include "ObjectDrawManager.h"
@@ -155,6 +156,48 @@ std::vector<Result> Collect()
         }
     }
 
+    // ---- 改动记录 · 撤销 ----
+    //
+    // 撤销器没注入的话，**所有「恢复」按钮会集体消失**，而界面不给任何原因：
+    // 记录在、按钮没了，用户分不清是功能没做、对象被回收、还是被关掉了。
+    //
+    // 这正是自检页存在的意义 —— 把「默认静默」的环节变成一条看得见的结论。
+    // （第 78/80 轮那三个 bug 全部属于「不报错、只是没生效」这一类。）
+    {
+        const size_t records = ChangeLog::Count();
+        char buf[200]{0};
+        if (!ChangeLog::UndoAvailable())
+        {
+            snprintf(buf, sizeof(buf), "撤销器未注入（记录 %zu 条）——「恢复」按钮不会出现", records);
+            out.push_back(Fail("改动记录 · 撤销", buf));
+        }
+        else if (records == 0)
+        {
+            out.push_back(Info("改动记录 · 撤销", "撤销器已就绪（还没有任何改动记录）"));
+        }
+        else
+        {
+            // 统计有多少条还能撤销 —— 全都不可撤销通常意味着句柄没拿到。
+            size_t undoable = 0;
+            for (const auto &e : ChangeLog::Snapshot())
+            {
+                if (ChangeLog::CanUndo(e))
+                {
+                    undoable++;
+                }
+            }
+            snprintf(buf, sizeof(buf), "共 %zu 条，其中 %zu 条可撤销", records, undoable);
+            if (undoable == 0)
+            {
+                out.push_back(Warn("改动记录 · 撤销", buf));
+            }
+            else
+            {
+                out.push_back(Ok("改动记录 · 撤销", buf));
+            }
+        }
+    }
+
     // ---- 配置 ----
     {
         char buf[256]{0};
@@ -175,6 +218,43 @@ std::vector<Result> Collect()
         }
     }
 
+
+    // ---- 冻结值 ----
+    //
+    // 冻结是**每帧**写回，而写回循环过去挂在 DrawWatches() 里 ——
+    // 那个函数只在 `CollapsingHeader("关注值")` 展开时才被调用。
+    // 于是「折叠关注值」会让所有冻结**静默失效**，而按钮还显示「解冻」。
+    // 第 83 轮把循环挪到了 ApplyFreezes()，无条件执行。
+    //
+    // 这里把「有几个正冻着」摊开：冻结了却一个都没冻住，和根本没冻结过，
+    // 在界面上看起来是一样的。
+    {
+        size_t total = 0;
+        size_t frozen = 0;
+        size_t frozenInvalid = 0;
+        ClassesTab::WatchStats(&total, &frozen, &frozenInvalid);
+        if (frozen > 0)
+        {
+            char buf[192]{0};
+            if (frozenInvalid > 0)
+            {
+                // ApplyFreezes 每帧先跑，正常情况下这里恒为 0。
+                snprintf(buf, sizeof(buf),
+                         "%zu / %zu 项正在冻结，其中 %zu 项对象已失效（下一帧自动解冻）", frozen, total,
+                         frozenInvalid);
+                out.push_back(Warn("冻结值", buf));
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "%zu / %zu 项正在冻结（每帧写回）", frozen, total);
+                out.push_back(Ok("冻结值", buf));
+            }
+        }
+        else if (total > 0)
+        {
+            out.push_back(Info("冻结值", "当前没有冻结项"));
+        }
+    }
     // ---- 已保存的对象数 ----    // 这些是用户手动标记的，靠 GC 强根保活。数量异常偏大通常意味着
     // 「关掉了标签页但根没释放」——那会让游戏对象永远回收不掉。
     {

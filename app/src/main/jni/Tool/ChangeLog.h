@@ -78,8 +78,14 @@ void SetRestorer(Restorer fn);
 using HandleReleaser = void (*)(uint32_t handle);
 void SetHandleReleaser(HandleReleaser fn);
 
-// 这一条现在还能不能撤销（对象还在、值没被恢复过、有注入的恢复器）。
-bool CanUndo(const Entry &entry);
+// 撤销器是否已注入。
+//
+// **必须能查**：`SetRestorer` 没被调用的话，每一条记录的 handle 还在
+// （能显示），但 CanUndo 恒为 false —— 于是**所有「恢复」按钮集体消失**，
+// 而界面不会给出任何原因。用户只能看到「记录在、按钮没了」，
+// 无从判断是功能没做、还是对象被回收了、还是自己被关掉了。
+// 这个自检就是为了让那件事变成「一条看得见的失败」。
+bool UndoAvailable();
 // 真正执行恢复。
 bool Undo(const Entry &entry);
 // 恢复成功后调用：这一条的可恢复状态作废（再点一次会跳过）。
@@ -88,6 +94,9 @@ bool Undo(const Entry &entry);
 // 只会命中**最新**那条，于是把**别人的**句柄还了回去，
 // 下一帧那条再点「恢复」就是**用已释放的句柄**。
 bool UndoById(uint64_t id);
+
+// 这一条现在还能不能撤销（对象还在、值没被恢复过、有注入的恢复器）。
+bool CanUndo(const Entry &entry);
 
 // 快照。返回的副本之后随便改，不影响内部状态。
 std::vector<Entry> Snapshot();

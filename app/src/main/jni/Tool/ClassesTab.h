@@ -131,8 +131,17 @@ struct ClassesTab
     static void RemoveWatchAt(size_t index);
     static void ClearWatches();
     static size_t WatchCount();
+
+    // 关注值/冻结的统计，给自检页用。
+    // 冻结项的对象一旦被回收会自动解冻（第 66 轮），但「有多少个正冻着」
+    // 只有用户自己知道 —— 让它在自检页可见。
+    static void WatchStats(size_t *total, size_t *frozen, size_t *frozenInvalid);
     // 在 JSON 检视器末尾画关注列表。由 ImGuiJson 调用。
     // 把「撤销器」和「句柄释放器」注入改动记录。
+    // 冻结的每帧写回。由 Tool::Draw() **无条件**调用 ——
+    // 不能放在 CollapsingHeader("关注值") 里面，否则折叠时冻结会静默失效。
+    static void ApplyFreezes();
+
     // 必须在任何 RecordUndoable 之前调用，否则记录表没有恢复能力。
     static void InitChangeLogUndo();
     static void DrawWatches();
