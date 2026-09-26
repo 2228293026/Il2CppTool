@@ -142,9 +142,13 @@ constexpr int MAX_CLASSES = 500;
 //    走类型分派，N 个关注项每帧跑是不必要的开销。
 //    又不是几秒一次 —— 那样「盯着看」就没意义了。
 static std::vector<ClassesTab::Watch> g_watches;
+// 前向声明：冻结的每帧写回要把值类型字段逐层写回父对象（见 WriteWatchValue 的注释）。
+void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> &paths,
+                       Il2CppObject *rootObj);
+
 // 前向声明：冻结的每帧写回要调它，而它的定义在文件更靠后（字段编辑那段）。
 static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &paths,
-                            std::string value);
+                            std::string value, Il2CppObject **lastObject);
 
 static double g_watchLastPoll = 0.0;
 
@@ -284,13 +288,24 @@ void ClassesTab::DrawWatches()
             continue;
         }
         std::string value = w.frozenValue; // setField 按值传，不能用 const 引用
-        if (!WriteWatchValue(live, w.paths, value))
+        Il2CppObject *wroteTo = nullptr;
+        if (!WriteWatchValue(live, w.paths, value, &wroteTo))
         {
             // 写不进去（路径断了 / 类型变了）。每帧重试只会刷屏，
             // 所以解除冻结并明确记一笔。
             w.frozen = false;
             ChangeLog::Record(ChangeLog::Kind::Field, w.label,
                               "已解除冻结：写不进去（路径失效或类型不支持）");
+            continue;
+        }
+        // **关键**：路径中间如果经过值类型（struct），wroteTo 拿到的是
+        // 一个**装箱副本** —— 不把它写回父对象的字段槽位，游戏里的真实
+        // 字段一点没变。表现是「冻结了但值就是立不住」，而且不报错。
+        // struct 在 Unity 里到处都是（Player.stats.health 之类），
+        // 所以这一行不是可有可无的。
+        if (wroteTo != nullptr && wroteTo != live)
+        {
+            ensureIfValueType(wroteTo, w.paths, live);
         }
     }
 
@@ -3778,11 +3793,21 @@ static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &typ
 // 和 dump(paths) 用的是同一套表示 —— 读和写必须走同样的解析，否则
 // 「读得到但写不进去」，而用户完全看不出为什么。
 //
+// **lastObject 拿回真正被写入的那个对象。** 这一条很关键：
+// 路径中间如果经过**值类型（struct）**，GetFieldValueObject 返回的是
+// 一个**装箱副本**，直接往它上面写等于写进了一个临时对象 —— 游戏里的
+// 真实字段一点没变。必须把它交回给调用方，由 ensureIfValueType 逐层
+// 写回父对象的字段槽位。
+//
+// 漏掉这一步的后果特别隐蔽：写入「成功」了、不报错、界面也照常显示，
+// 但值就是立不住 —— 而 struct 在 Unity 里到处都是
+// （Player.stats.health、Transform.position …）。
+//
 // 返回 false 表示写不进去（路径中途断了 / 字段找不到 / 类型不认识 /
 // 解析失败）。调用方据此**解除冻结**，而不是每帧对着一个写不进去的
 // 路径空转 —— 那既浪费又会在日志里刷屏。
 static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &paths,
-                            std::string value)
+                            std::string value, Il2CppObject **lastObject)
 {
     if (paths.empty())
     {
@@ -3816,6 +3841,10 @@ static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &
             }
             // 走字段编辑那套严格的解析（整串吃掉 + 范围检查），
             // 否则「12abc」会静默写成 12 —— 第 44 轮修过的坑。
+            if (lastObject != nullptr)
+            {
+                *lastObject = object;
+            }
             return ParseAndSetNumericField(object, type, name, value);
         }
         // 中间段：取子对象
