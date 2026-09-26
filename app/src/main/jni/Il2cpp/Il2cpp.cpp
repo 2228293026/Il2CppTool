@@ -1551,6 +1551,8 @@ namespace Il2cpp
         // 已经报过错的属性：失败时重试，但**只报一次**。
         // （自检页每 2 秒读一次版本号，不限流就是每 2 秒一行 LOGE。）
         static std::set<std::string> warnedProperties;
+        // 每个属性上次**尝试**失败的时刻（用于限流重试，见下面的说明）。
+        static std::unordered_map<std::string, double> lastFailedAttempt;
 
         {
             std::lock_guard<std::mutex> guard(cacheMutex);
@@ -1605,14 +1607,40 @@ namespace Il2cpp
         // 失败时改成重试。但重试要**限流**：自检页每 2 秒读一次
         // getUnityVersion()/getGameVersion()，不限流就是每 2 秒一行 LOGE，
         // 日志很快被刷满。所以每个属性只报一次错。
+        // 失败时改成重试。两件事都要限流：
+        //
+        //  1) **日志**每个属性只报一次（否则每 2 秒一行 LOGE 刷满）
+        //  2) **重试本身**也要退避 —— 自检页每 2 秒读一次版本号，
+        //     而每次读失败都要走一遍 FindClass("UnityEngine.Application")，
+        //     那是一次「遍历所有程序集的所有类型做名字比对」
+        //     （十万量级）。有些游戏就是没有 Application，
+        //     那它永远读不到 → 每 2 秒一次全量扫描，**永远持续下去**。
+        //     这是第 33 轮那个「失败不缓存」修复带来的长期开销，
+        //     第 38 轮的自检页把它放大了 100 倍。
+        //
+        // 退避到 30 秒封顶：真的只是「取得早」时，几秒内就恢复了；
+        // 确实没有的话，代价衰减到可忽略。
         if (ok)
         {
             cache[property] = result;
+            lastFailedAttempt[property] = 0.0;
         }
-        else if (warnedProperties.insert(property).second)
+        else
         {
-            LOGE("读取 UnityEngine.Application.%s 失败，本次显示为 %s（后续会重试）",
-                 property, fallback);
+            const double now = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+            if (now - lastFailedAttempt[property] < 1.0)
+            {
+                // 刚刚才试过，别再重复扫描
+                return result;
+            }
+            lastFailedAttempt[property] = now;
+            if (warnedProperties.insert(property).second)
+            {
+                LOGE("读取 UnityEngine.Application.%s 失败，本次显示为 %s（后续会重试）",
+                     property, fallback);
+            }
         }
         return result;
     }

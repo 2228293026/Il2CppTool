@@ -393,7 +393,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
     if (!scanError.empty())
     {
         ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "对象扫描失败: %s", scanError.c_str());
-        ImGui::TextDisabled("下面的列表是**上一次**的结果，不是本次的。");
+        ImGui::TextDisabled("下面的列表是「上一次」的结果，不是本次的。");
     }
     ImGuiIO &io = ImGui::GetIO();
     float width = io.DisplaySize.x;

@@ -88,7 +88,7 @@ std::vector<Result> Collect()
         }
         else
         {
-            out.push_back(Fail("软键盘", "TouchScreenKeyboard 不可用 —— **所有文本输入都无法使用**"));
+            out.push_back(Fail("软键盘", "TouchScreenKeyboard 不可用 ——「所有文本输入都无法使用」"));
         }
     }
 
@@ -103,8 +103,6 @@ std::vector<Result> Collect()
             out.push_back(Fail("ImGui 上下文", "已销毁 —— 菜单不可用"));
         }
     }
-
-    // ---- ImGui 上下文 ----
 
     // ---- ESP 前置条件 ----
     // 这些是 ESP 能不能工作的全部前提。任何一条不成立，现象都是
@@ -126,7 +124,10 @@ std::vector<Result> Collect()
             }
             else
             {
-                out.push_back(Ok("ESP 包围盒", "未就绪（会自动退回固定像素尺寸框）"));
+                // 框**仍然会画**，只是退回固定像素尺寸 —— 所以不是失败。
+                // 但也不该报「通过」：用户看到的框和实际物体大小对不上，
+                // 而界面上没有任何提示。降级要如实说是降级。
+                out.push_back(Warn("ESP 包围盒", "未就绪 —— 框仍会画，但退回固定像素尺寸（与物体实际大小不符）"));
             }
             out.push_back(Info("ESP 已选目标", std::to_string(ObjectDrawManager::DrawObjectCount())));
         }
@@ -235,8 +236,10 @@ std::vector<Result> Collect()
 
 void DrawUI()
 {
+    // 注意：ImGui **不解析 markdown**。写 **粗体** 会在界面上显示成
+    //  literally 带星号的文本。想强调就用「」或【】。
     ImGui::TextDisabled(
-        "自检把「哪些前置条件成立」一次性摊开。多数问题在这个项目里默认是**静默**的"
+        "自检把「哪些前置条件成立」一次性摊开。多数问题在这个项目里默认是「静默」的"
         "（ESP 拿不到相机就只是不画框，触摸偏移错了菜单就完全没反应），\n"
         "而这里能直接看出是哪一环坏了；具体原因去「日志」页看。");
     ImGui::Separator();
