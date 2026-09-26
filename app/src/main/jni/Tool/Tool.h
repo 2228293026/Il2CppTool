@@ -67,6 +67,13 @@ namespace Tool
     // 停止并回收 dump 工作线程。必须在线程仍 joinable 时调用，
     // 否则全局 std::thread 的析构会 std::terminate。
     void ShutdownDumper();
+
+// ToggleHooker 失败时的**原因**（空 = 上次没有失败）。
+//
+// 旧代码 ToggleHooker 返回 bool，调用点直接丢弃 —— 于是 Dobby 装钩失败、
+// 或者「该地址已被另一个泛型实例化占用」这些情况，用户点了按钮**什么都没
+// 发生**，也无法判断是按钮没生效还是工具没收到。
+extern std::string g_hookError;
     bool ToggleHooker(MethodInfo *method, int state = -1);
     void CalculateSomething();
     // 每帧在渲染线程调用：采样各 hook 的调用频率。

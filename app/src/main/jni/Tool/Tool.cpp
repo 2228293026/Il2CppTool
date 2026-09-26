@@ -29,7 +29,10 @@ extern std::vector<Il2CppImage *> g_Images;
 extern Il2CppImage *g_Image;
 
 namespace Tool
+
 {
+// ToggleHooker 失败原因。见 Tool.h 里的声明。
+std::string g_hookError;
     struct CallData
     {
         MethodInfo *method;
@@ -816,6 +819,8 @@ namespace Tool
     // 0 = Off
     // 1 = On
     bool ToggleHooker(MethodInfo *method, int state) {
+
+    g_hookError.clear();
     bool patched = ClassesTab::oMap[method].bytes.empty() == false;
     if (patched) {
         LOGE("Can't hook while patched!");
@@ -842,6 +847,31 @@ namespace Tool
     auto EnableHooker = [&method]() -> bool {
         LOGD("%s", method->getName());
         printHex(method->methodPointer);
+        // **同一个函数地址可能对应多个 MethodInfo** —— 泛型方法的各个
+        // 实例化（Foo.Bar<int>() / Foo.Bar<string>()）共用一个 methodPointer。
+        //
+        // 旧代码直接 `hookerMap[addr] = ...`，于是第二个实例会**静默覆盖**
+        // 第一个的记录：计数被清零、data.method 变成后一个，
+        // 界面上就只剩下一个方法名 —— 而用户明明追踪了两个。
+        // 更糟的是 DobbyInstrument 对同一个地址装第二次钩子，
+        // 会在已有的跳板链上再叠一层。
+        //
+        // 这里明确拒绝并说明，而不是静默替换。
+        {
+            std::lock_guard guard(hookerMtx);
+            auto existing = hookerMap.find(method->methodPointer);
+            if (existing != hookerMap.end() && existing->second.method != method) {
+                const char *other =
+                    (existing->second.method && existing->second.method->getName())
+                        ? existing->second.method->getName()
+                        : "?";
+                LOGE("地址 %p 已被 %s 占用（%s 是泛型实例化，共用同一地址）",
+                     method->methodPointer, other, method->getName());
+                g_hookError = std::string("该函数地址已被 ") + other +
+                              " 追踪（泛型方法的各个实例化共用同一地址，无法分别追踪）";
+                return false;
+            }
+        }
         std::span<uint8_t> originalBytes((uint8_t *)method->methodPointer, (uint8_t *)method->methodPointer + 8);
 #ifdef __aarch64__
         constexpr std::array<uint8_t, 4> ret = {0xC0, 0x03, 0x5F, 0xD6};
@@ -883,6 +913,9 @@ namespace Tool
             return true;
         } else {
             LOGE("Failed to instrument %s", method->getName());
+            g_hookError = std::string("装钩失败（地址 ") +
+                             (const char *)method->methodPointer +
+                             "）—— 可能是已被其他 hook 占用，或地址不可写";
             return false;
         }
     };

@@ -2630,7 +2630,16 @@ void ClassesTab::HookerView(Il2CppClass *klass, MethodInfo *method, const Method
     }
     if (ImGui::Button(label))
     {
-        Tool::ToggleHooker(method);
+        // 旧代码直接丢弃返回值：Dobby 装钩失败、或者「地址已被另一个
+        // 泛型实例化占用」时，用户点了按钮**什么都没发生**，
+        // 也无法判断是按钮没生效还是工具没收到。
+        //
+        // 现在把失败原因交给字段错误横幅 —— 那是这一页唯一的全局提示位，
+        // 不需要用户知道自己正看的是哪个 tab。
+        if (!Tool::ToggleHooker(method) && !Tool::g_hookError.empty())
+        {
+            ReportFieldError(Tool::g_hookError);
+        }
         std::lock_guard guard(hookerMtx);
         hooked = hookerMap.find(method->methodPointer) != hookerMap.end();
     }
