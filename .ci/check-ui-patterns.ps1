@@ -199,6 +199,40 @@ foreach ($f in $files) {
 # 而它本来要抓的那个**真 bug**（关掉全部标签页 → 空指针解引用 →
 # 用户的游戏进程崩溃）已经在第 70 轮修掉了，并且改法是
 # 「值拿不准就别解引用」—— 这条原则不依赖任何检查也能成立。
+# ---- 模式 D：ImGui 会**原样显示** `**`，它不解析 markdown ----
+#
+# ImGui 的 Text 系列只是把字符串丢进字库，没有任何 markdown 处理。
+# 所以中文文案里习惯性写的 `**重点**` 会变成界面上 literally 的星号：
+#
+#     无法写入该目录 —— **参数预设和配置都不会被保存**
+#                                        ^^^^^^^^^^ 会原样显示
+#
+# 这个缺陷在第 44/49 轮犯过两次，第 **84 轮又犯了一次**
+#（新加的自检项里写了 `**`，而当时我以为已经有门禁 ——
+#  实际上并没有，只有一句注释提醒）。
+#
+# 「我记得上次犯过」不是门禁。犯过三次的东西必须有机械检查。
+#
+# 排除项：
+#   注释        —— 不是渲染文本
+#   LOGx(...)   —— 日志是纯文本，`**` 在那里没问题
+#   第三方目录  —— imgui / asmjit 自己就有 `**DebugBreak**`
+foreach ($f in $files) {
+    $lines = Get-Content $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -match 'LOG[DEIWE]\(') { continue }
+        if ($t -notmatch '"[^"]*\*\*[^"]*"') { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'D: 渲染文本里的 ** 会原样显示（ImGui 不解析 markdown）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

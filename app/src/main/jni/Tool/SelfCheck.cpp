@@ -221,7 +221,7 @@ std::vector<Result> Collect()
         if (f == nullptr)
         {
             out.push_back(Fail("数据目录可写",
-                               "无法写入该目录 —— **参数预设和配置都不会被保存**，"
+                               "无法写入该目录 —— 参数预设和配置都不会被保存，"
                                "而保存失败没有任何提示"));
         }
         else
@@ -255,7 +255,7 @@ std::vector<Result> Collect()
             if (restorable < patched)
             {
                 snprintf(buf, sizeof(buf),
-                         "%zu 个方法已打补丁，其中 %zu 个**无法恢复**（方法体已重新加载）", patched,
+                         "%zu 个方法已打补丁，其中 %zu 个无法恢复（方法体已重新加载）", patched,
                          patched - restorable);
                 out.push_back(Warn("补丁 · 原字节", buf));
             }

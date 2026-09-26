@@ -38,7 +38,11 @@ function Test-Rule {
         [string]$Name,
         [scriptblock]$Inject,      # 注入违规；返回 $true 表示注入成功
         [scriptblock]$Check,       # 跑检查；返回退出码
-        [string]$Target            # 会被改动的文件（相对路径）
+        [string]$Target,           # 会被改动的文件（相对路径）
+        [bool]$ExpectRed = $true   # 注入后**应该**变红。
+                                    # 测「不该误报」的规则时传 $false ——
+                                    # 那类规则变红才是失败。门禁必须两边都验：
+                                    # 只验「能红」的规则，会把注释和日志也拦下来。
     )
     $path = Join-Path $root $Target
     $before = [IO.File]::ReadAllText($path)
@@ -62,11 +66,12 @@ function Test-Rule {
         [IO.File]::WriteAllBytes($path, $beforeBytes)
     }
 
-    $ok = $injected -and ($rcBad -ne 0) -and ($rcGood -eq 0)
+    $ok = $injected -and (($rcBad -ne 0) -eq $ExpectRed) -and ($rcGood -eq 0)
     $script:results += [pscustomobject]@{
         Name    = $Name
         Injected = $injected
         RedOnBad = ($rcBad -ne 0)
+        ExpectRed = $ExpectRed
         GreenAfter = ($rcGood -eq 0)
         Ok      = $ok
     }
@@ -140,6 +145,34 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 7. markdown 规则：渲染文本里的 ** 必须被抓到，注释/日志里的必须放过 ----
+# 这是第 44/49 轮的老缺陷，第 84 轮又犯了一次。规则本身要能红，
+# 也要证明**不误报** —— 一个把注释和日志也拦下来的检查会被人加白名单，
+# 然后就彻底没用了。
+$mdCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'D 渲染文本的 ** ' {
+    param($t)
+    $p = $t.IndexOf('而保存失败没有任何提示"));')
+    if ($p -lt 0) { return $false }
+    $out = $t.Substring(0, $p) + '而保存失败**没有任何提示**"));' + $t.Substring($p + '而保存失败没有任何提示"));'.Length)
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/SelfCheck.cpp'), $out,
+        (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $mdCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
+
+# 反向：注释和日志里的 ** 不该被拦
+Test-Rule 'D 不误报（注释/日志）' {
+    param($t)
+    $marker = 'void ClassesTab::ApplyFreezes()'
+    $p = $t.IndexOf($marker)
+    if ($p -lt 0) { return $false }
+    $out = $t.Substring(0, $p) + "// 注释里的 **markdown** 不该被拦`n" + $t.Substring($p)
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'), $out,
+        (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $mdCheck 'app/src/main/jni/Tool/ClassesTab.cpp' -ExpectRed $false
 # ---- 6. 结构检查：删掉一个 } 必须被抓到 ----
 # 这是第 74 轮真实发生过的损坏（按行号搬代码，误删 `});`）。
 $structCheck = {
