@@ -8,7 +8,8 @@
 #
 # 现在只有这一个入口，CI 和本地跑的是**同一份**逻辑。
 param(
-    [switch]$SkipClangTidy
+    [switch]$SkipClangTidy,
+    [switch]$SkipSelfTest
 )
 
 $ErrorActionPreference = 'Continue'
@@ -67,6 +68,21 @@ if (-not $SkipClangTidy) {
         # 只回显结论那几行，clang-tidy 的逐文件进度刷屏没意义
         ($out -split "`r?`n") | Where-Object { $_ -match '告警:|静态检查|通过|新增' } | ForEach-Object { "    $_" }
         if ($code -ne 0) { $script:rc = 1 }
+    }
+}
+
+# 最后一步：验证**上面那些检查自己**抓得到它们要防的东西。
+#
+# 第 64 轮的一条检查从写下来起就是死的，却一直显示「通过」；
+# 第 63 轮的一条断言从未执行，同样显示「通过」。
+# 一个从不失败的检查和没有检查，在输出上无法区分 ——
+# 所以必须真的去制造一次违规，看它会不会红。
+#
+# 这一步会临时改几个文件再改回来，耗时几十秒，所以可以 -SkipSelfTest 跳过。
+if (-not $SkipSelfTest) {
+    Invoke-Check '门禁自检（每条检查都必须能红）' {
+        powershell -ExecutionPolicy Bypass -File .\.ci\selftest-gates.ps1
+        if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
     }
 }
 
