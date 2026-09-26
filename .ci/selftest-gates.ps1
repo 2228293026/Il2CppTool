@@ -175,6 +175,49 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 11. 门禁必须按 **UTF-8** 读源码，不能跟着系统区域设置走 ----
+# 第 92 轮 CI 红而本地绿，查出来是这一条：
+#
+#   Windows PowerShell 5.1 的 Get-Content 不带 -Encoding 时按**系统 ANSI**
+#   读文件，这台机器上是 GBK。源码是 UTF-8，于是
+#
+#       "**未运行** ..."      UTF-8 字节 22 2A 2A E6 9C AA E8 BF 90 E8 A1 8C 2A 2A 22
+#   被 GBK 解码成        "**鏈繍琛?*"
+#                                       ^^ 这里只剩一个 * —— 8C 2A 是个非法
+#                                          组合，解码器把两个字节一起吃掉
+#
+# 规则 D 要找的是 `\*\*`，本地只看到一个 `*` → 绿。CI 是 Linux/UTF-8，
+# 两个 `*` 都在 → 红。
+#
+# 也就是说：**所有基于文本的门禁在不同的机器上会给出不同的答案**。
+# 而门禁的全部意义就是「哪里都一样的同一个答案」。
+$encCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'D 在 GBK 机器上也要看得见中文里的 **' {
+    param($t)
+    # 用**中文标识**而不是 ASCII：ASCII 标识在任何编码下都正常，
+    # 只有非 ASCII 才暴露「读文件用错编码」这个 bug。
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $j = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*ImGui::Text\("[^"]*"\);') { $j = $k; break }
+    }
+    if ($j -lt 0) { return $false }
+    # 关键：`**` 必须**紧跟在中文后面**，而且是全句里**唯一**的一对。
+    #
+    # 写成 `"**中文**"` 是不行的 —— 开头那对 `**` 前面是 ASCII 空格，
+    # 任何编码下都完整，规则照样报红，这条自检就**测不出编码问题**。
+    # 而 `"未运行**"` 里 8C 2A 会被 GBK 解码器一起吃掉，只剩一个 `*`，
+    # 裸 Get-Content 时规则必然漏报。
+    #
+    #   裸 Get-Content + 未运行**  -> rc=0   漏报
+    #   -Encoding UTF8 + 未运行**  -> rc=1   报出
+    $ls[$j] = '            ImGui::Text("未运行**");'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $encCheck 'app/src/main/jni/Main.cpp'
 # ---- 10. 规则 G + **门禁必须扫到 jni 根目录的 .cpp** ----
 # 第 90 轮发现的覆盖漏洞：$dirs 只有 Tool / Menu / Includes，
 # 所以 Main.cpp（927 行，整个渲染循环、追踪页、配置读写），

@@ -42,7 +42,7 @@ $verbPattern = '\b(Ensure|Parse|Write|Read|Request|Resolve|Free|Record|Add|Remov
 $findings = @()
 
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     # 粗略切分函数体：顶格 '}' 结束一段
     $inFunc = $false
     $funcStart = -1

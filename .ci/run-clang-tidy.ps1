@@ -93,7 +93,7 @@ $findings = ($output -split "`r?`n") | Where-Object {
 $baselineFile = Join-Path $PSScriptRoot 'clang-tidy-baseline.txt'
 $known = @()
 if (Test-Path $baselineFile) {
-    $known = Get-Content $baselineFile | Where-Object { $_.Trim() }
+    $known = Get-Content -Encoding UTF8 $baselineFile | Where-Object { $_.Trim() }
 }
 
 $keys = $findings | ForEach-Object {

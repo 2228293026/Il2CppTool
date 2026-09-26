@@ -59,7 +59,7 @@ $files += Get-ChildItem $rootCpp -Filter *.cpp -File
 $hits = @()
 
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^\s*(//|\*|/\*)') { continue }
@@ -119,7 +119,7 @@ foreach ($f in $files) {
 # 只扫 .cpp：字体二进制头（Roboto-Regular.h）里全是重复的十六进制行，
 # 那不是「重复插入」，是**数据**。这条规则对数据文件是纯噪音。
 foreach ($f in ($files | Where-Object { $_.Extension -eq '.cpp' })) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 1; $i -lt $lines.Count; $i++) {
         $a = ($lines[$i - 1] -replace '^\s+', '')
         $b = ($lines[$i] -replace '^\s+', '')
@@ -153,7 +153,7 @@ foreach ($f in ($files | Where-Object { $_.Extension -eq '.cpp' })) {
 # 规则：任何按 paths 逐段走并写字段的函数（WriteWatchValue），
 # 必须在**自己体内**出现 ensureIfValueType。写到别处去不算数。
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     $joined = ($lines -join "`n")
     if ($joined -notmatch 'static bool WriteWatchValue') { continue }
     $start = -1
@@ -231,7 +231,7 @@ foreach ($f in $files) {
 #   LOGx(...)   —— 日志是纯文本，`**` 在那里没问题
 #   第三方目录  —— imgui / asmjit 自己就有 `**DebugBreak**`
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -265,7 +265,7 @@ foreach ($f in $files) {
 # CollapsingHeader，就是缺陷。父条件是 Button / Checkbox / MenuItem
 # 这些「用户主动触发」的没问题 —— 那些本来就该在点了之后才执行。
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -322,7 +322,7 @@ foreach ($f in $files) {
 #   - 只看实参，不看「附近有什么」（那会误报一堆合法的缓存清理）
 #   - 条件里必须有 `else` 才放过（写成 else 就说明作者想过这件事）
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -notmatch '^if\s*\(!?\s*[\w:.]+\(') { continue }
@@ -376,7 +376,7 @@ foreach ($f in $files) {
 #
 # 所以要拦的是：绕过 FileWriter 直接 ofstream/fopen 写正式文件。
 foreach ($f in $files) {
-    $lines = Get-Content $f.FullName
+    $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -418,7 +418,7 @@ foreach ($f in $files) {
 # 而**误报的检查会被调低或干脆删掉**，那才是真正的损失。
 $workflow = Join-Path $root '.github/workflows/ci.yml'
 if (Test-Path $workflow) {
-    $wl = Get-Content $workflow
+    $wl = Get-Content -Encoding UTF8 $workflow
     for ($i = 0; $i -lt $wl.Count; $i++) {
         $cur = $wl[$i]
         $trim = $cur.Trim()
