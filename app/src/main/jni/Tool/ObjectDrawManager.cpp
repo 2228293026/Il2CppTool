@@ -1360,15 +1360,56 @@ static std::vector<GameObjectInfo> BuildUIObjectList() {
     return result;
 }
 
+// DrawUI 用的**非拥有**快照。
+//
+// 为什么不用 DrawObject 直接快照：GameObjectInfo 拥有 GC 句柄、拷贝构造
+// 被 delete 了（句柄只能有一个主人，拷贝会 double free）。
+// 所以早期实现写的是 `drawSnapshot = std::move(drawObjects)` ——
+// 那不是快照，那是**把绘制列表搬空**。
+//
+// 而 DrawUI 是在 `ImGui::BeginTabItem("对象绘制")` 里面调的，
+// 也就是**这一页可见的每一帧**都会搬一次。同一帧里后面的顺序是
+//
+//     DrawUI()   -> 把 drawObjects 搬空
+//     Tick()     -> 遍历 drawObjects（空的，什么都不更新）
+//     DrawAll()  -> 遍历 drawObjects（空的，**一个都不画**）
+//
+// 于是只要用户停在「对象绘制」这一页，ESP 就停了；要等下一次后台重扫
+// （5 秒间隔）才恢复 —— 表现是绘制每隔 5 秒闪一下。
+//
+// 而这一行代码只是要**显示**列表，所以下面这几个字段拷一份就够了，
+// 不需要转移所有权。
+struct DrawRow
+{
+    Il2CppObject *gameObject = nullptr; // 裸指针，仅用于显示与定位（回写按它找）
+    std::string name;                   // 拷贝出来的名字，UI 期间不依赖原对象
+    ImColor color;
+    float thickness = 2.0f;
+    bool drawLine = true;
+    bool drawBox = false;
+    bool drawCircle = false;
+};
+
 void ObjectDrawManager::DrawUI() {
-    // 快照。GameObjectInfo 是 move-only（句柄只能有一个主人），
-    // 所以这里必须是 move 而不是拷贝 —— 拷贝的话两个 vector 共用同一批
-    // gchandle，析构时就会 double free，把 GC 的句柄表写坏。
-    // 锁的作用域正好到 move 为止，之后 drawSnapshot 与 drawObjects 无关。
-    std::vector<DrawObject> drawSnapshot;
+    // 快照只拷**显示/编辑需要的那几个字段**，不碰所有权。
+    // 锁只护住「读 drawObjects」这一段：后面所有绘制都在锁外，
+    // 和第 24 轮那条「锁的作用域正好到 move 为止」的教训一致。
+    std::vector<DrawRow> drawSnapshot;
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_drawMutex);
-        drawSnapshot = std::move(drawObjects);
+        drawSnapshot.reserve(drawObjects.size());
+        for (const auto &d : drawObjects)
+        {
+            DrawRow row;
+            row.gameObject = d.target.gameObject;
+            row.name = d.target.name;
+            row.color = d.color;
+            row.thickness = d.thickness;
+            row.drawLine = d.drawLine;
+            row.drawBox = d.drawBox;
+            row.drawCircle = d.drawCircle;
+            drawSnapshot.push_back(std::move(row));
+        }
     }
 
     // UI 对象列表实时构建（只在打开UI时执行，不影响绘制性能）
@@ -1489,7 +1530,7 @@ void ObjectDrawManager::DrawUI() {
     std::unordered_set<Il2CppObject*> existing;
     existing.reserve(drawSnapshot.size() * 2);
     for (const auto& d : drawSnapshot) {
-        existing.insert(d.target.gameObject);
+        existing.insert(d.gameObject);
     }
 
     for (const auto& obj : gameSnapshot) {
@@ -1524,9 +1565,9 @@ void ObjectDrawManager::DrawUI() {
         for (size_t i = 0; i < drawSnapshot.size(); i++) {
             ImGui::PushID(i);
 
-            // 注意：drawSnapshot 是副本，回写必须按 gameObject 定位，
+            // 注意：drawSnapshot 是**字段副本**，回写必须按 gameObject 定位，
             // 不能用快照下标 i 去索引 drawObjects（两者大小可能不同 → 越界写）。
-            auto* go = drawSnapshot[i].target.gameObject;
+            auto* go = drawSnapshot[i].gameObject;
 
             // 名字长度不受控（GameObject 名字是游戏作者起的，可以很长），
             // 用表格给名字列一个上限宽度，后面两个控件固定宽 ——
@@ -1538,10 +1579,10 @@ void ObjectDrawManager::DrawUI() {
                 ImGui::TableSetupColumn("act", ImGuiTableColumnFlags_WidthFixed, 64.0f);
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(drawSnapshot[i].target.name.c_str());
+                ImGui::TextUnformatted(drawSnapshot[i].name.c_str());
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip("%s", drawSnapshot[i].target.name.c_str());
+                    ImGui::SetTooltip("%s", drawSnapshot[i].name.c_str());
                 }
                 ImGui::TableNextColumn();
                 ImVec4 color = ImGui::ColorConvertU32ToFloat4(drawSnapshot[i].color);
