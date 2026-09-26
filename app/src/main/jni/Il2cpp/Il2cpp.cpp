@@ -1612,8 +1612,16 @@ namespace Il2cpp
         // TODO: handle other unity versions
         std::vector<Il2CppObject *> FindObjects(Il2CppClass *klass)
         {
-            static auto unityVersion = getUnityVersion();
-            static bool unityVersionIsBelow202120 = UnityVersion::lt(unityVersion, "2021.2.0");
+            // 不要 static 缓存 unityVersion。
+            //
+            // getApplicationString 已经改成「失败不缓存、会重试」，但这里
+            // 又用 static 把它冻结成第一次读到的值 —— **上层的一次性缓存
+            // 会把下层的修复抵消掉**。读不到版本时，
+            // UnityVersion::lt(unityVersion, "2021.2.0") 拿到的是
+            // "unknown_unity_version"，比较结果可能选错分支，
+            // 而 static 让它错到会话结束。
+            const auto unityVersion = getUnityVersion();
+            const bool unityVersionIsBelow202120 = UnityVersion::lt(unityVersion, "2021.2.0");
             LOGD("Seaching objects for %s", klass->getFullName().c_str());
 
             std::vector<Il2CppObject *> objects;
@@ -1703,11 +1711,35 @@ namespace Il2cpp
             LOGD("Found %lu objects", objects.size());
             return objects;
         }
-        // is this function actually work?
+        // 原注释就写着 "is this function actually work?" —— 现在至少
+        // 不会因为拿不到类就崩。
+        //
+        // 旧代码：
+        //     static auto SystemGC = FindClass("System.GC");
+        //     SystemGC->invoke_static_method<void>("KeepAlive", object);
+        // 同样的两个问题：判空缺失（必崩）+ static 把 null 永久缓存
+        // （早失败 = 整个会话 KeepAlive 都崩）。
+        //
+        // KeepAlive 的作用只是「让 GC 认为对象还被使用」，属于优化而非
+        // 正确性必需 —— 真正保活靠的是 GCHandle。所以拿不到类时安静
+        // 跳过、只记一条日志，是合理的降级。
         void KeepAlive(Il2CppObject *object)
         {
-            static auto SystemGC = FindClass("System.GC");
-            SystemGC->invoke_static_method<void>("KeepAlive", object);
+            if (object == nullptr)
+            {
+                return;
+            }
+            static Il2CppClass *systemGC = nullptr;
+            if (systemGC == nullptr)
+            {
+                systemGC = FindClass("System.GC");
+                if (systemGC == nullptr)
+                {
+                    LOGW("GC::KeepAlive: 找不到 System.GC，跳过（对象保活靠 GCHandle，不影响正确性）");
+                    return;
+                }
+            }
+            systemGC->invoke_static_method<void>("KeepAlive", object);
         }
 
         uint32_t NewHandle(Il2CppObject *object, bool pinned)

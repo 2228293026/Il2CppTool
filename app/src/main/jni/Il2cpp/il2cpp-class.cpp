@@ -696,9 +696,40 @@ MethodInfo *MethodInfo::inflate(std::initializer_list<Il2CppClass *> types)
         LOGE("Types generic count doesn't match");
         return nullptr;
     }
-    static auto corlib = Il2cpp::GetCorlib();
-    static auto systemType = corlib->getClass("System.Type");
+    // 解析 System.Type 所在的 corlib。
+    //
+    // 旧代码：
+    //     static auto corlib = Il2cpp::GetCorlib();
+    //     static auto systemType = corlib->getClass("System.Type");
+    // 两处问题：
+    //  1) corlib 没判空就解引用 —— GetCorlib() 失败（初始化太早 / 元数据
+    //     被裁剪）就是**必崩**的空指针解引用。
+    //  2) static 局部变量意味着「第一次拿到的 null 会永久缓存」。
+    //     于是「早了一点」会变成**整个会话调用泛型方法都崩**。
+    //
+    // 改成每次重试：代价只是一次类查找（内部有缓存），换来能自动恢复。
+    static Il2CppClass *systemType = nullptr;
+    if (systemType == nullptr)
+    {
+        auto *corlib = Il2cpp::GetCorlib();
+        if (corlib == nullptr)
+        {
+            LOGE("inflate: 拿不到 corlib，无法解析 System.Type");
+            return nullptr;
+        }
+        systemType = corlib->getClass("System.Type");
+        if (systemType == nullptr)
+        {
+            LOGE("inflate: corlib 里找不到 System.Type");
+            return nullptr;
+        }
+    }
     auto array = Il2cpp::ArrayNewGeneric<Il2CppObject *>(systemType, types.size());
+    if (array == nullptr)
+    {
+        LOGE("inflate: 分配 Type 数组失败（长度 %zu）", types.size());
+        return nullptr;
+    }
     int i = 0;
     for (auto type : types)
     {
@@ -719,9 +750,29 @@ Il2CppClass *Il2CppClass::inflate(std::initializer_list<Il2CppClass *> types)
     //     LOGE("Types generic count doesn't match");
     //     return nullptr;
     // }
-    static auto corlib = Il2cpp::GetCorlib();
-    static auto systemType = corlib->getClass("System.Type");
+    // 同上：不判空 + static 永久缓存，是同一个坑。
+    static Il2CppClass *systemType = nullptr;
+    if (systemType == nullptr)
+    {
+        auto *corlib = Il2cpp::GetCorlib();
+        if (corlib == nullptr)
+        {
+            LOGE("Il2CppClass::inflate: 拿不到 corlib，无法解析 System.Type");
+            return nullptr;
+        }
+        systemType = corlib->getClass("System.Type");
+        if (systemType == nullptr)
+        {
+            LOGE("Il2CppClass::inflate: corlib 里找不到 System.Type");
+            return nullptr;
+        }
+    }
     auto array = Il2cpp::ArrayNewGeneric<Il2CppObject *>(systemType, types.size());
+    if (array == nullptr)
+    {
+        LOGE("Il2CppClass::inflate: 分配 Type 数组失败（长度 %zu）", types.size());
+        return nullptr;
+    }
     int i = 0;
     for (auto type : types)
     {
