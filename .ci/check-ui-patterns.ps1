@@ -383,7 +383,16 @@ foreach ($f in $files) {
         # Util.cpp 里的就是实现本身；dump 走的是自己的进度/取消通道
         if ($f.Name -eq 'Util.cpp') { continue }
         if ($f.Name -eq 'Il2cpp.cpp') { continue }
-        if ($t -match '^\s*std::ofstream\s+\w+\s*\(' -or $t -match '^\s*std::fstream\s+\w+\s*\(') {
+        # 标识符用 [^\s(]+ 而不是 \w —— C++ 完全允许 UTF-8 标识符
+        # （写个「写文件」当变量名是合法的），而 \w 在某些编码下
+        # 匹配不到非 ASCII 字母，会让这条规则**静默漏掉**它们。
+        # 第 90 轮 CI 就是在这一点上红过一次。
+        #
+        # 另一个坑（本轮自己踩的）：`(o|f)stream` **匹配不到 ofstream** ——
+        # ofstream 是 o+f+stream，两个都试一遍也对不上。
+        # 「让规则更通用」的小改动，反而让它彻底静默失效 ——
+        # 和第 63 轮那次是同一个错误形状。
+        if ($t -match '^\s*std::(of|o|f|i)stream\s+[^\s(]+\s*\(') {
             $hits += [pscustomobject]@{
                 File = $f.Name
                 Line = $i + 1

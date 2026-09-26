@@ -161,7 +161,14 @@ Test-Rule 'G 绕过 FileWriter 直写' {
         if ($ls[$k] -match 'Util::FileWriter fileWriter\("tool_conf\.json"\);') { $i = $k; break }
     }
     if ($i -lt 0) { return $false }
-    $ls.Insert($i, '    std::ofstream 直写("tool_conf.json");')
+        # 注入的标识符**必须用 ASCII**。
+    #
+    # 第 90 轮 CI 红过一次而本地绿：本地注入的是 `std::ofstream 直写(...)`，
+    # 规则 G 的 `^\s*std::ofstream\s+\w+\s*\(` 匹配上了；到了 CI 上
+    # 这一行的中文被按别的编码读成乱码，`\w` 就不匹配了 ——
+    # 门禁**自己的测试**依赖了字符编码，这件事本身就是脆弱的。
+    # 换成 ASCII 之后与编码无关。
+    $ls.Insert($i, '    std::ofstream directWrite("tool_conf.json");')
     [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
         ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
     return $true
