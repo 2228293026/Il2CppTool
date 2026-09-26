@@ -145,6 +145,32 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 9. 规则 F：第 80 轮那个 bug 原样注入，必须被抓到 ----
+$fCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'F 失败后清掉恢复数据' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'if \(!RestorePatchedMethod\(method, o\.bytes\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # 把「成功才清」的那 18 行换成第 80 轮的无条件版本
+    $ls.RemoveRange($i, 18)
+    $ls.InsertRange($i, [System.Collections.ArrayList]@(
+        '                if (!RestorePatchedMethod(method, o.bytes))',
+        '                {',
+        '                    LOGE("恢复失败: %s", method->getName() ? method->getName() : "?");',
+        '                }',
+        '                o.bytes.clear();',
+        '                o.text.clear();'
+    ))
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $fCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 # ---- 8. 规则 E：把第 83 轮那个 bug 原样注入，必须被抓到 ----
 # 这是**同一个真实缺陷**的复现，不是造一个假的：第 83 轮
 # 「折叠关注值 → 冻结全停」就是这么写的。

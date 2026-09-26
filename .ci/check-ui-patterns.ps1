@@ -288,6 +288,70 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 F：失败之后无条件清掉**恢复要用的那份数据** ----
+#
+# 第 80 轮的真实 bug：
+#
+#     if (!RestorePatchedMethod(method, o.bytes)) { LOGE("恢复失败"); }
+#     o.bytes.clear();          // ← 无条件
+#     o.text.clear();
+#
+# 恢复失败（mprotect 失败等）之后：补丁**还在内存里生效**，
+# 而**原字节已经被清掉了** —— 退不回去、也不能重试；
+# `patched = !o.bytes.empty()` 变成 false，界面上还显示「没打补丁」。
+#
+# 之所以能做这条规则，是因为这个形状足够窄：
+# **条件里那个调用的实参，在同一个 if 之后被无条件清掉**。
+# `o.bytes` 既是「恢复函数的输入」，又是「失败后被销毁的东西」——
+# 这一条就足以判定，不需要理解业务。
+#
+# 故意收窄：
+#   - 只看实参，不看「附近有什么」（那会误报一堆合法的缓存清理）
+#   - 条件里必须有 `else` 才放过（写成 else 就说明作者想过这件事）
+foreach ($f in $files) {
+    $lines = Get-Content $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -notmatch '^if\s*\(!?\s*[\w:.]+\(') { continue }
+        $m = [regex]::Match($t, '\(([^)]*)\)')
+        if (-not $m.Success) { continue }
+        $args = @($m.Groups[1].Value -split ',' |
+                  ForEach-Object { $_.Trim() } |
+                  Where-Object { $_ -match '^[\w\.\->]+$' })
+        if ($args.Count -eq 0) { continue }
+        $ind = ($lines[$i] -replace '^(\s*).*', '$1').Length
+        $j = $i
+        while ($j -lt $lines.Count) {
+            if (($lines[$j] -replace '^(\s*).*', '$1').Length -eq $ind -and $lines[$j].Trim() -eq '}') { break }
+            $j++
+        }
+        if ($j -ge $lines.Count) { continue }
+        # 有 else = 作者考虑过失败路径，放过
+        for ($k = $j + 1; $k -le [Math]::Min($j + 2, $lines.Count - 1); $k++) {
+            if (($lines[$k] -replace '^(\s*).*', '$1').Length -eq $ind -and $lines[$k].Trim() -match '^else\b') {
+                $j = -1
+                break
+            }
+        }
+        if ($j -lt 0) { continue }
+        for ($k = $j + 1; $k -le [Math]::Min($j + 4, $lines.Count - 1); $k++) {
+            $u = $lines[$k].Trim()
+            if (($lines[$k] -replace '^(\s*).*', '$1').Length -ne $ind) { continue }
+            foreach ($a in $args) {
+                $esc = [regex]::Escape($a)
+                if ($u -match "^$esc(\.clear\(\)|\.erase\(| = 0;| = nullptr;)") {
+                    $hits += [pscustomobject]@{
+                        File = $f.Name
+                        Line = $k + 1
+                        Rule = 'F: 恢复函数失败后无条件清掉了它的实参（原数据没了，退不回去）'
+                        Text = $u
+                    }
+                }
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
