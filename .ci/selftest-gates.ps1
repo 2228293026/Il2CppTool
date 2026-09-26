@@ -234,7 +234,16 @@ Test-Rule 'J 裸参数形状（ResolveSaved）' {
 # check-ui-patterns.ps1 的 $dirs 少了 Il2cpp，5009 行 Il2cpp.cpp / Il2cpp.h
 # 对规则 A / A2 / B2 / D / E / F / G / H / I / J 全都是不可见的。
 $covCheck = {
-    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-all.ps1', '-SkipSelfTest')
+    # -SkipClangTidy 是**必须**的（第 112 轮）。
+    #
+    # 这一条要验的是「check-all 的扫描范围元检查能发现目录被拿掉」。
+    # 跑整个 check-all 会顺带跑 clang-tidy，而 clang-tidy 需要 NDK_PATH。
+    # 没设这个环境变量时它会失败 -> 非 0 -> 自检报「还原后绿=False」，
+    # 而**代码其实完全正常**。
+    #
+    # 也就是说这条自检的成败取决于**跑它的人有没有配好 NDK** ——
+    # 一个「在我机器上是红的」的检查，比没有更糟。
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-all.ps1', '-SkipSelfTest', '-SkipClangTidy')
 }
 Test-Rule 'K 扫描范围含 Il2cpp' {
     param($t)
@@ -323,6 +332,34 @@ Test-Rule 'N 进托管代码的 invoke 要有边界' {
         ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
     return $true
 } $n2Check 'app/src/main/jni/Il2cpp/il2cpp-class.h'
+
+# ---- 20. 规则 O：把「日志函数会抛」复现出来（第 112 轮）----
+#
+# 这条规则写出来之后**第一次跑就是红的**（7 处），因为 Logger.cpp 里的
+# 函数确实都会抛。中间还卡了两次：先把 `{` 要求在同一行（没匹配上，
+# 显示为「通过」），又先把行 trim 掉再要求 `^ {4}`（同样没匹配上）。
+# 两次都是「看起来是绿的」，靠人肉盯着那条 0 命中才发现。
+$oCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'O 日志函数不许往外抛' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'void AddLog\(const char \*prefix') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ty = -1
+    for ($k = $i; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*try\s*$' -and $ls[$k - 1] -match '它自己不能再是第一个崩的地方') { $ty = $k; break }
+    }
+    if ($ty -lt 0) { return $false }
+    $ls[$ty] = '        ; // 第 112 轮之前的样子'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Includes/Logger.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $oCheck 'app/src/main/jni/Includes/Logger.cpp'
 
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {

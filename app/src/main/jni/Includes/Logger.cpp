@@ -1,6 +1,7 @@
 #include "Logger.h"
 
 #include "imgui/imgui.h"
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <string.h>
@@ -37,59 +38,120 @@ namespace logger
     constexpr int kMaxLogBytes = 512 * 1024;
     int g_droppedLines = 0; // 因超限被丢弃的行数（UI 上如实告知用户）
 
+    // 因为**记不下来**而丢掉的日志条数（第 112 轮）。
+    //
+    // AddLog 现在有一层边界（它会在 catch 块里被调，抛出去就是 terminate）。
+    // catch 里必须什么都不做 —— 但「什么都不做」意味着**有一条诊断信息
+    // 悄悄没了**，而排障的人正需要它。
+    //
+    // 所以记一个数，UI 上如实显示：这和「因超限丢弃」是两回事，
+    // 前者是内存不够（很可疑），后者是 512KB 上限（正常）。
+    std::atomic<long> g_droppedWrites{0};
+
+    long DroppedWrites()
+    {
+        // 这个函数本身不会抛（就是读一个 atomic），但规则 O 是统一的：
+        // Includes/Logger.cpp 里每个函数都要有边界，**不加例外** ——
+        // 「这个函数不会抛」这种判断在代码演进中很容易失效。
+        try
+        {
+            return g_droppedWrites.load(std::memory_order_relaxed);
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+    }
+
+    // 注意：**调用方已经持着 g_logMutex**（AddLog 在自己的临界区里调它）。
+    //
+    // 所以这里绝对不能再去 lock —— 那是同一把非递归互斥量，
+    // 第二次 lock 直接死锁。而异常边界因此只能写 catch 块：
+    // 一旦 TrimLocked 抛出，锁会被 AddLog 的 lock_guard 释放，
+    // 但 Buf/LineOffsets 可能已经不一致 —— 那种情况下**什么都别动**，
+    // 让日志少几行，比让 Draw 切出越界的行号安全得多。
     void TrimLocked()
     {
-        if (Buf.size() <= kMaxLogBytes)
+        try
         {
-            return;
-        }
-        // 找保留起点：向前越过 kMaxLogBytes，再往回找最近的换行，
-        // 保证从整行的开头开始保留。
-        int keepFrom = Buf.size() - kMaxLogBytes;
-        while (keepFrom > 0 && Buf[keepFrom - 1] != '\n')
-        {
-            keepFrom--;
-        }
-
-        std::string tail(Buf.begin() + keepFrom, Buf.begin() + Buf.size());
-
-        // 统计被丢掉的行数，供 UI 显示。
-        int dropped = 0;
-        for (int i = 0; i < keepFrom; i++)
-        {
-            if (Buf[i] == '\n')
+            if (Buf.size() <= kMaxLogBytes)
             {
-                dropped++;
+                return;
+            }
+            // 找保留起点：向前越过 kMaxLogBytes，再往回找最近的换行，
+            // 保证从整行的开头开始保留。
+            int keepFrom = Buf.size() - kMaxLogBytes;
+            while (keepFrom > 0 && Buf[keepFrom - 1] != '\n')
+            {
+                keepFrom--;
+            }
+
+            std::string tail(Buf.begin() + keepFrom, Buf.begin() + Buf.size());
+
+            // 统计被丢掉的行数，供 UI 显示。
+            int dropped = 0;
+            for (int i = 0; i < keepFrom; i++)
+            {
+                if (Buf[i] == '\n')
+                {
+                    dropped++;
+                }
+            }
+            g_droppedLines += dropped;
+
+            Buf.clear();
+            LineOffsets.clear();
+            LineOffsets.push_back(0);
+            Buf.append(tail.c_str(), tail.c_str() + tail.size());
+            const char *begin = Buf.begin();
+            for (int i = 0; i < Buf.size(); i++)
+            {
+                if (begin[i] == '\n')
+                {
+                    LineOffsets.push_back(i + 1);
+                }
             }
         }
-        g_droppedLines += dropped;
-
-        Buf.clear();
-        LineOffsets.clear();
-        LineOffsets.push_back(0);
-        Buf.append(tail.c_str(), tail.c_str() + tail.size());
-        const char *begin = Buf.begin();
-        for (int i = 0; i < Buf.size(); i++)
+        catch (...)
         {
-            if (begin[i] == '\n')
-            {
-                LineOffsets.push_back(i + 1);
-            }
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默：缓冲区超限顶多让内存多占一点，
+            // 但 throw 出去会一路穿到 hook 回调里（第 112 轮）。
         }
     }
 
     int DroppedLines()
     {
-        std::lock_guard<std::mutex> guard(g_logMutex);
-        return g_droppedLines;
+        // 异常边界（第 112 轮）：日志函数绝不能把调用方带崩。
+        // 它会在 catch 块里被调（LOGE 展开就是 AddLog），
+        // 而 catch 里抛异常 = 边展开边抛 = std::terminate。
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            return g_droppedLines;
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默：记不下来就算了，日志不该有任何副作用。
+            return 0;
+        }
     }
 
     void Clear()
     {
-        std::lock_guard<std::mutex> guard(g_logMutex);
-        Buf.clear();
-        LineOffsets.clear();
-        LineOffsets.push_back(0);
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            Buf.clear();
+            LineOffsets.clear();
+            LineOffsets.push_back(0);
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // void AddLog(const char *fmt, ...)
@@ -106,6 +168,28 @@ namespace logger
 
     void AddLog(const char *prefix, const char *fmt, ...)
     {
+        // **整段包在边界里**（第 112 轮）—— 这是最要紧的一个。
+        //
+        // 一个日志函数必须做到：**记不下来就算了，绝不能把调用方带崩。**
+        //
+        // 为什么这么要紧：下面四样都会抛
+        //     new char[...]          bad_alloc
+        //     Buf.appendfv           内部要分配
+        //     LineOffsets.push_back  bad_alloc
+        //     TrimLocked 里的 std::string tail
+        //
+        // 而 AddLog 是从**哪里**被调的？
+        //   · hook 回调里（hookerHandler / get_touchCount / swapbuffers_hook）
+        //   · 第 110/111 轮新加的那些 **catch 块里面**
+        //
+        // 在 catch 里抛 = **边展开边抛 = std::terminate**。
+        // 也就是说：为了「异常不弄崩游戏」而加的 catch，
+        // 如果自己打日志时内存不够，会**比不加 catch 更糟**。
+        //
+        // 边界必须在这里 —— 日志是**最后一道**防线，
+        // 它自己不能再是第一个崩的地方。
+        try
+        {
         // 整段临界区：old_size 的读取、append、扫描 '\n' 填充 LineOffsets
         // 必须原子完成，否则 LineOffsets 会和 Buf 对不上（行号指向错位的
         // 位置，Draw 里会切出乱码甚至越界）。
@@ -131,50 +215,85 @@ namespace logger
                 LineOffsets.push_back(old_size + 1);
 
         TrimLocked();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 故意什么都不做：日志页丢一行，远好过把游戏带崩。
+            //
+            // 也不往 logcat 补写 —— 那会再走一遍 AddLog，递归下去
+            // 只会把同一块堆反复戳。宏里那条 __android_log_print
+            // 是独立的路，AddLog 失败时它照样会执行。
+        }
     }
 
     // 界面上有哪些行（供「错误数」角标用）。
     int ErrorCount()
     {
-        std::lock_guard<std::mutex> guard(g_logMutex);
-        const char *begin = Buf.begin();
-        int total = Buf.size();
-        int count = 0;
-        // 只扫开头那几个字节，够判断前缀是不是 "[E] " 即可。
-        for (int i = 0; i + 3 < total; i++)
+        try
         {
-            if (Buf[i] == '\n')
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            const char *begin = Buf.begin();
+            int total = Buf.size();
+            int count = 0;
+            // 只扫开头那几个字节，够判断前缀是不是 "[E] " 即可。
+            for (int i = 0; i + 3 < total; i++)
             {
-                break;
+                if (Buf[i] == '\n')
+                {
+                    break;
+                }
+                if (begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+                {
+                    count = 1; // 第一行就是错误
+                    break;
+                }
             }
-            if (begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+            for (int i = 1; i + 3 < total; i++)
             {
-                count = 1; // 第一行就是错误
-                break;
+                if (Buf[i - 1] == '\n' && begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
+                {
+                    count++;
+                }
             }
+            return count;
         }
-        for (int i = 1; i + 3 < total; i++)
+        catch (...)
         {
-            if (Buf[i - 1] == '\n' && begin[i] == '[' && begin[i + 1] == 'E' && begin[i + 2] == ']')
-            {
-                count++;
-            }
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            return 0;
         }
-        return count;
     }
 
     // 整个缓冲区导出成一个字符串，供「复制到剪贴板」用。
     std::string CopyText()
     {
-        std::lock_guard<std::mutex> guard(g_logMutex);
-        const char *begin = Buf.begin();
-        int total = Buf.size();
-        return total > 0 ? std::string(begin, begin + total) : std::string();
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_logMutex);
+            const char *begin = Buf.begin();
+            int total = Buf.size();
+            return total > 0 ? std::string(begin, begin + total) : std::string();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 复制失败就是复制失败，返回空串；
+            // 绝不能在这里抛 —— 它是从界面上调的，而空串用户看得懂。
+            return std::string();
+        }
     }
 
     // NEVER CALL LOG HERE
+    //
+    // 「不要在这里调 LOG」的原因是老规矩：Draw 期间 ImGui 的窗口栈正在被
+    // 操作，中途 Begin 一堆新窗口会破坏配对。第 112 轮再加一条：
+    // Draw 本身也不许往外抛 —— 它跑在**渲染线程**上，也就是
+    // eglSwapBuffers 钩子里，抛出去和 hook 里抛出去是一个后果。
     void Draw(const char *title, bool *p_open)
     {
+        try
+        {
         // if (!ImGui::Begin(title, p_open))
         //{
         //     ImGui::End();
@@ -220,6 +339,18 @@ namespace logger
             {
                 // 如实告知，而不是让人以为日志莫名消失。
                 ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "已丢弃最早的 %d 行（超出 512KB 上限）", dropped);
+            }
+        }
+        {
+            // 「写不进去」和「超出上限」是**两回事**，必须分开说（第 112 轮）。
+            // 后者是正常行为；前者说明内存吃紧，**排障信息正在丢失** ——
+            // 而用户此时正需要日志。这条一旦静默，工具就成了瞎子。
+            long unwritten = DroppedWrites();
+            if (unwritten > 0)
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                                   "有 %ld 条日志【没能记下来】（多半是内存不足）—— 排障信息正在丢失",
+                                   unwritten);
             }
         }
 
@@ -408,5 +539,12 @@ namespace logger
         ImGui::EndChild();
         ImGui::PopFont();
         // ImGui::End();
+        }
+        catch (...)
+        {
+            g_droppedWrites.fetch_add(1, std::memory_order_relaxed);
+            // 静默。这里绝不能去平衡 Begin/End —— 出错时配对可能已经残缺，
+            // 再动只会让 ImGui 的状态更糟。下一帧重新开始即可。
+        }
     }
 }; // namespace logger

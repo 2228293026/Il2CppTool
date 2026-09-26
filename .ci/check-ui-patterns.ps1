@@ -672,6 +672,62 @@ foreach ($f in $files) {
         $hookNames[$m.Groups[1].Value] = $true
     }
 }
+# ---- 模式 O：日志函数**不许往外抛异常** ----
+#
+# 第 112 轮。LOGW/LOGE/LOGI 全部展开成 `logger::AddLog(...)`，而 AddLog 里是
+#
+#     new char[modifiedFmtLength + 2];      // bad_alloc
+#     Buf.appendfv(...)                     // 内部要分配
+#     LineOffsets.push_back(...)            // bad_alloc
+#     TrimLocked() 里的 std::string tail    // bad_alloc
+#
+# 四处都会抛。而 AddLog 是从**哪里**被调的？
+#
+#   · hook 回调里（hookerHandler / get_touchCount / swapbuffers_hook）
+#   · 第 110/111 轮我刚加的那些 **catch 块里面**
+#
+# 在 catch 里抛 = **边展开边抛 = std::terminate**。
+# 也就是说：为了让「异常不弄崩游戏」而加的 catch，如果自己打日志时
+# 内存不够，会**比不加 catch 更糟** —— 直接 terminate。
+#
+# 一个日志函数必须做到：记不下来就算了，绝不能把调用方带崩。
+# 所以本规则要求 Includes/Logger.cpp 里每个函数体都有边界。
+foreach ($f in $files) {
+    if ($f.Name -ne 'Logger.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 命名空间内的函数定义（缩进 4、空格、无模板、无分号）。
+        #
+        # 缩进要拿**没 trim 的那一行**去匹配：先把行 trim 掉再要求 `^ {4}`
+        # 永远不可能成立 —— 第一版就是这么写的，于是一条都没匹配上。
+        if ($lines[$i] -notmatch '^ {4}\S' ) { continue }
+        if ($t -notmatch '^(const\s+)?[\w:]+[\w\s:<>,\*&]*\s\**(\w+)\s*\([^;]*$') { continue }
+        # `{` 常常在**下一行**（这个项目里大多数函数定义都是这样写的）。
+        # 第一版只认同行，结果一条都没匹配上 —— 又一条「显示为通过的假检查」。
+        $openAt = $i
+        if ($t -notmatch '\{\s*$') {
+            if (($i + 1) -lt $lines.Count -and $lines[$i + 1].Trim() -eq '{') { $openAt = $i }
+            else { continue }
+        }
+        $ind = ($lines[$openAt] -replace '^(\s*).*', '$1').Length
+        $body = @()
+        for ($m = $openAt; $m -lt $lines.Count; $m++) {
+            $body += $lines[$m]
+            if ($lines[$m].Trim() -eq '}' -and ($lines[$m] -replace '^(\s*).*', '$1').Length -eq $ind) { break }
+        }
+        $bt = $body -join "`n"
+        if ($bt -notmatch '\btry\s*\{') {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'O: 日志函数可能往外抛（它是在 catch 里被调的，抛出去就是 terminate）'
+                Text = $t
+            }
+        }
+    }
+}
 foreach ($name in $invFamily) {
     foreach ($f in $files) {
         if ($f.Extension -ne '.cpp' -and $f.Extension -ne '.h') { continue }
