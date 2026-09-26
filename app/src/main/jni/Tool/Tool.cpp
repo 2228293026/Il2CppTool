@@ -242,6 +242,16 @@ namespace Tool
                 break;
             }
         }
+        // 兜底：一个都复制不到时（新开的第一个 tab，或者刚把标签页
+        // 全关掉之后新开的那个）就退回第一个程序集。
+        //
+        // 原来这里留的是 nullptr，而 ClassesTab::Draw() 会直接
+        // `selectedImage->getName()` —— 于是「把标签页全关掉」
+        // 会在下一帧**崩掉用户的游戏进程**。
+        if (clone.selectedImage == nullptr && !g_Images.empty())
+        {
+            clone.selectedImage = g_Images.front();
+        }
         return classesTabs.emplace_back(clone);
     }
     ClassesTab &OpenNewTabFromClass(Il2CppClass *klass)

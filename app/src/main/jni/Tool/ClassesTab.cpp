@@ -2995,9 +2995,16 @@ void ClassesTab::Draw(int index, bool closeable)
         setOpenedTab = false;
         ImGui::BeginDisabled(includeAllImages);
         ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(-1, io.DisplaySize.y / 1.5f));
-        if (ImGui::BeginCombo("Image##ImageSelector", selectedImage->getName()))
+        // selectedImage 可能为 nullptr：OpenNewTab() 只是从**当前打开的**
+        // 那个 tab 复制它，而「把标签页全关掉」之后新开的那个 tab
+        // 一个都复制不到 —— selectedImage 就一直是 null。
+        // 下一帧 Draw() 走到这里，旧代码直接 selectedImage->getName()
+        // → 空指针解引用 → **用户的游戏进程崩掉**。
+        // （同一个文件 3295 行早就写了 `(selectedImage ? ... : "")`，
+        //  说明这个 null 是预料之中的，只是这里漏了。）
+        const char *imageLabel = selectedImage ? selectedImage->getName() : "(未选择程序集)";
+        if (ImGui::BeginCombo("Image##ImageSelector", imageLabel))
         {
-
             for (int i = 0; i < g_Images.size(); i++)
             {
                 bool selected = selectedImageIndex == i;
@@ -4846,7 +4853,10 @@ void to_json(nlohmann::ordered_json &j, const ClassesTab &p)
     j["showAllClasses"] = p.showAllClasses;
     j["includeAllImages"] = p.includeAllImages;
     j["caseSensitive"] = p.caseSensitive;
-    j["selectedImage"] = p.selectedImage->getName();
+    // 同上：selectedImage 可能为 nullptr（见 2998 处的说明）。
+    // 这里是 ConfigSave 路径，崩了的后果更奇怪 —— 用户点「保存配置」
+    // 游戏就崩，而配置没存下来。
+    j["selectedImage"] = p.selectedImage ? p.selectedImage->getName() : "";
 
     // 参数预设。
     //
