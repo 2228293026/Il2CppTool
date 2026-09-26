@@ -15,6 +15,7 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <set>
 #include <unordered_map>
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
@@ -1491,10 +1492,11 @@ namespace Il2cpp
     static std::string getApplicationString(const char *property, const char *fallback)
     {
         // 缓存结果：这些值在进程生命周期内不变。
-        // 注意 fallback 也要缓存 —— 否则每次失败都打一条日志，
-        // 扫描线程每秒调几次会把日志刷爆。
         static std::mutex cacheMutex;
         static std::unordered_map<std::string, std::string> cache;
+        // 已经报过错的属性：失败时重试，但**只报一次**。
+        // （自检页每 2 秒读一次版本号，不限流就是每 2 秒一行 LOGE。）
+        static std::set<std::string> warnedProperties;
 
         {
             std::lock_guard<std::mutex> guard(cacheMutex);
@@ -1506,17 +1508,18 @@ namespace Il2cpp
         }
 
         std::string result = fallback;
+        bool ok = false;
         auto *Application = FindClass("UnityEngine.Application");
         if (Application == nullptr)
         {
-            LOGE("找不到 UnityEngine.Application（%s 退化为 %s）", property, fallback);
+            // 统一在下面报一次
         }
         else
         {
             auto *method = Application->getMethod(property);
             if (method == nullptr)
             {
-                LOGE("UnityEngine.Application 没有 %s", property);
+                // 统一在下面报一次
             }
             else
             {
@@ -1526,25 +1529,37 @@ namespace Il2cpp
                     if (value)
                     {
                         result = value->to_string();
+                        ok = true;
                     }
-                    else
-                    {
-                        LOGE("读取 %s 返回空", property);
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    LOGE("读取 %s 抛出异常: %s", property, e.what());
                 }
                 catch (...)
                 {
-                    LOGE("读取 %s 抛出未知异常", property);
+                    // 统一在下面报一次
                 }
             }
         }
 
         std::lock_guard<std::mutex> guard(cacheMutex);
-        cache[property] = result;
+        // **只缓存成功**。
+        //
+        // 这些值（Application.version / unityVersion / productName …）有可能在
+        // 游戏的静态初始化跑完**之前**就被读一次 —— 工具的 on_init 并不
+        // 保证晚于游戏的初始化。一旦那时候读失败，空结果被缓存下来，
+        // 之后每次都直接返回空 → 界面上永远是「?」，而且**没有任何办法
+        // 恢复**，除非重启游戏。
+        //
+        // 失败时改成重试。但重试要**限流**：自检页每 2 秒读一次
+        // getUnityVersion()/getGameVersion()，不限流就是每 2 秒一行 LOGE，
+        // 日志很快被刷满。所以每个属性只报一次错。
+        if (ok)
+        {
+            cache[property] = result;
+        }
+        else if (warnedProperties.insert(property).second)
+        {
+            LOGE("读取 UnityEngine.Application.%s 失败，本次显示为 %s（后续会重试）",
+                 property, fallback);
+        }
         return result;
     }
 

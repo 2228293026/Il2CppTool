@@ -160,7 +160,18 @@ std::vector<Result> Collect()
         const std::string game = Il2cpp::getGameVersion();
         char buf[256]{0};
         snprintf(buf, sizeof(buf), "Unity %s / 游戏 %s", unity.c_str(), game.c_str());
-        out.push_back(Info("目标", buf));
+        // 读不到版本**不代表工具坏了** —— 有些游戏裁掉了这些属性，
+        // 或者工具初始化得比游戏早。所以是警告不是失败。
+        if (unity.empty() && game.empty())
+        {
+            out.push_back(Info("目标（版本）",
+                               "读不到 Unity / 游戏版本 —— 可能游戏裁掉了这些属性，"
+                               "也可能工具初始化早于游戏。不影响其他功能"));
+        }
+        else
+        {
+            out.push_back(Info("目标", buf));
+        }
     }
 
     // ---- 构建期开关 ----
