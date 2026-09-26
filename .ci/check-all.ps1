@@ -94,6 +94,38 @@ if (-not $SkipSelfTest) {
     }
 }
 
+# ---- 门禁自己声明编码 ----
+#
+# 第 92 轮：Windows PowerShell 5.1 的 Get-Content 不带 -Encoding 时
+# 按**系统 ANSI** 读文件（这台机器是 GBK），于是
+#
+#     "**未运行**"   UTF-8: 22 2A 2A E6 9C AA E8 BF 90 E8 A1 8C 2A 2A 22
+#                GBK:  "**鏈繍琛?*"      <- 8C 2A 非法组合，两个字节一起吃掉
+#
+# 规则 D 找 `\*\*`，本地只看到一个 `*` -> 绿；CI（Linux/UTF-8）-> 红。
+#
+# 也就是说：**所有基于文本的门禁，在不同机器上给出不同答案**，
+# 而门禁的全部意义就是「哪里都一样的同一个答案」。
+#
+# 所以这条不是「记得加 -Encoding」，是**结构上禁止**：
+# 门禁脚本里任何读文本的地方都必须显式声明编码。
+Invoke-Check '门禁自身声明编码' {
+    $bad = @()
+    foreach ($g in Get-ChildItem .ci -Filter *.ps1 -File) {
+        foreach ($m in (Select-String -Path $g.FullName -Encoding UTF8 -Pattern 'Get-Content|Select-String')) {
+            if ($m.Line -match '^\s*#') { continue }
+            # Get-FileHash / Select-String 的输出管道不算读文件
+            if ($m.Line -notmatch '(-Path|\s)\$?\w') { continue }
+            if ($m.Line -notmatch '-Encoding') { $bad += "$($g.Name):$($m.LineNumber)" }
+        }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host "  下面这些读文本的地方没有声明编码（会跟着系统区域设置走）："
+        foreach ($b in $bad) { Write-Host "    $b" }
+        $script:rc = 1
+    }
+}
+
 Invoke-Check '结构完整（花括号配平）' {
     powershell -ExecutionPolicy Bypass -File .\.ci\check-structure.ps1
     if ($LASTEXITCODE -ne 0) { $script:rc = 1 }

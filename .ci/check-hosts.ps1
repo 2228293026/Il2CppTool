@@ -35,7 +35,7 @@ $sources = Get-ChildItem app/src/main/jni -Recurse -Include *.cpp -File |
 foreach ($e in $expect) {
     $sites = @()
     foreach ($f in $sources) {
-        $m = Select-String -Path $f.FullName -Pattern ([regex]::Escape($e.Func) + '\(\);')
+        $m = Select-String -Path $f.FullName -Encoding UTF8 -Pattern ([regex]::Escape($e.Func) + '\(\);')
         foreach ($hit in $m) { $sites += $hit }
     }
     if ($sites.Count -ne 1) {
