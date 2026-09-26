@@ -4213,9 +4213,15 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     iss >> type >> val;
                     if (strcmp(type.c_str(), "String") == 0)
                     {
+                        // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                        // 直接父对象，key 是它的直接子字段。传整条 paths 会从
+                        // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug：
+                        // 撤销因此在任何深度都无效）。必须在 lambda **外面**声明 ——
+                        // lambda 只捕获它，不捕获 key。
+                        const std::vector<std::string> fieldPath{std::string(key)};
                         Keyboard::Open(
                             text.c_str(),
-                            [type = std::move(type), val = std::move(val), currentObj, paths,
+                            [type = std::move(type), val = std::move(val), currentObj, paths, fieldPath,
                              rootObj](const std::string &value)
                             {
                                 LOGD("%s", value.c_str());
@@ -4226,15 +4232,11 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                     return;
                                 }
                                 auto newStr = Il2cpp::NewString(value.c_str());
-                                // il2cpp_field_set_value(obj, field, ptr) 是「从 ptr 指向的
-                                // 地址拷贝 field 长度的那几个字节」，所以必须传 &newStr。
-                                // 旧代码直接传 newStr（托管对象本身），等于把对象头
-                                // （klass 指针 + monitor）当字段内容写进去，字段直接损坏。
                                 // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
                                 // 旧值必须在 SetFieldValue **之前**读。
-                                const std::string prevValue = ReadScalarText(currentObj, paths);
+                                const std::string prevValue = ReadScalarText(currentObj, fieldPath);
                                 Il2cpp::SetFieldValue(currentObj, f, &newStr);
-                                RecordFieldChange(rootObj, val, "字符串", value, currentObj, paths, prevValue);
+                                RecordFieldChange(rootObj, val, "字符串", value, currentObj, fieldPath, prevValue);
                                 RequestRefresh(rootObj);
                             });
                     }
@@ -4250,9 +4252,14 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                             auto fieldType = field->getType();
                             if (fieldType && fieldType->isEnum())
                             {
+                                // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                                // 直接父对象，key 是它的直接子字段。传整条 paths 会从
+                                // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug）。
+                                // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
+                                const std::vector<std::string> fieldPath{std::string(key)};
                                 poper.Open(
                                     "EnumSelector",
-                                    [fieldType, currentObj, field, paths, rootObj](const std::string &result)
+                                    [fieldType, currentObj, field, paths, fieldPath, rootObj](const std::string &result)
                                     {
                                         auto *enumClass = fieldType->getClass();
                                         auto *enumField = enumClass ? enumClass->getField(result.c_str()) : nullptr;
@@ -4271,7 +4278,11 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                         const char *baseName = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
                                         // 旧值必须在两个分支的写入**之前**读 —— 之后
                                         // 就只剩新值了（第 73 轮的 bug）。
-                                        const std::string prevValue = ReadScalarText(currentObj, paths);
+                                        // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                                        // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
+                                        // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
+                                        // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
+                                        const std::string prevValue = ReadScalarText(currentObj, fieldPath);
 
                                         if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
                                                          strcmp(baseName, "System.UInt64") == 0))
@@ -4286,7 +4297,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                         }
                                         RecordFieldChange(rootObj,
                                                           field && field->getName() ? field->getName() : "?",
-                                                          "枚举", result, currentObj, paths, prevValue);
+                                                          "枚举", result, currentObj, fieldPath, prevValue);
                                         RequestRefresh(rootObj);
                                     },
                                     fieldType);
@@ -4301,19 +4312,32 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                 if (ImGui::IsItemClicked())
                 {
                     std::istringstream iss(key);
-                    std::string _, val;
-                    iss >> _ >> val;
+                    std::string type, val;
+                    iss >> type >> val;
+                    // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的直接
+                    // 父对象，key 是它的**直接子字段**。传整条 paths 会从
+                    // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug：
+                    // 撤销因此在任何深度都无效）。
+                    //
+                    // 而 ensureIfValueType 仍要**整条 paths** —— 它要一路走回根，
+                    // 把被就地改写的值类型逐层写回。两个路径不能混用。
+                    // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                    // 直接父对象，key 是它的直接子字段。传整条 paths 会从
+                    // currentObj 再走一遍树，读到的不是这个字段（第 74 轮的 bug）。
+                    // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
+                    const std::vector<std::string> fieldPath{std::string(key)};
                     poper.Open("BooleanSelector",
-                               [currentObj, val, paths, rootObj](const std::string &value)
+                               [currentObj, val, paths, fieldPath, rootObj](const std::string &value)
                                {
                                    bool b = value == "True";
                                    // split key by space
                                    // 旧值必须在 setField **之前**读。
-                                   const std::string prevValue = ReadScalarText(currentObj, paths);
+                                   const std::string prevValue = ReadScalarText(currentObj, fieldPath);
                                    currentObj->setField(val.c_str(), (int)b);
                                    ensureIfValueType(currentObj, paths, rootObj);
                                    RequestRefresh(rootObj);
-                                   RecordFieldChange(rootObj, val, "布尔", value, currentObj, paths, prevValue);
+                                   RecordFieldChange(rootObj, val, "布尔", value, currentObj, fieldPath,
+                                                                     prevValue);
                                 });
                 }
             }
@@ -4335,8 +4359,13 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     iss >> type >> val;
                     // 预填值同样必须按声明类型格式化：预填对了，
                     // 「原样点确认」才是无损的。
+                    // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的直接
+                    // 父对象，key 是它的直接子字段。传整条 paths 会从 currentObj
+                    // 再走一遍树，读到的不是这个字段（第 74 轮的 bug：撤销在任何
+                    // 深度都无效）。而 ensureIfValueType 仍要**整条 paths**。
+                    const std::vector<std::string> fieldPath{std::string(key)};
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
-                                   [type, currentObj, val, paths, rootObj](const std::string &text)
+                                   [type, currentObj, val, paths, fieldPath, rootObj](const std::string &text)
                                    {
                                        if (currentObj == nullptr)
                                        {
@@ -4346,10 +4375,14 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        // 就是错的：那时字段已经是新值了，于是
                                        // 「恢复」等于「把新值再写一遍」——
                                        // 按钮能点、不报错、什么也没发生。
-                                       const std::string prevValue = ReadScalarText(currentObj, paths);
+                                       // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                                       // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
+                                       // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
+                                       // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
+                                       const std::string prevValue = ReadScalarText(currentObj, fieldPath);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text, currentObj, paths,
+                                           RecordFieldChange(rootObj, val, type, text, currentObj, fieldPath,
                                                              prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
@@ -4377,8 +4410,13 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     std::istringstream iss(key);
                     std::string type, val;
                     iss >> type >> val;
+                    // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的直接
+                    // 父对象，key 是它的直接子字段。传整条 paths 会从 currentObj
+                    // 再走一遍树，读到的不是这个字段（第 74 轮的 bug：撤销在任何
+                    // 深度都无效）。而 ensureIfValueType 仍要**整条 paths**。
+                    const std::vector<std::string> fieldPath{std::string(key)};
                     Keyboard::Open(FormatFieldForEdit(type, value).c_str(),
-                                   [type, currentObj, val, paths, rootObj](const std::string &text)
+                                   [type, currentObj, val, paths, fieldPath, rootObj](const std::string &text)
                                    {
                                        if (currentObj == nullptr)
                                        {
@@ -4388,10 +4426,14 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        // 就是错的：那时字段已经是新值了，于是
                                        // 「恢复」等于「把新值再写一遍」——
                                        // 按钮能点、不报错、什么也没发生。
-                                       const std::string prevValue = ReadScalarText(currentObj, paths);
+                                       // 读/撤销用的路径是**单元素**的：currentObj 就是这一行的
+                                       // 直接父对象。传整条 paths 会从 currentObj 再走一遍树，
+                                       // 读到的不是这个字段（第 74 轮的 bug：撤销在任何深度都无效）。
+                                       // 而 ensureIfValueType 仍要**整条 paths** —— 两个路径不能混用。
+                                       const std::string prevValue = ReadScalarText(currentObj, fieldPath);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text, currentObj, paths,
+                                           RecordFieldChange(rootObj, val, type, text, currentObj, fieldPath,
                                                              prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
