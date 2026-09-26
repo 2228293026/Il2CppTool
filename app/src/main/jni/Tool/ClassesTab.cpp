@@ -150,6 +150,9 @@ void ClassesTab::AddWatch(Il2CppObject *object, const std::vector<std::string> &
         return;
     }
     g_watches.push_back({object, handle, paths, label, {}, false, false});
+    // 立刻让下一帧重读一次。否则新加的这一项要等最多 200ms 才显示值，
+    // 期间 lastValue 是空串 —— 界面上就是「加完是空的」，看着像没加上。
+    g_watchLastPoll = 0.0;
 }
 
 void ClassesTab::RemoveWatchAt(size_t index)
@@ -276,29 +279,49 @@ void ClassesTab::DrawWatches()
     for (size_t i = 0; i < g_watches.size();)
     {
         auto &w = g_watches[i];
+        // 固定成两列的表格。不用「标签 + SameLine + 值」：
+        // 标签长度不受限（类名可以很长），值会被 SameLine 顶到屏幕外 ——
+        // 而值是这一行唯一真正要看的**东西**，标签只是定位用的。
+        // 表格给标签列一个上限宽度，超出部分被裁掉。
         ImGui::PushID(static_cast<int>(i));
-        if (w.changed)
+        if (ImGui::BeginTable("##watchrow", 2, ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 255, 120, 255));
-        }
-        ImGui::TextUnformatted(w.label.c_str());
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        if (w.invalid)
-        {
-            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s",
-                               w.lastValue.empty() ? "<对象已失效>" : w.lastValue.c_str());
-        }
-        else
-        {
-            ImGui::TextUnformatted(w.lastValue.c_str());
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("x"))
-        {
-            RemoveWatchAt(i);
-            ImGui::PopID();
-            continue;
+            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::GetContentRegionAvail().x * 0.55f);
+            ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (w.changed)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 255, 120, 255));
+            }
+            // 完整标签放 tooltip，被裁掉的部分还能看全。
+            ImGui::TextUnformatted(w.label.c_str());
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("%s", w.label.c_str());
+            }
+            ImGui::PopStyleColor();
+
+            ImGui::TableNextColumn();
+            if (w.invalid)
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s",
+                                   w.lastValue.empty() ? "<对象已失效>" : w.lastValue.c_str());
+            }
+            else
+            {
+                ImGui::TextUnformatted(w.lastValue.c_str());
+            }
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("x"))
+            {
+                ImGui::EndTable();
+                ImGui::PopID();
+                RemoveWatchAt(i);
+                continue;
+            }
+            ImGui::EndTable();
         }
         ImGui::PopID();
         ++i;
