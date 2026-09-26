@@ -2368,6 +2368,11 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                 {
                     o.bytes.clear();
                     o.text.clear();
+                    // appliedAt 一起清（第 107 轮）。留着它就是个**不再代表任何
+                    // 意思的陈旧指针**：这条记录已经恢复过了，可 appliedAt
+                    // 还指着当年的方法体地址。下一个人拿它做判断（比如想跳过
+                    // 「已恢复」的条目）就会得出相反的结论。
+                    o.appliedAt = nullptr;
                 }
             }
         }
@@ -2420,6 +2425,11 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                 {
                     o.bytes.clear();
                     o.text.clear();
+                    // appliedAt 一起清（第 107 轮）。留着它就是个**不再代表任何
+                    // 意思的陈旧指针**：这条记录已经恢复过了，可 appliedAt
+                    // 还指着当年的方法体地址。下一个人拿它做判断（比如想跳过
+                    // 「已恢复」的条目）就会得出相反的结论。
+                    o.appliedAt = nullptr;
                 }
             }
             else
