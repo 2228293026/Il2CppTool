@@ -362,10 +362,12 @@ namespace Tool
             CalculateSomething();
             return true;
         }();
-        static auto lastUpdate = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate);
-        
+        // 原来这里还有：
+        //     static auto lastUpdate = std::chrono::steady_clock::now();
+        //     auto now = ...; auto elapsed = ...;
+        // lastUpdate 从来没被更新过、elapsed 从来没被用过 ——
+        // 应该是想做「每 N 毫秒刷新一次什么」的半成品。删掉，避免误导。
+
         if (ImGui::BeginTabBar("tabber", ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll |
                                              ImGuiTabBarFlags_TabListPopupButton))
         {

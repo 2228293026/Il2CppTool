@@ -1868,6 +1868,22 @@ namespace Il2cpp
             //  }
         }
         static int depth;
+        // **spam 限制其实没实现。**
+        //
+        // 原设计是「同一个方法被调用超过 maxSpam 次之后就静音，避免刷屏」，
+        // 数据也传进来了（TracerData 里的 maxSpam 字段），但这个计数器
+        // 从声明到现在**从来没有被读或写过** —— 上面的 on_enter 里也没有
+        // 任何按计数静音的逻辑。
+        //
+        // 所以：即使你打开 USE_FRIDA 构建，Trace(..., maxSpam) 的
+        // maxSpam 参数也是**完全无效**的，被高频调用的方法会把日志刷爆
+        // （而 512KB 的上限会静默丢弃最早的若干行，只在「日志」页显示
+        // 丢弃行数，用户很难联想到是这个原因）。
+        //
+        // 现状下整个这一段都在 #ifdef USE_FRIDA 里，而 Android.mk 没有
+        // -DUSE_FRIDA —— 所以正式构建根本不编译它。保留是为了将来启用
+        // Frida 时用；真要启用，**maxSpam 必须先实现**，否则比不实现更糟
+        // （用户以为有限流）。
         static std::unordered_map<void *, TracerData *> spamCounter;
     };
     int TracerLintener::depth = 0;
