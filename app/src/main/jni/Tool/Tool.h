@@ -54,6 +54,8 @@ namespace Tool
     // 自检页用它把「配置被重置」这件事显示出来 —— 否则用户只看到
     // 「设置怎么都回默认值了」，没有任何地方说明原因。
     bool ConfigLoadFailed();
+    // 标记「配置被重置过」（Main.cpp 的 tool_conf.json 也用）。
+    void MarkConfigLoadFailed();
     void Init(Il2CppImage *image, std::vector<Il2CppImage *> images);
     void FilterClasses(const std::string &filter);
     void Draw();

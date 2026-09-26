@@ -43,6 +43,19 @@ $files = foreach ($d in $dirs) {
     if (Test-Path $d) { Get-ChildItem $d -Recurse -Include *.cpp, *.h -File }
 }
 
+# jni **根目录**下的 .cpp 也要扫。
+#
+# 第 90 轮发现的：这里原本只有三个子目录（Tool / Menu / Includes），
+# 于是 `Main.cpp` —— 927 行，整个渲染循环、追踪页、配置读写都在里面 ——
+# 对下面每一条规则都是**不可见**的。
+#
+# 这和第 63 轮「排除模式吃掉所有语句」、第 85 轮「markdown 规则根本不存在」
+# 是同一类失败：门禁绿着，但有一大片代码它从来没看过。
+# 区别只在于那次是我写完就发现了，这次是**反向验证抓到的** ——
+# 注入的缺陷正好在被漏掉的那个文件里。
+$rootCpp = Join-Path $root 'app/src/main/jni'
+$files += Get-ChildItem $rootCpp -Filter *.cpp -File
+
 $hits = @()
 
 foreach ($f in $files) {
@@ -347,6 +360,35 @@ foreach ($f in $files) {
                         Text = $u
                     }
                 }
+            }
+        }
+    }
+}
+
+# ---- 模式 G：所有文件写入都必须走 FileWriter（原子写在它里面）----
+#
+# 第 89 轮发现：导出 .cs 有原子写（`.part` + rename），class_tabs.json 没有；
+# 第 90 轮发现 tool_conf.json 也没有。**同一个项目里三份持久化、三套纪律。**
+#
+# 修法不是「给每个调用点各写一遍原子写」—— 两份实现迟早会不一致
+# （第 89 轮就手写了一份，第 90 轮发现还得再来一份）。而是把原子写放进
+# **FileWriter 本身**：那是所有写入必经的入口。
+#
+# 所以要拦的是：绕过 FileWriter 直接 ofstream/fopen 写正式文件。
+foreach ($f in $files) {
+    $lines = Get-Content $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # Util.cpp 里的就是实现本身；dump 走的是自己的进度/取消通道
+        if ($f.Name -eq 'Util.cpp') { continue }
+        if ($f.Name -eq 'Il2cpp.cpp') { continue }
+        if ($t -match '^\s*std::ofstream\s+\w+\s*\(' -or $t -match '^\s*std::fstream\s+\w+\s*\(') {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'G: 绕过 FileWriter 直接写文件（原子写在 FileWriter 里，绕过去就没有）'
+                Text = $t
             }
         }
     }

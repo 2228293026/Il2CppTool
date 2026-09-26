@@ -145,6 +145,42 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 10. 规则 G + **门禁必须扫到 jni 根目录的 .cpp** ----
+# 第 90 轮发现的覆盖漏洞：$dirs 只有 Tool / Menu / Includes，
+# 所以 Main.cpp（927 行，整个渲染循环、追踪页、配置读写），
+# 对下面**每一条**规则都是不可见的。
+# 这条自检同时验两件事：规则 G 能红，而且注入点在 Main.cpp 里。
+$gCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'G 绕过 FileWriter 直写' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'Util::FileWriter fileWriter\("tool_conf\.json"\);') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls.Insert($i, '    std::ofstream 直写("tool_conf.json");')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $gCheck 'app/src/main/jni/Main.cpp'
+
+# 规则 D 也必须看得见 Main.cpp（覆盖漏洞就是从这个角度发现的）
+Test-Rule 'D 能看见 Main.cpp' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $j = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*ImGui::Text\("[^"]*"\);') { $j = $k; break }
+    }
+    if ($j -lt 0) { return $false }
+    $ls[$j] = $ls[$j] -replace 'ImGui::Text\("([^"]*)"\);', 'ImGui::Text("$1 **加星号**");'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $gCheck 'app/src/main/jni/Main.cpp'
 # ---- 9. 规则 F：第 80 轮那个 bug 原样注入，必须被抓到 ----
 $fCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

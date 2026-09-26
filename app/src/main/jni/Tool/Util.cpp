@@ -103,25 +103,29 @@ namespace Util
 
     FileWriter::FileWriter(const std::string &fileName)
     {
-        this->fileName = DataPath() + "/" + fileName;
+        this->init(fileName);
         this->open();
     }
 
     void FileWriter::init(const std::string &fileName)
     {
-        this->fileName = DataPath() + "/" + fileName;
+        m_finalPath = DataPath() + "/" + fileName;
+        m_tempPath = m_finalPath + ".part";
+        this->fileName = m_tempPath; // 真正打开的是临时文件
     }
 
     void FileWriter::open()
     {
-        fileStream.open(this->fileName);
-        // 静默失败是这个工具里最伤的一种 bug：用户点了 Dump，进度条跑满、
-        // 提示成功，然后去游戏目录找不到文件 —— 因为数据目录不可写
-        // （权限、路径不存在），ofstream 构造失败却没人告诉任何人。
-        // 这里至少明确报错，并在 write() 里阻止继续写空文件。
-        if (!fileStream.is_open())
+        // 打开的是 **.part**，正式文件在整个写入过程中**根本没被碰过**。
+        // 进程被杀掉也只会留下一个 .part，下一次启动照样读得到完整的旧配置。
+        fileStream.open(m_tempPath, std::ios::out | std::ios::trunc);
+        m_ok = fileStream.is_open();
+        if (!m_ok)
         {
-            LOGE("无法写入文件: %s", this->fileName.c_str());
+            // 静默失败是这个工具里最伤的一种 bug：用户点了 Dump，进度条跑满、
+            // 提示成功，然后去游戏目录找不到文件 —— 因为数据目录不可写
+            // （权限、路径不存在），ofstream 构造失败却没人告诉任何人。
+            LOGE("无法写入文件: %s", m_tempPath.c_str());
         }
     }
 
@@ -133,6 +137,7 @@ namespace Util
         }
         fileStream << data;
         fileStream << std::endl;
+        m_dirty = true;
     }
 
     bool FileWriter::exists()
@@ -142,7 +147,47 @@ namespace Util
 
     FileWriter::~FileWriter()
     {
-        fileStream.close();
+        if (fileStream.is_open())
+        {
+            fileStream.flush();
+            // 不检查就 rename 等于把「写了一半」的文件变成正式的 ——
+            // 那比截断更糟：旧的好文件也没了。
+            if (!fileStream.good())
+            {
+                LOGE("写入中断（磁盘满？），放弃替换 %s", m_finalPath.c_str());
+                fileStream.close();
+                std::error_code ec;
+                std::filesystem::remove(m_tempPath, ec);
+                m_ok = false;
+                return;
+            }
+            fileStream.close();
+        }
+        if (!m_dirty)
+        {
+            // 一个字都没写就析构：把刚才 open 出来的空 .part 收掉，
+            // 不然「打开失败」的路径会在磁盘上留一堆空文件。
+            std::error_code ec;
+            std::filesystem::remove(m_tempPath, ec);
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(m_tempPath, m_finalPath, ec);
+        if (ec)
+        {
+            // 和导出 .cs 一样：rename 失败就退回「拷贝 + 删除」，再不行报错。
+            LOGW("rename 失败(%s)，退回拷贝", ec.message().c_str());
+            std::filesystem::remove(m_finalPath, ec);
+            std::filesystem::rename(m_tempPath, m_finalPath, ec);
+            if (ec)
+            {
+                LOGE("保存失败: %s (%s)", m_finalPath.c_str(), ec.message().c_str());
+                std::filesystem::remove(m_tempPath, ec);
+                m_ok = false;
+                return;
+            }
+        }
+        m_ok = true;
     }
     FileReader::FileReader(const std::string &fileName)
     {

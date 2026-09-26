@@ -674,7 +674,29 @@ void ConfigInit()
         }
         catch (nlohmann::json::exception &e)
         {
+            // 覆盖前留一份副本：和 class_tabs.json 一样（第 89 轮），
+            // 全丢和「能抢救几个」对用户是两件很不一样的事。
             LOGE("ConfigInit error : %s", e.what());
+            try
+            {
+                std::error_code ec;
+                const std::string bad = Util::DataPathString() + "/tool_conf.json";
+                std::filesystem::copy_file(bad, bad + ".corrupt",
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec)
+                {
+                    LOGW("保留损坏配置副本失败: %s", ec.message().c_str());
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                LOGW("保留损坏配置副本时抛异常: %s", ex.what());
+            }
+            catch (...)
+            {
+                LOGW("保留损坏配置副本时发生未知异常");
+            }
+            Tool::MarkConfigLoadFailed();
             Util::FileWriter fileWriter("tool_conf.json");
             fileWriter.write("{}");
         }

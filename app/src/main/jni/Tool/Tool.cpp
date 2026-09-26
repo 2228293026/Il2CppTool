@@ -61,6 +61,13 @@ std::string g_hookError;
         return g_configLoadFailed;
     }
 
+    // Main.cpp 的 tool_conf.json 解析失败时也要标 —— 两个配置文件的
+    // 「被重置过」对用户是同一件事，自检页不该只报一半。
+    void MarkConfigLoadFailed()
+    {
+        g_configLoadFailed = true;
+    }
+
     void ConfigLoad()
     {
         LOGD(__FUNCTION__);
@@ -102,74 +109,20 @@ std::string g_hookError;
     void ConfigSave()
     {
         LOGD(__FUNCTION__);
-        // **原子写**：先写 .part，成功后再 rename 替换正式文件。
+        // 原子写在 FileWriter 里（第 89/90 轮）：所有内容先写进
+        // `class_tabs.json.part`，析构时成功才 rename 替换正式文件。
         //
-        // 旧代码直接 FileWriter("class_tabs.json") 打开写 —— ofstream 默认
-        // **截断**，所以进程在写的中途被杀（游戏崩、用户强杀、系统回收），
-        // 磁盘上留下的是一个**半截的 JSON**。下一次启动 ConfigLoad 读到它，
-        // nlohmann 解析失败，于是**全部**配置丢失 —— 标签页、参数预设、
-        // 改了半天的设置，一次崩溃就全没了。
+        // 旧代码直接打开正式文件写 —— ofstream 默认 trunc，于是进程在写的
+        // 中途被杀（游戏崩、用户强杀、系统回收），磁盘上留下**半截的 JSON**，
+        // 下次启动解析失败 → **全部**配置丢失：标签页、参数预设、
+        // 改了半天的设置，一次崩溃全没了。而保存那一下「看起来是成功的」。
         //
-        // 而且它没有任何提示：保存那一下「看起来是成功的」。
-        //
-        // 这个模式不是新发明的：`Il2cpp.cpp` 导出 .cs 已经在用
-        // （`finalPath + ".part"` + `std::filesystem::rename`），
-        // 那边的注释写得更详细。这里复用同一套。
-        //
-        // 配置比导出更该这么做 —— 导出失败只是重导一次，配置丢了是全丢。
-        const std::string finalPath = Util::DataPathString() + "/class_tabs.json";
-        const std::string tempPath = finalPath + ".part";
-
-        struct TempCleanup
-        {
-            const std::string &path;
-            bool armed = true;
-            ~TempCleanup()
-            {
-                if (armed)
-                {
-                    std::error_code ec;
-                    std::filesystem::remove(path, ec);
-                }
-            }
-        } tempCleanup{tempPath};
-
+        // 这里第 89 轮曾经手写了一份原子写，第 90 轮发现 `tool_conf.json`
+        // 有同样的问题 —— 与其在每个调用点各写一遍（两份实现迟早会不一致），
+        // 不如把它放进 FileWriter：**所有写入必经的入口**。
         nlohmann::ordered_json j = classesTabs;
-        const std::string text = j.dump(2, ' ');
-
-        {
-            std::ofstream out(tempPath, std::ios::out | std::ios::trunc);
-            if (!out.is_open())
-            {
-                LOGE("配置无法写入: %s", tempPath.c_str());
-                return; // 正式文件保持原样
-            }
-            out << text;
-            out.flush();
-            // 不检查写盘结果就 rename，等于把「写了一半」的文件
-            // 变成正式的 —— 那比截断更糟，因为原来的好文件也没了。
-            if (!out.good())
-            {
-                LOGE("配置写入中断（磁盘满？): %s", tempPath.c_str());
-                return;
-            }
-        }
-
-        std::error_code ec;
-        std::filesystem::rename(tempPath, finalPath, ec);
-        if (ec)
-        {
-            // 和 dump 一样：rename 失败就退回「拷贝 + 删除」，再不行报错。
-            LOGW("配置 rename 失败(%s)，退回拷贝", ec.message().c_str());
-            std::filesystem::remove(finalPath, ec);
-            std::filesystem::rename(tempPath, finalPath, ec);
-            if (ec)
-            {
-                LOGE("配置保存失败: %s", ec.message().c_str());
-                return;
-            }
-        }
-        tempCleanup.armed = false; // 已经改名，别把正式文件删了
+        Util::FileWriter configFile("class_tabs.json");
+        configFile.write(j.dump(2, ' ').c_str());
     }
     void ConfigInit()
     {
