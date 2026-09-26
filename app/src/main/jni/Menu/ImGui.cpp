@@ -424,8 +424,46 @@ EGLBoolean swapbuffers_hook(EGLDisplay dpy, EGLSurface surf)
         initialScreenSize.y = h;
         initialScreenSet = true;
     }
-    setupMenu();
-    internalDrawMenu(w, h);
+
+    // ---- 最外层异常边界（第 108 轮）----
+    //
+    // 这是**整个钩子**的兜底，而不只是 menuAddress。
+    //
+    // 第 344 行那段注释已经把道理说清楚了：栈上没有有效的 unwind info
+    // （Dobby 的 trampoline 是手写汇编），异常一路逃出去就是
+    // std::terminate —— 用户的游戏直接没了。
+    //
+    // 而旧代码的 try **只包住了 menuAddress()**。同一条链上还有：
+    //     setupMenu()                       每次新建 ImGui 上下文相关状态
+    //     ImGui::NewFrame()                 分配 draw list，可能 bad_alloc
+    //     ImGui::Render()                   同上
+    //     ImGui_ImplOpenGL3_RenderDrawData()
+    //     Unity::PublishMenuRect()          持着输入锁
+    // 它们都在边界**之外**，而上面那段注释自己就点名了
+    // 「std::string/vector 的 bad_alloc」。
+    //
+    // 游戏本来就吃紧的时候再来一次 bad_alloc，一局游戏就没了 ——
+    // 而为了画一个菜单。
+    //
+    // 边界放在**这里**而不是散进各个函数：C 回调「不许异常逃出去」
+    // 是这个入口的契约，由入口自己保证，第三个内部函数出现时也不会漏。
+    //
+    // catch 里**绝不能碰 ImGui**：NewFrame 可能已经发出去、这一帧的
+    // Begin/End 配对是残缺的，再操作窗口栈只会让状态更糟。
+    // 只记录，然后**照样把这一帧交还给游戏**。
+    try
+    {
+        setupMenu();
+        internalDrawMenu(w, h);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("swapbuffers_hook: 绘制菜单时抛出异常: %s", e.what());
+    }
+    catch (...)
+    {
+        LOGE("swapbuffers_hook: 绘制菜单时抛出未知异常");
+    }
 
     return o_swapbuffers(dpy, surf);
 }

@@ -604,6 +604,81 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 N：Dobby 的替换函数必须**整个函数体**都在异常边界里 ----
+#
+# 第 108 轮的发现，三处：
+#
+#   Menu/ImGui.cpp   swapbuffers_hook  的 try **只包住了 menuAddress()**，
+#                    而 setupMenu / ImGui::NewFrame / ImGui::Render /
+#                    ImGui_ImplOpenGL3_RenderDrawData / PublishMenuRect
+#                    全在边界**之外**。
+#   Tool/ClassesTab.cpp  hookerHandler  **一个 try 都没有**，而
+#                    `trace.name = buffer` 是 std::string 赋值。
+#
+# 而 Menu/ImGui.cpp 里那段注释自己就写着「栈上没有有效的 unwind info
+# （Dobby 的 trampoline 是手写汇编），异常一路逃出去就是
+# std::terminate —— 用户的游戏直接没了」，还点名了
+# 「std::string/vector 的 bad_alloc」。
+# 也就是：**理由写在那里，边界没覆盖到**。
+#
+# 为什么不做成「函数名里带 hook 字样」：
+#   那样会误报 HookerView / SampleHookRates / ToggleHooker /
+#   HookInput / UninstallInputHooks —— 五个都不是 Dobby 回调
+#   （PowerShell 的 -match 还是大小写不敏感的，HookerView 会被
+#    `hook` 匹配上）。实测 5 个误报 : 0 个真报。
+#
+# 正确的做法是从**注册点**拿名单：
+#   DobbyHook(目标, 替换, 原函数)
+#   DobbyInstrument(目标, 回调, 原函数)
+# 第二个参数就是被 Dobby 装上去的替换函数，全项目就这几个，
+# 名单是**精确**的，不靠命名猜。
+$hookNames = @{}
+# 只在 .cpp 里找注册点。头文件里全是假的：
+#   dobby.h        DobbyHook / DobbyInstrument **自己的声明**
+#   il2cpp-class.h 模板 DobbyHook(methodPointer, (void *)func, ...)
+#   OpenGL.h       reinterpret_cast 转发的十几个 GL 钩子
+# 那三个来源实测把名单撑成 6 个，其中 5 个报的是无关函数。
+$castNames = @('reinterpret_cast', 'const_cast', 'static_cast', 'dynamic_cast')
+foreach ($f in $files) {
+    if ($f.Extension -ne '.cpp') { continue }
+    $txt = Get-Content -Encoding UTF8 $f.FullName -Raw
+    foreach ($m in [regex]::Matches($txt, 'Dobby(?:Hook|Instrument)\s*\([^,]*,\s*(?:\(\s*void\s*\*\s*\)|\(\s*[\w:]*callback\w*\s*\))?\s*&?\s*(\w+)')) {
+        $n = $m.Groups[1].Value
+        if ($castNames -contains $n) { continue }
+        $hookNames[$n] = $true
+    }
+}
+foreach ($name in $hookNames.Keys) {
+    foreach ($f in $files) {
+        $lines = Get-Content -Encoding UTF8 $f.FullName
+        if ($f.Extension -ne '.cpp') { continue }
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $t = $lines[$i].Trim()
+            if ($t -match '^(//|\*|/\*)') { continue }
+            # 找这个替换函数的**定义**（不是声明：声明行以 ; 结尾）
+            if ($t -notmatch ("\b" + [regex]::Escape($name) + "\s*\(")) { continue }
+            if ($t -match ';') { continue }
+            $ind = ($lines[$i] -replace '^(\s*).*', '$1').Length
+            $body = @()
+            $closed = $false
+            for ($m2 = $i; $m2 -lt $lines.Count; $m2++) {
+                $body += $lines[$m2]
+                if ($lines[$m2].Trim() -eq '}' -and ($lines[$m2] -replace '^(\s*).*', '$1').Length -eq $ind) { $closed = $true; break }
+            }
+            if (-not $closed) { continue }
+            $bt = $body -join "`n"
+            if ($bt -notmatch '\btry\s*\{') {
+                $hits += [pscustomobject]@{
+                    File = $f.Name
+                    Line = $i + 1
+                    Rule = 'N: Dobby 替换函数没有异常边界（逃进 trampoline = std::terminate = 崩游戏）'
+                    Text = $t
+                }
+            }
+            break
+        }
+    }
+}
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

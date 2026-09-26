@@ -566,6 +566,20 @@ NeverDestroyedMutex hookerMtx;
 #ifndef USE_FRIDA
 void hookerHandler(void *address, DobbyRegisterContext *ctx)
 {
+    // 异常边界（第 108 轮）—— 和 swapbuffers_hook 同一个道理。
+    //
+    // 这个回调由 Dobby 的 trampoline 进来，栈上没有有效的 unwind info，
+    // 异常一路逃出去就是 std::terminate —— 而这里跑在**游戏线程**上、
+    // 在**被 hook 的方法自己的调用栈里**，后果是整局游戏崩掉。
+    //
+    // 下面确实有会抛的东西：`trace.name = buffer` 是 std::string 赋值
+    //（可能 bad_alloc），`visited.push_back` 要动容器。
+    //
+    // catch 里只记日志，不碰 hookerMap / visited / 任何持锁的状态：
+    // 这一刻游戏自己的方法正等着返回，工具再抛一次就没意义了。
+    // `lock_guard` 是 RAII，异常退栈时自动解锁。
+    try
+    {
     // 这段跑在**游戏线程**上 —— 每次被 hook 的方法被调用都会进来一次。
     // 所以这里的每一分开销都是直接加在游戏帧时间上的。
     //
@@ -624,6 +638,15 @@ void hookerHandler(void *address, DobbyRegisterContext *ctx)
         trace.name = buffer;
     }
     HookerData::visited.push_back(std::move(trace));
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("hookerHandler: 记录调用时抛出异常: %s", e.what());
+    }
+    catch (...)
+    {
+        LOGE("hookerHandler: 记录调用时抛出未知异常");
+    }
 }
 #endif
 

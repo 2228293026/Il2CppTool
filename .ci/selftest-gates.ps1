@@ -269,6 +269,34 @@ Test-Rule 'L 不可恢复的行要有可见状态' {
     return $true
 } $lCheck 'app/src/main/jni/Tool/ChangeLog.cpp'
 
+# ---- 18. 规则 N：把「Dobby 替换函数没有边界」复现出来（第 108 轮）----
+#
+# 第 108 轮在两个 Dobby 回调上都找到过：swapbuffers_hook 的 try 只包住
+# menuAddress()，而 hookerHandler 一个 try 都没有。
+$nCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'N Dobby 替换函数要有异常边界' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'void hookerHandler\(void \*address') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # 从函数开头**往后**找第一个 try —— 用固定偏移会打到函数签名上
+    #（try 上面还有一整段说明）。
+    $ty = -1
+    for ($k = $i; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*try\s*$') { $ty = $k; break }
+    }
+    if ($ty -lt 0) { return $false }
+    $ls[$ty] = '    ; // 第 108 轮之前的样子：一个 try 都没有'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $nCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
