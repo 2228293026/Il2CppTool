@@ -1528,17 +1528,33 @@ void ObjectDrawManager::DrawUI() {
             // 不能用快照下标 i 去索引 drawObjects（两者大小可能不同 → 越界写）。
             auto* go = drawSnapshot[i].target.gameObject;
 
-            ImGui::Text("%s", drawSnapshot[i].target.name.c_str());
-            ImGui::SameLine();
-
-            ImVec4 color = ImGui::ColorConvertU32ToFloat4(drawSnapshot[i].color);
-            ImGui::ColorButton("##color", color, ImGuiColorEditFlags_NoTooltip, ImVec2(20, 20));
-
-            ImGui::SameLine();
-            if (ImGui::Button("移除")) {
-                RemoveDrawObject(go);
-                ImGui::PopID();
-                break;
+            // 名字长度不受控（GameObject 名字是游戏作者起的，可以很长），
+            // 用表格给名字列一个上限宽度，后面两个控件固定宽 ——
+            // 否则 SameLine 会把颜色/移除按钮顶到屏幕外，等于按钮点不到。
+            if (ImGui::BeginTable("##drawrow", 3, ImGuiTableFlags_SizingStretchProp))
+            {
+                const float avail = ImGui::GetContentRegionAvail().x;
+                ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("color", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+                ImGui::TableSetupColumn("act", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(drawSnapshot[i].target.name.c_str());
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("%s", drawSnapshot[i].target.name.c_str());
+                }
+                ImGui::TableNextColumn();
+                ImVec4 color = ImGui::ColorConvertU32ToFloat4(drawSnapshot[i].color);
+                ImGui::ColorButton("##color", color, ImGuiColorEditFlags_NoTooltip, ImVec2(20, 20));
+                ImGui::TableNextColumn();
+                if (ImGui::Button("移除")) {
+                    RemoveDrawObject(go);
+                    ImGui::EndTable();
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::EndTable();
             }
 
             ImGui::SameLine();

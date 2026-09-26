@@ -2958,9 +2958,10 @@ void ClassesTab::Draw(int index, bool closeable)
         {
             // 上一轮筛选失败了。明确说出来，而不是让用户对着一个
             // 空列表 + 一句「没有匹配」怀疑是自己关键字打错了。
-            ImGui::SameLine();
+            //
+            // 「重试」另起一行：跟在失败原因后面的话，原因一长按钮就被
+            // 顶出屏幕 —— 而它恰恰是用户此刻最想按的那个。
             ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "筛选失败: %s", filterFailure);
-            ImGui::SameLine();
             if (ImGui::SmallButton("重试"))
             {
                 FilterClasses(filter);

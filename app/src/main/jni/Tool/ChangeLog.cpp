@@ -189,7 +189,9 @@ void DrawUI()
     snprintf(summary, sizeof(summary), "共 %zu 条（最多保留 %zu 条，超出丢弃最早的）",
              list.size(), kMaxEntries);
     ImGui::TextDisabled("%s", summary);
-    ImGui::SameLine();
+    // 按钮另起一行。跟在 summary 后面用 SameLine 的话，摘要一长
+    // 「复制全部 / 清空」就被顶出屏幕 —— 而这两个按钮正是这一页
+    // 除了看列表之外唯一能做的事。
     if (ImGui::SmallButton("复制全部"))
     {
         const std::string text = ExportText(list);
