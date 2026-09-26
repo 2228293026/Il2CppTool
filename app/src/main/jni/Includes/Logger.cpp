@@ -311,16 +311,60 @@ namespace logger
 
             if (Filter.IsActive())
             {
-                // In this example we don't use the clipper when Filter is enabled.
-                // This is because we don't have random access to the result of our filter.
-                // A real application processing logs with ten of thousands of entries may want to store the result of
-                // search/filter.. especially if the filtering function is not trivial (e.g. reg-exp).
-                for (int line_no = 0; line_no < offsetCount; line_no++)
+                // 过滤激活时**不能**直接遍历全部行：ImGui 的官方示例在这里
+                // 明确写着「we don't use the clipper when Filter is enabled」，
+                // 代价是**每一行每一帧**都要 PassFilter 一次再画一次。
+                // 一次对象扫描能产生几万行 —— 打开日志页再输个关键字，
+                // 渲染线程就被按住了。清单 7.3 和 7.6 单独看都成立，
+                // 合起来（「过滤 + 大日志 + 不卡」）就不成立了。
+                //
+                // 官方注释给的解法就是「把过滤结果存下来」：
+                // 先扫一遍算出命中的行号，之后对**命中集**用 clipper ——
+                // 平时每帧只画可见的十几行，扫描只在内容或关键字变化时做。
+                static std::vector<int> filteredLines;
+                static std::string lastFilterKey;
+                static int lastFilterSourceSize = -1;
+
+                const std::string key = Filter.InputBuf;
+                // 只在**内容或关键字变化**时重扫一次。平时每帧零成本。
+                if (key != lastFilterKey || lastCopiedSize != lastFilterSourceSize)
                 {
-                    const char *line_start = buf + offsetsSnapshot[line_no];
-                    const char *line_end =
-                        (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
-                    Text(line_start, line_end);
+                    filteredLines.clear();
+                    for (int line_no = 0; line_no < offsetCount; line_no++)
+                    {
+                        const char *line_start = buf + offsetsSnapshot[line_no];
+                        const char *line_end =
+                            (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
+                        if (Filter.PassFilter(line_start, line_end))
+                        {
+                            filteredLines.push_back(line_no);
+                        }
+                    }
+                    lastFilterKey = key;
+                    lastFilterSourceSize = lastCopiedSize;
+                }
+
+                const int matchCount = (int)filteredLines.size();
+                if (matchCount == 0)
+                {
+                    ImGui::TextDisabled("没有匹配 \"%s\" 的日志行", key.c_str());
+                }
+                else
+                {
+                    ImGui::TextDisabled("匹配 %d / %d 行", matchCount, offsetCount);
+                    ImGuiListClipper clipper;
+                    clipper.Begin(matchCount);
+                    while (clipper.Step())
+                    {
+                        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
+                        {
+                            const int line_no = filteredLines[i];
+                            const char *line_start = buf + offsetsSnapshot[line_no];
+                            const char *line_end =
+                                (line_no + 1 < offsetCount) ? (buf + offsetsSnapshot[line_no + 1] - 1) : buf_end;
+                            Text(line_start, line_end);
+                        }
+                    }
                 }
             }
             else
