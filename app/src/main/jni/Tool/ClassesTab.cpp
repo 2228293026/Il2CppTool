@@ -1,4 +1,5 @@
 #include "ClassesTab.h"
+#include "ChangeLog.h"
 #include "Includes/NeverDestroyedMutex.h"
 #include "Il2cpp/Il2cpp.h"
 #include "KittyMemory/KittyMemory.h"
@@ -171,6 +172,7 @@ void ClassesTab::AddWatch(Il2CppObject *object, const std::vector<std::string> &
         return;
     }
     g_watches.push_back({object, handle, paths, label, {}, false, false});
+    ChangeLog::Record(ChangeLog::Kind::Watch, label, "已加入关注（每 200ms 刷新）");
     // 立刻让下一帧重读一次。否则新加的这一项要等最多 200ms 才显示值，
     // 期间 lastValue 是空串 —— 界面上就是「加完是空的」，看着像没加上。
     g_watchLastPoll = 0.0;
@@ -3385,6 +3387,22 @@ void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> 
 // lambda**（软键盘回调、枚举选择回调），那些 lambda 捕获不了局部变量。
 static std::unordered_map<Il2CppObject *, bool> g_refreshRequests;
 
+// 记一条「字段被改了」。给「改动记录」页用。
+//
+// 这里**不**去读旧值：写之前它就已经被覆盖了，而界面显示的 JSON 是
+// 上一帧 dump 的快照，不一定是最新的。与其给一个可能不对的「原值 → 新值」，
+// 不如只如实记「新值」。
+static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
+                              const std::string &type, const std::string &value)
+{
+    if (!rootObj || !rootObj->klass || !rootObj->klass->getName())
+    {
+        return;
+    }
+    const std::string target = std::string(rootObj->klass->getName()) + "." + field;
+    const std::string detail = type.empty() ? value : (type + " = " + value);
+    ChangeLog::Record(ChangeLog::Kind::Field, target, detail);
+}
 static void RequestRefresh(Il2CppObject *object)
 {
     if (object == nullptr)
@@ -3720,6 +3738,8 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             {
                 savedSet[currentObj->klass].insert(currentObj);
                 SaveObjectWithRoot(currentObj);
+                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根");
+                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根");
             }
             if (ImGui::IsItemHovered())
             {
@@ -3792,7 +3812,8 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         RequestRefresh(rootObj);
     }
     if (ConsumeRefresh(rootObj))
-    {        dataMap[rootObj].first = rootObj->dump(paths);
+    {
+        dataMap[rootObj].first = rootObj->dump(paths);
         // 重新 dump 之后 currentObj 可能变了（甚至变成 nullptr ——
         // 路径指向的对象在这一瞬间被销毁了）。下一帧会重新取，
         // 但这一帧后面的代码还在用它，这里显式同步。
@@ -3885,6 +3906,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                 // （klass 指针 + monitor）当字段内容写进去，字段直接损坏。
                                 // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
                                 Il2cpp::SetFieldValue(currentObj, f, &newStr);
+                                RecordFieldChange(rootObj, val, "字符串", value);
                                 RequestRefresh(rootObj);
                             });
                     }
@@ -3931,6 +3953,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                             int32_t narrow = static_cast<int32_t>(raw);
                                             Il2cpp::SetFieldValue(currentObj, field, &narrow);
                                         }
+                                        RecordFieldChange(rootObj, field && field->getName() ? field->getName() : "?", "枚举", result);
                                         RequestRefresh(rootObj);
                                     },
                                     fieldType);
@@ -3953,6 +3976,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                    bool b = value == "True";
                                    // split key by space
                                    currentObj->setField(val.c_str(), (int)b);
+                                   RecordFieldChange(rootObj, val, "布尔", value);
                                    ensureIfValueType(currentObj, paths, rootObj);
                                    RequestRefresh(rootObj);
                                });
@@ -3985,6 +4009,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        }
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
+                                           RecordFieldChange(rootObj, val, type, text);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
                                        }
@@ -4020,6 +4045,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        }
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
+                                           RecordFieldChange(rootObj, val, type, text);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
                                        }

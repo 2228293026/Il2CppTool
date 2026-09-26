@@ -8,6 +8,7 @@
 #include "Includes/obfuscate.h" // for make_obfuscator, OBFUSCATE
 #include "Menu/ImGui.h"
 #include "Tool/Keyboard.h"
+#include "Tool/ChangeLog.h"
 #include "Tool/Tool.h"
 #include "Tool/SelfCheck.h"
 #include "Tool/Util.h"
@@ -318,6 +319,21 @@ void draw_thread()
             else
                 ImGui::Text("对象绘制管理器未启用（在「工具」页勾选开启）");
             ImGui::EndTabItem();
+        }
+
+        // 改动记录页：只读，不参与任何游戏逻辑。
+        {
+            const size_t n = ChangeLog::Count();
+            std::string label = "改动记录";
+            if (n > 0)
+            {
+                label = "改动记录 (" + std::to_string(n) + ")";
+            }
+            if (ImGui::BeginTabItem(label.c_str()))
+            {
+                ChangeLog::DrawUI();
+                ImGui::EndTabItem();
+            }
         }
 
         // 日志页。

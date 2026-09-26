@@ -1,3 +1,4 @@
+#include "ChangeLog.h"
 #include "Patcher.h"
 #include "Il2cpp/il2cpp-class.h"
 #include "KittyMemory/KittyMemory.h"
@@ -371,6 +372,18 @@ std::vector<uint8_t> Patcher::patch()
     // ARM 上这一步不能省：指令改完不刷 I-cache，CPU 可能继续执行旧字节
     // （表现为补丁「时灵时不灵」或干脆跑飞）。
     __builtin___clear_cache((char *)target, (char *)target + bytes.size());
+
+    // 补丁是**改方法体**里最狠的一类改动，事后完全想不起来当时打了什么。
+    // 记一条：方法名 + 写进去的字节数。
+    {
+        // patch() 只拿到方法**入口地址**，拿不到 MethodInfo*（MethodInfo 是
+        // UI 层的东西，不该反向传进来）。所以记地址 + 长度 ——
+        // 配合「Patcher」页里显示的类名/方法名一样能对上。
+        char addr[32]{0};
+        snprintf(addr, sizeof(addr), "%p", target);
+        ChangeLog::Record(ChangeLog::Kind::Patch, std::string("方法 @ ") + addr,
+                          "改写前 " + std::to_string(bytes.size()) + " 字节（见 Patcher 页）");
+    }
 
     if (!KittyMemory::ProtectAddr(target, bytes.size(), originalProtect))
     {
