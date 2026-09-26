@@ -290,6 +290,13 @@ namespace Tool
             ObjectDrawManager::Shutdown();
             objMgrRunning = false;
         }
+        // 解析不全就重试（最多每 2 秒一次）。用户在加载画面早期就勾上
+        // 「对象绘制管理器」是完全可能的，那时 UnityEngine 的一些类
+        // 还没注册好 —— 一次性解析失败会让 ESP 整个会话都是死的。
+        if (ObjectDrawManager::showObjectManager)
+        {
+            ObjectDrawManager::RetryPendingResolve();
+        }
 
         [[maybe_unused]] static auto _ = []
         {

@@ -107,6 +107,9 @@ public:
     static size_t DrawObjectCount();
     // 当前持有的 GC 强根总数（扫描缓存 + 已绘制目标 + 已保存对象）。
     static size_t TotalRootCount();
+    // 还有方法没解析到就重试（最多每 2 秒一次）。渲染线程上调用。
+    // 见 ResolveDrawingApis 的注释：初始化时机不由工具控制，早失败必须能自愈。
+    static void RetryPendingResolve();
 };
 
 extern ObjectDrawManager g_ObjectDrawManager;

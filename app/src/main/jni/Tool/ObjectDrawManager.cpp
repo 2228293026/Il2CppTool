@@ -145,6 +145,15 @@ static inline Il2CppObject* ResolveMainCamera()
 static void ReleaseMainCamera();
 
 static MethodInfo* g_WorldToScreenPoint = nullptr;
+
+// 上次惰性重试的时间（渲染线程独占）。用 steady_clock 的 epoch 秒数，
+// 而不是 ImGui::GetTime() —— 后者只有 ImGui 上下文活着时才有意义。
+//
+// 存成 double 而不是 time_point：time_point 的默认构造不是 constexpr，
+// 静态初始化期会因此生成调用构造函数的代码（clang-tidy cert-err58-cpp）。
+// double + 常量 0.0 就没有这个问题。
+// 初值 0 表示「从没重试过」：epoch 秒数远大于 2，于是第一次一定立即重试。
+static double s_lastResolveRetry = 0.0;
 static MethodInfo* g_IsNativeObjectAlive = nullptr;
 
 // 给一个待绘制目标加根。
@@ -756,55 +765,86 @@ void ObjectDrawManager::DrawAll() {
     }
 }
 
+// ESP / 对象绘制依赖的方法解析。
+//
+// 之前是**一次性**的：Initialize() 里解析一次，失败就是 null 到会话结束。
+// 而这个工具的初始化时机不由它控制 —— 用户在加载画面早期就勾上
+// 「对象绘制管理器」是完全可能的，那时 UnityEngine 的一些类还没注册好，
+// FindClass 拿不到 → ESP **整个会话都是死的**。
+//
+// 症状还特别隐蔽：解析结果只记在 LOGD 里，而 **LOGD 在正式版是被编译掉的**
+// —— 也就是说正式版用户看到的是「ESP 什么都不画」，没有任何线索。
+//
+// 现在改成**惰性重试**：Tick 里发现有还是 null 的，最多每 2 秒重试一次，
+// 只补 null 的那些（幂等，开销极小），一旦补上用 LOGI 明说 ——
+// 这样正式版的日志里能看到「晚到的解析」，排障时是个明确的线索。
+static void ResolveDrawingApis()
+{
+    if (g_GetTransform == nullptr)
+    {
+        if (auto *c = Il2cpp::FindClass("UnityEngine.GameObject"))
+        {
+            g_GameObjectClass = c;
+            g_GetTransform = c->getMethod("get_transform");
+            g_GetName = c->getMethod("get_name");
+            // GameObject.GetComponent<T>() 在 il2cpp 里是泛型方法，编译后名字是
+            // "GetComponent<Renderer>"（元数据里保留泛型参数）。用单参的
+            // "GetComponent" 拿到的是 GetComponent(Type)，传错参数会取到
+            // 随便什么东西 —— 比拿不到更糟，因为它「成功」了。
+            g_GetComponent = c->getMethod("GetComponent<UnityEngine.Renderer>", 0);
+        }
+    }
+    if (g_GetPosition == nullptr)
+    {
+        if (auto *c = Il2cpp::FindClass("UnityEngine.Transform"))
+        {
+            g_TransformClass = c;
+            g_GetPosition = c->getMethod("get_position");
+        }
+    }
+    if (g_GetBounds == nullptr)
+    {
+        if (auto *c = Il2cpp::FindClass("UnityEngine.Renderer"))
+        {
+            g_RendererClass = c;
+            g_GetBounds = c->getMethod("get_bounds");
+        }
+    }
+    if (g_IsNativeObjectAlive == nullptr)
+    {
+        if (auto *c = Il2cpp::FindClass("UnityEngine.Object"))
+        {
+            g_IsNativeObjectAlive = c->getMethod("IsNativeObjectAlive");
+        }
+    }
+    if (g_CameraClass == nullptr)
+    {
+        if (auto *c = Il2cpp::FindClass("UnityEngine.Camera"))
+        {
+            g_CameraClass = c;
+            if (ResolveMainCamera())
+            {
+                // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有
+                // 多个重载（含带 MonoOrStereoscopicEye 的两参版本），按下标取
+                // 很容易挑错签名；而 invoke 是按「尾部再塞一个 MethodInfo*」
+                // 的约定直接 reinterpret 成函数指针调的，签名一错就等于把隐藏
+                // 参数喂到枚举参数的位置上 → 寄存器/栈错乱。
+                g_WorldToScreenPoint = c->getMethod("WorldToScreenPoint", 1);
+            }
+        }
+    }
+}
+
 void ObjectDrawManager::Initialize() {
     LOGI("初始化对象绘制管理器");
 
-    auto GameObjectClass = Il2cpp::FindClass("UnityEngine.GameObject");
-    g_GameObjectClass = GameObjectClass;
-    if (GameObjectClass) {
-        g_GetTransform = GameObjectClass->getMethod("get_transform");
-        g_GetName = GameObjectClass->getMethod("get_name");
-        // 拿 Renderer 组件用来算真实包围盒。
-        //
-        // GameObject.GetComponent<T>() 在 il2cpp 里是泛型方法，编译后名字是
-        // "GetComponent<Renderer>"（元数据里保留泛型参数）。这里必须用
-        // **泛型实例化后的名字**，用 "GetComponent" 单参版本拿到的是
-        // GetComponent(Type)，传错参数会取到 ScriptableObject/Component
-        // 之类的随便什么东西 —— 比拿不到更糟，因为它「成功」了。
-        g_GetComponent = GameObjectClass->getMethod("GetComponent<UnityEngine.Renderer>", 0);
-    }
+    ResolveDrawingApis();
 
-    auto RendererClass = Il2cpp::FindClass("UnityEngine.Renderer");
-    g_RendererClass = RendererClass;
-    if (RendererClass) {
-        g_GetBounds = RendererClass->getMethod("get_bounds");
-    }
-
-    auto TransformClass = Il2cpp::FindClass("UnityEngine.Transform");
-    g_TransformClass = TransformClass;
-    if (TransformClass) {
-        g_GetPosition = TransformClass->getMethod("get_position");
-    }
-
-    auto CameraClass = Il2cpp::FindClass("UnityEngine.Camera");
-    g_CameraClass = CameraClass;
-    if (CameraClass) {
-        // 走 RefreshCamera 而不是直接赋值：它会把新相机挂上 GC 根，
-        // 直接写裸指针会漏掉句柄。
+    // 走 RefreshCamera 而不是直接赋值：它会把新相机挂上 GC 根，
+    // 直接写裸指针会漏掉句柄。
+    if (g_CameraClass)
+    {
         RefreshCamera();
-        if (ResolveMainCamera()) {
-            // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有多个重载
-            // （含带 MonoOrStereoscopicEye 的两参版本），按下标取很容易挑错签名；
-            // 而 invoke 是按「尾部再塞一个 MethodInfo*」的约定直接 reinterpret 成函数指针调的，
-            // 签名一错就等于把隐藏参数喂到枚举参数的位置上 → 寄存器/栈错乱。
-            // 显式按名字 + 1 个参数找；找不到就留空，后面所有调用点都有判空。
-            g_WorldToScreenPoint = CameraClass->getMethod("WorldToScreenPoint", 1);
-        }
-    }
-
-    auto UnityObject = Il2cpp::FindClass("UnityEngine.Object");
-    if (UnityObject) {
-        g_IsNativeObjectAlive = UnityObject->getMethod("IsNativeObjectAlive");
     }
 
     LOGD("对象绘制管理器: 方法解析 -> transform=%p position=%p name=%p alive=%p w2s=%p "
@@ -812,6 +852,47 @@ void ObjectDrawManager::Initialize() {
          (void*)g_GetTransform, (void*)g_GetPosition, (void*)g_GetName,
          (void*)g_IsNativeObjectAlive, (void*)g_WorldToScreenPoint,
          (void*)g_GetComponent, (void*)g_GetBounds);
+
+    // 解析不全要说一声，而且要用 **LOGI 不是 LOGD** —— LOGD 在正式版被
+    // 编译掉，那样用户就是「ESP 不画框」且毫无线索。
+    if (g_GetTransform == nullptr || g_GetPosition == nullptr || g_WorldToScreenPoint == nullptr)
+    {
+        LOGW("对象绘制: 部分方法尚未解析到（transform=%p position=%p w2s=%p）。"
+             "会每 2 秒自动重试；如果一直失败，通常是勾选得太早（游戏还没加载完）"
+             "或这个游戏裁掉了相应 API。",
+             (void*)g_GetTransform, (void*)g_GetPosition, (void*)g_WorldToScreenPoint);
+    }
+}
+
+// 惰性重试。渲染线程上调用。
+void ObjectDrawManager::RetryPendingResolve()
+{
+    if (g_GetTransform && g_GetPosition && g_GetBounds && g_GetComponent &&
+        g_IsNativeObjectAlive && g_CameraClass && g_WorldToScreenPoint)
+    {
+        return; // 都齐了
+    }
+    const double now = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now - s_lastResolveRetry < 2.0)
+    {
+        return;
+    }
+    s_lastResolveRetry = now;
+
+    const bool wasIncomplete = (g_GetTransform == nullptr || g_WorldToScreenPoint == nullptr);
+    ResolveDrawingApis();
+    if (g_CameraClass)
+    {
+        RefreshCamera();
+    }
+
+    if (wasIncomplete && g_GetTransform && g_WorldToScreenPoint)
+    {
+        // 用 LOGI：正式版日志里能看到「晚到的解析」，是排障时的明确线索。
+        LOGI("对象绘制: 方法解析已完成（重试生效），ESP 现在可用");
+    }
 }
 
 // ---- 自检用的查询接口 ----
