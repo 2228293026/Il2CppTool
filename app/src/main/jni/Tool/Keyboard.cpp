@@ -22,6 +22,17 @@ namespace Keyboard
     {
         TouchScreenKeyboard = Il2cpp::FindClass("UnityEngine.TouchScreenKeyboard");
         LOGPTR(TouchScreenKeyboard);
+        if (!TouchScreenKeyboard)
+        {
+            // 不在这里放弃：Open() 每次会重试（见那里的注释），
+            // 这里只先说明，免得完全无声。
+            LOGW("TouchScreenKeyboard 暂时不可用，将在每次打开键盘时重试");
+        }
+    }
+
+    bool IsAvailable()
+    {
+        return TouchScreenKeyboard != nullptr;
     }
 
     void Open(const std::function<void(const std::string &)> &callback)
@@ -30,11 +41,23 @@ namespace Keyboard
     }
     void Open(const char *text, const std::function<void(const std::string &)> &callback)
     {
-        // 类可能不存在（没有该模块的 Unity 版本）。
-        // 旧代码直接 TouchScreenKeyboard->invoke_static_method，空指针就崩。
+        // 类可能不存在（没有该模块的 Unity 版本），也可能是**取得太早**：
+        // Init() 只解析一次，而它跑在 on_init 里，不保证晚于游戏的元数据
+        // 注册。一次失败就 null 到会话结束 = **整个工具的文本输入全废**
+        // （搜索框、参数输入、字段编辑、预设名全靠它），
+        // 而用户只会看到「点了没反应」。
+        // 所以这里取不到就再试一次 —— 代价只是一次类查找。
         if (!TouchScreenKeyboard)
         {
-            LOGE("TouchScreenKeyboard 类不可用，无法打开键盘");
+            TouchScreenKeyboard = Il2cpp::FindClass("UnityEngine.TouchScreenKeyboard");
+            if (TouchScreenKeyboard)
+            {
+                LOGI("TouchScreenKeyboard 已可用（此前解析失败，现已恢复）");
+            }
+        }
+        if (!TouchScreenKeyboard)
+        {
+            LOGE("TouchScreenKeyboard 类不可用，无法打开键盘（文本输入不可用）");
             return;
         }
         LOGD("Keyboard Open");

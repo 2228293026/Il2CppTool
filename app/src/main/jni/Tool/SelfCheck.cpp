@@ -3,6 +3,7 @@
 #include "Includes/Logger.h"
 #include "ObjectDrawManager.h"
 #include "Tool/Tool.h"
+#include "Tool/Keyboard.h"
 #include "Tool/Unity.h"
 #include "imgui/imgui.h"
 
@@ -76,6 +77,22 @@ std::vector<Result> Collect()
             out.push_back(Ok("触摸偏移", "自检通过"));
         }
     }
+    // ---- 软键盘 ----
+    // 这是**整个工具的文本输入**的唯一入口：搜索框、参数输入、字段编辑、
+    // 预设名全靠它。它不可用时用户只会看到「点了没反应」，
+    // 而不会有任何报错 —— 所以必须在自检里显式列出。
+    {
+        if (Keyboard::IsAvailable())
+        {
+            out.push_back(Ok("软键盘", "TouchScreenKeyboard 可用"));
+        }
+        else
+        {
+            out.push_back(Fail("软键盘", "TouchScreenKeyboard 不可用 —— **所有文本输入都无法使用**"));
+        }
+    }
+
+    // ---- ImGui 上下文 ----
     {
         if (Unity::g_uiContextAlive)
         {
@@ -86,6 +103,8 @@ std::vector<Result> Collect()
             out.push_back(Fail("ImGui 上下文", "已销毁 —— 菜单不可用"));
         }
     }
+
+    // ---- ImGui 上下文 ----
 
     // ---- ESP 前置条件 ----
     // 这些是 ESP 能不能工作的全部前提。任何一条不成立，现象都是
