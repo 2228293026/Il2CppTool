@@ -48,10 +48,11 @@ std::vector<Result> Collect()
     // ---- 程序集 / 类 ----
     {
         char buf[160]{0};
-        snprintf(buf, sizeof(buf), "%zu 个程序集", g_Images.size());
+        snprintf(buf, sizeof(buf), "%zu 个程序集（每 3 秒自动复查，数量变化会刷新列表）",
+                 g_Images.size());
         if (g_Images.empty())
         {
-            out.push_back(Fail("程序集", "一个都没枚举到 —— 常见于游戏还没加载完，或 il2cpp 被裁剪"));
+            out.push_back(Fail("程序集", "一个都没枚举到 —— 工具初始化早于游戏，尚未恢复"));
         }
         else
         {

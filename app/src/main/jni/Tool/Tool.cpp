@@ -24,6 +24,10 @@ std::vector<Il2CppImage *> g_Images;
 CircularBuffer<HookerTrace> HookerData::visited{50};
 std::unordered_map<Il2CppClass *, std::set<Il2CppObject *>> HookerData::collectSet{};
 
+// g_Images / g_Image 定义在 Main.cpp（工具入口）。
+extern std::vector<Il2CppImage *> g_Images;
+extern Il2CppImage *g_Image;
+
 namespace Tool
 {
     struct CallData
@@ -272,8 +276,59 @@ namespace Tool
 #endif
     }
 
+    // 动态加载的 assembly 不会自己冒出来。
+    //
+    // g_Images 是初始化时枚举**一次**的结果，但 Unity 支持运行时加载
+    // assembly（Addressables / 程序集热更 / 某些引擎的插件机制）。
+    // 那些后来加载的 assembly 里的类，在列表里**永远不会出现** ——
+    // 用户看到的是「这个类明明在 dump 里，工具里搜不到」。
+    //
+    // 每 3 秒重查一次，**只在数量真的变了**时才重刷所有 tab ——
+    // 没变化就什么都不做，所以常态开销只有一次 il2cpp_domain_get_assemblies。
+    // 渲染线程上调用。
+    static void RefreshDynamicImages()
+    {
+        static double s_lastImageRefresh = 0.0;
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        if (now - s_lastImageRefresh <= 3.0)
+        {
+            return;
+        }
+        s_lastImageRefresh = now;
+        auto fresh = Il2cpp::GetImages();
+        fresh.erase(std::remove_if(fresh.begin(), fresh.end(),
+                                   [](Il2CppImage *img) { return img == nullptr; }),
+                    fresh.end());
+        if (fresh.size() == g_Images.size())
+        {
+            return; // 没变化就什么都不做
+        }
+        LOGI("检测到 assembly 数量变化: %zu -> %zu，重新枚举类",
+             g_Images.size(), fresh.size());
+        g_Images = std::move(fresh);
+        std::sort(g_Images.begin(), g_Images.end(),
+                  [](Il2CppImage *a, Il2CppImage *b)
+                  { return std::strcmp(a->getName(), b->getName()) < 0; });
+        // 所有 tab 重筛：新的 assembly 里可能有类匹配用户当前的关键字，
+        // 不重刷的话列表就停留在旧快照上。
+        for (ClassesTab &tab : classesTabs)
+        {
+            // 选中的 image 如果还在就保持，否则回到 g_Image。
+            if (tab.selectedImage != nullptr &&
+                std::find(g_Images.begin(), g_Images.end(), tab.selectedImage) == g_Images.end())
+            {
+                tab.selectedImage = g_Image;
+            }
+            tab.FilterClasses(tab.filter);
+        }
+    }
+
     void Draw()
     {
+        RefreshDynamicImages();
+
         // 采样放在 UI 之前：这一帧画出来的曲线要用这一帧刚采到的数据。
         SampleHookRates();
 

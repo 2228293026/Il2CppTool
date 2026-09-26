@@ -732,8 +732,16 @@ void on_init()
     {
         // 一个 image 都没有时不能往下走：Tool::Init 会开第一个 ClassesTab，
         // 而它会直接 selectedImage->getClasses()，g_Image 为空就是必崩。
-        LOGE("没有可用的 assembly，il2cpp 元数据可能尚未就绪，跳过类/方法枚举");
-        g_initState = INIT_FAILED;
+        //
+        // 但这**不是终态** —— 和上面 attach 失败一样，「一个 assembly 都
+        // 枚举不到」通常只是时机问题：工具挂进游戏进程的时刻不由它决定，
+        // il2cpp 的元数据注册可能还没完成（动态加载的 assembly 尤其是）。
+        //
+        // 旧代码这里直接 INIT_FAILED —— 于是「早了一点」就变成
+        // **整个会话没有任何类可看**，而且用户只会看到一个空列表，
+        // 不明白发生了什么。改成下一帧重试。
+        LOGW("暂未枚举到任何 assembly，il2cpp 元数据可能尚未就绪，稍后重试");
+        g_initState = INIT_PENDING;
         return;
     }
     Tool::Init(g_Image, images);
