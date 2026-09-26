@@ -915,6 +915,23 @@ static std::string StableParamKey(const char *paramName, int index)
 
 
 
+// 上一次字段写入失败的原因。空串 = 没有待显示的错误。
+//
+// 键盘回调是在**之后的某一帧**才被调用的，和绘制路径不在同一帧，
+// 所以不能在里面直接 ImGui::Text —— 那时 ImGui 帧上下文早就不在了。
+// 用文件级变量传回绘制路径显示。
+static std::string g_fieldError;
+static double g_fieldErrorAt = 0.0;
+
+static void ReportFieldError(const std::string &msg)
+{
+    g_fieldError = msg;
+    g_fieldErrorAt = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    LOGW("字段写入失败: %s", msg.c_str());
+}
+
 void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const MethodParamList &paramsInfo,
                             Il2CppObject *thiz)
 {
@@ -1185,17 +1202,61 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 // 这里在 Call 按钮的回调栈上，一旦抛出就会冲出 ImGui 渲染、
                 // 冲出 eglSwapBuffers 钩子 —— 整个游戏进程被 terminate。
                 // 统一走带保护的解析，失败就跳过该参数并提示。
-                auto parse = [&](auto tag, auto fn) {
+                auto parse = [&](auto tag) {
                     using T = decltype(tag);
                     T raw{};
                     try
                     {
-                        raw = fn(param.value);
+                        // **必须整串吃掉**。std::stoll / stod 接受部分输入：
+                        // std::stoll("12abc") 静默返回 12，std::stod("1.5e")
+                        // 静默返回 1.5。也就是用户敲错一个字符，工具就把一个
+                        // **不同的值**当成他的输入传给游戏 —— 界面上完全看不出异常。
+                        //
+                        // 上一轮在字段编辑器那边加了同样的检查，这里是
+                        // 同一条路径的另一半：之前只修了一处。
+                        const std::string &s = param.value;
+                        size_t pos = 0;
+                        if constexpr (std::is_same_v<T, int>)
+                        {
+                            raw = static_cast<int>(std::stol(s, &pos, 10));
+                        }
+                        else if constexpr (std::is_same_v<T, int64_t>)
+                        {
+                            raw = static_cast<int64_t>(std::stoll(s, &pos, 10));
+                        }
+                        else if constexpr (std::is_same_v<T, uint32_t>)
+                        {
+                            raw = static_cast<uint32_t>(std::stoul(s, &pos, 10));
+                        }
+                        else if constexpr (std::is_same_v<T, uint64_t>)
+                        {
+                            raw = static_cast<uint64_t>(std::stoull(s, &pos, 10));
+                        }
+                        else if constexpr (std::is_same_v<T, float>)
+                        {
+                            raw = std::stof(s, &pos);
+                        }
+                        else
+                        {
+                            raw = std::stod(s, &pos);
+                        }
+                        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos])))
+                        {
+                            ++pos;
+                        }
+                        if (pos != s.size())
+                        {
+                            LOGE("参数 %s 的值 \"%s\" 含有无法解析的尾部字符", name, s.c_str());
+                            parseFailed = true;
+                            ReportFieldError(std::string(name) + "：\"" + s + "\" 不是合法的数值");
+                            return;
+                        }
                     }
                     catch (const std::exception &e)
                     {
                         LOGE("参数 %s 的值 \"%s\" 无法解析为数值: %s", name, param.value.c_str(), e.what());
                         parseFailed = true;
+                        ReportFieldError(std::string(name) + "：\"" + param.value + "\" 无法解析为数值");
                         return;
                     }
                     auto *klass = type->getClass();
@@ -1210,17 +1271,17 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 };
 
                 if (strcmp(type->getName(), "System.Int32") == 0)
-                    parse(int{}, [](const std::string &s) { return std::stoi(s); });
+                    parse(int{});
                 else if (strcmp(type->getName(), "System.Int64") == 0)
-                    parse(int64_t{}, [](const std::string &s) { return std::stoll(s); });
+                    parse(int64_t{});
                 else if (strcmp(type->getName(), "System.UInt32") == 0)
-                    parse(uint32_t{}, [](const std::string &s) { return (uint32_t)std::stoul(s); });
+                    parse(uint32_t{});
                 else if (strcmp(type->getName(), "System.UInt64") == 0)
-                    parse(uint64_t{}, [](const std::string &s) { return std::stoull(s); });
+                    parse(uint64_t{});
                 else if (strcmp(type->getName(), "System.Single") == 0)
-                    parse(float{}, [](const std::string &s) { return std::stof(s); });
+                    parse(float{});
                 else if (strcmp(type->getName(), "System.Double") == 0)
-                    parse(double{}, [](const std::string &s) { return std::stod(s); });
+                    parse(double{});
                 else if (strcmp(type->getName(), "System.Boolean") == 0)
                 {
                     // using true/false sometimes causing crash for me, don't know why
@@ -3080,23 +3141,6 @@ static std::string FormatFieldForEdit(const std::string &type, const nlohmann::o
     }
     // 未知类型：走 float 旧路径，至少不崩
     return std::to_string(value.get<float>());
-}
-
-// 上一次字段写入失败的原因。空串 = 没有待显示的错误。
-//
-// 键盘回调是在**之后的某一帧**才被调用的，和绘制路径不在同一帧，
-// 所以不能在里面直接 ImGui::Text —— 那时 ImGui 帧上下文早就不在了。
-// 用文件级变量传回绘制路径显示。
-static std::string g_fieldError;
-static double g_fieldErrorAt = 0.0;
-
-static void ReportFieldError(const std::string &msg)
-{
-    g_fieldError = msg;
-    g_fieldErrorAt = std::chrono::duration<double>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                         .count();
-    LOGW("字段写入失败: %s", msg.c_str());
 }
 
 // 解析用户输入并按声明类型写回字段。
