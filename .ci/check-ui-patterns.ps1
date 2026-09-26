@@ -128,6 +128,63 @@ foreach ($f in ($files | Where-Object { $_.Extension -eq '.cpp' })) {
     }
 }
 
+# ---- 模式 B2：走路径写字段的函数**必须自己**做值类型写回 ----
+#
+# 第 67 轮抓到：冻结（新增功能）按路径写字段时，把值写进了**装箱副本** ——
+# 路径中间经过 struct 的话，游戏里的真实字段一点没变。而写入「成功」了，
+# 不报错，界面照常显示，只有值立不住。
+#
+# 修的时候我又犯了一版：让**调用方**判断要不要写回。于是「写」和「写回」
+# 分在两个函数里 —— 谁重构了其中一个，都会**静默**弄坏嵌套 struct。
+#
+# 规则：任何按 paths 逐段走并写字段的函数（WriteWatchValue），
+# 必须在**自己体内**出现 ensureIfValueType。写到别处去不算数。
+foreach ($f in $files) {
+    $lines = Get-Content $f.FullName
+    $joined = ($lines -join "`n")
+    if ($joined -notmatch 'static bool WriteWatchValue') { continue }
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^static bool WriteWatchValue') { continue }
+        # 跳过**前向声明**，只认定义。签名可能跨多行，所以要一直往下找到
+        # 「以 { 开头」（定义）或「以 ; 结尾」（声明）为止 ——
+        # 只看紧邻的下一行的话，多行签名会被当成声明，**整段规则不执行**。
+        # （第 68 轮在这上面卡了三轮：先是匹配到声明，再是匹配到注释。）
+        $n = $i
+        while ($n -lt $lines.Count) {
+            $trimmed = $lines[$n].Trim()
+            if ($trimmed -eq '') { $n++; continue }
+            if ($trimmed.StartsWith('{')) { break }
+            if ($trimmed.EndsWith(';')) { break }
+            $n++
+        }
+        if ($n -ge $lines.Count) { continue }
+        if (-not $lines[$n].Trim().StartsWith('{')) { continue }  # 那是声明
+        $start = $i
+        break
+    }
+    if ($start -lt 0) { continue }
+    $body = @()
+    for ($i = $start; $i -lt $lines.Count; $i++) {
+        $body += $lines[$i]
+        if ($lines[$i] -eq '}') { break }
+    }
+    # **必须先剥掉注释**再匹配。
+    # 函数里那段解释「为什么要写回」的注释本身就出现了 ensureIfValueType
+    # 这几个字 —— 第 68 轮第一次写这条规则时，就是被自己的注释骗过去的：
+    # 把真正的调用删掉，检查依然是绿的。
+    # 检查项必须匹配**代码**，不是文本。
+    $codeOnly = ($body | Where-Object { $_.Trim() -notmatch '^(//|\*|/\*)' }) -join "`n"
+    if ($codeOnly -notmatch 'ensureIfValueType') {
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $start + 1
+            Rule = 'B2: 按路径写字段却没有在函数内做值类型写回（嵌套 struct 会静默失效）'
+            Text = $lines[$start].Trim()
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

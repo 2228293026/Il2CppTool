@@ -288,24 +288,16 @@ void ClassesTab::DrawWatches()
             continue;
         }
         std::string value = w.frozenValue; // setField 按值传，不能用 const 引用
+        // WriteWatchValue 自己负责值类型写回（含嵌套 struct），
+        // 所以这里只关心成功与否。
         Il2CppObject *wroteTo = nullptr;
         if (!WriteWatchValue(live, w.paths, value, &wroteTo))
         {
-            // 写不进去（路径断了 / 类型变了）。每帧重试只会刷屏，
+            // 写不进去（路径断了 / 类型变了 / 值非法）。每帧重试只会刷屏，
             // 所以解除冻结并明确记一笔。
             w.frozen = false;
             ChangeLog::Record(ChangeLog::Kind::Field, w.label,
-                              "已解除冻结：写不进去（路径失效或类型不支持）");
-            continue;
-        }
-        // **关键**：路径中间如果经过值类型（struct），wroteTo 拿到的是
-        // 一个**装箱副本** —— 不把它写回父对象的字段槽位，游戏里的真实
-        // 字段一点没变。表现是「冻结了但值就是立不住」，而且不报错。
-        // struct 在 Unity 里到处都是（Player.stats.health 之类），
-        // 所以这一行不是可有可无的。
-        if (wroteTo != nullptr && wroteTo != live)
-        {
-            ensureIfValueType(wroteTo, w.paths, live);
+                              "已解除冻结：写不进去（路径失效、类型不支持或值非法）");
         }
     }
 
@@ -3841,11 +3833,22 @@ static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &
             }
             // 走字段编辑那套严格的解析（整串吃掉 + 范围检查），
             // 否则「12abc」会静默写成 12 —— 第 44 轮修过的坑。
-            if (lastObject != nullptr)
+            const bool ok = ParseAndSetNumericField(object, type, name, value);
+            if (ok && lastObject != nullptr)
             {
                 *lastObject = object;
             }
-            return ParseAndSetNumericField(object, type, name, value);
+            if (ok && object != root)
+            {
+                // **值类型写回放在函数内部**，而不是交给调用方。
+                //
+                // 上一版是调用方拿到 lastObject 自己判断要不要写回 ——
+                // 那样「写」和「写回」分在两个函数里，谁重构了其中一个
+                // 都会**静默**弄坏嵌套 struct，编译器也不会报。
+                // 机制要和需要它的代码放在一起，才不会散。
+                ensureIfValueType(object, paths, root);
+            }
+            return ok;
         }
         // 中间段：取子对象
         auto *klass = Il2cpp::GetObjectClass(object);
