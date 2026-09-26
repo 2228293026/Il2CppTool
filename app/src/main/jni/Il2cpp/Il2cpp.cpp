@@ -468,10 +468,39 @@ bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int,
     // 自己之前那份已经没了。
     //
     // 改成先写临时文件，成功结束时再改名替换：
-    //  - 取消/失败 → 临时文件被析构删除，原文件完好无损
+    //  - 取消/失败 → 临时文件被自动删除，原文件完好无损
     //  - 成功     → rename 原子替换
     const std::string finalPath{outDir};
     const std::string tempPath{finalPath + ".part"};
+
+    // RAII 清理临时文件。
+    //
+    // 原注释写着「取消/失败 → 临时文件被析构删除」，但**从来没有实现**：
+    // 打开临时文件之后的每一条 return（拿不到 domain、没有 assembly、
+    // 枚举失败、用户取消、写盘出错……）都会把 .part 留在磁盘上。
+    // 于是一次取消就会留下一堆垃圾文件，累积几次之后用户会以为
+    // 「导出把存储塞满了」——而真正的原因恰恰是导出**没成功**。
+    //
+    // 成功路径在最后 rename 掉临时文件，这里 disarm 一下就不会把
+    // 刚改好的正式文件再删一遍。
+    struct TempFileCleanup
+    {
+        const std::string &path;
+        bool armed = true;
+        ~TempFileCleanup()
+        {
+            if (!armed)
+            {
+                return;
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            if (ec)
+            {
+                LOGW("dump: 未能删除临时文件 %s: %s", path.c_str(), ec.message().c_str());
+            }
+        }
+    } tempCleanup{tempPath};
 
     std::ofstream outStream(tempPath, std::ios::out | std::ios::trunc);
     if (!outStream.is_open())
@@ -679,6 +708,8 @@ bool il2cpp_dump(const char *outDir, const std::function<bool(const char *, int,
         }
     }
     LOGI("dump done! %s (%zu 个类)", finalPath.c_str(), doneClasses);
+    // 临时文件已经变成正式文件了，RAII 别再删它。
+    tempCleanup.armed = false;
     return true;
 }
 

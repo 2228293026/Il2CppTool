@@ -631,6 +631,33 @@ namespace Tool
         switch (state)
         {
         case DumpState::Idle:
+        {
+            // **先告诉用户会写到哪里。**
+            //
+            // 之前只有导出完成后才有一个「复制路径」按钮，路径本身
+            // 从来没有显示在界面上 —— 用户必须点按钮、粘到某个地方
+            // 才能知道文件在哪。Android 上 persistentDataPath 还是在
+            // /storage/emulated/0/Android/data/<包名>/files 下面，
+            // 让用户自己拼出来是不现实的。
+            //
+            // 导出中、导出完成、以及「之前导出过」三种情况都用同一段显示。
+            {
+                std::string preview = outputPath;
+                if (preview.empty())
+                {
+                    preview = Il2cpp::getDataPath() + "/" + Il2cpp::getPackageName() + "_" +
+                              Il2cpp::getGameVersion() + ".cs";
+                }
+                if (preview.find("unknown_") == std::string::npos)
+                {
+                    ImGui::TextWrapped("将导出到: %s", preview.c_str());
+                }
+                else
+                {
+                    ImGui::TextDisabled("读不到包名/版本，暂时无法确定导出文件名（游戏可能还没就绪）");
+                }
+                ImGui::Separator();
+            }
             if (ImGui::Button("导出 .cs (DUMP)"))
             {
                 // 路径长度不受控（包名 + 数据目录 + 版本号），用 std::string
@@ -652,6 +679,7 @@ namespace Tool
                 }
             }
             break;
+        } // ← 关闭 case DumpState::Idle 的块
 
         case DumpState::Running:
         {
@@ -673,6 +701,10 @@ namespace Tool
             {
                 ImGui::TextDisabled("%s", message.c_str());
             }
+            if (!outputPath.empty())
+            {
+                ImGui::TextDisabled("导出到: %s", outputPath.c_str());
+            }
             if (ImGui::Button("取消"))
             {
                 Dump().cancelRequested.store(true, std::memory_order_relaxed);
@@ -682,6 +714,12 @@ namespace Tool
 
         case DumpState::Done:
             ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "导出完成");
+            // 路径**显示出来**，而不只是「复制」按钮 ——
+            // 用户要的第一个信息就是「文件到底在哪」。
+            if (!outputPath.empty())
+            {
+                ImGui::TextWrapped("文件: %s", outputPath.c_str());
+            }
             if (ImGui::Button("复制路径"))
             {
                 Keyboard::Open(outputPath.c_str(), nullptr);
@@ -696,7 +734,16 @@ namespace Tool
 
         case DumpState::Cancelled:
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.3f, 1.f), "已取消：%s", message.c_str());
-            ImGui::TextDisabled("文件里是**不完整**的内容，不适合直接使用");
+            // 旧文案写的是「文件里是不完整的内容」—— 那是改成
+            // 「先写 <name>.part、完成后才 rename」之前的做法。
+            // 现在取消时 .part 会被删掉、正式文件**根本没被碰过**，
+            // 所以旧文案是错的：用户会以为已有的导出被弄坏了，
+            // 白白重新导一次（大型游戏要几分钟）。
+            ImGui::TextDisabled("取消不会损坏已有文件：导出先写临时文件，完成后才改名");
+            if (!outputPath.empty())
+            {
+                ImGui::TextDisabled("目标: %s", outputPath.c_str());
+            }
             if (ImGui::Button("再试一次"))
             {
                 std::lock_guard guard(Dump().mutex);
@@ -706,6 +753,10 @@ namespace Tool
 
         case DumpState::Failed:
             ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "导出失败：%s", message.c_str());
+            if (!outputPath.empty())
+            {
+                ImGui::TextDisabled("目标: %s", outputPath.c_str());
+            }
             if (ImGui::Button("重试"))
             {
                 std::lock_guard guard(Dump().mutex);
