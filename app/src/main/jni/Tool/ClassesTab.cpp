@@ -102,6 +102,209 @@ static Il2CppObject *ResolveSaved(Il2CppObject *obj)
 
 constexpr int MAX_CLASSES = 500;
 
+// ===================================================================
+// 关注值（Watch）
+// ===================================================================
+//
+// 实现要点：
+//
+// 1. **必须加 GC 根**。关注列表是跨帧持久的，而游戏随时可能销毁对应实体。
+//    每 200ms 重读一次，两次之间对象被回收 = 拿野指针解引用 → 崩溃。
+//    借用 savedSet 那套句柄管理，但**自己持有句柄**：watch 是「用户盯着看的
+//    那个具体对象」，不应该因为它没被 Save 过就不保活。
+//
+// 2. **走句柄解析**，不直接用裸指针。对象在移动/重建后地址可能变，
+//    gchandle 是唯一可靠的存活判断。
+//
+// 3. 轮询频率 200ms。不是每帧 —— dump 一条路径会构造 JSON、
+//    走类型分派，N 个关注项每帧跑是不必要的开销。
+//    又不是几秒一次 —— 那样「盯着看」就没意义了。
+static std::vector<ClassesTab::Watch> g_watches;
+static double g_watchLastPoll = 0.0;
+
+void ClassesTab::AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
+                          const std::string &label)
+{
+    if (!object || paths.empty())
+    {
+        return;
+    }
+    // 同一个对象的同一条路径不重复加
+    for (auto &w : g_watches)
+    {
+        if (w.object == object && w.paths == paths)
+        {
+            return;
+        }
+    }
+    auto handle = Il2cpp::GC::NewHandle(object);
+    if (handle == 0)
+    {
+        LOGW("关注失败：加根没成功 %p", static_cast<void *>(object));
+        return;
+    }
+    if (g_watches.size() >= 64)
+    {
+        LOGW("关注列表已满（64 条），忽略新增");
+        Il2cpp::GC::FreeHandle(handle);
+        return;
+    }
+    g_watches.push_back({object, handle, paths, label, {}, false, false});
+}
+
+void ClassesTab::RemoveWatchAt(size_t index)
+{
+    if (index >= g_watches.size())
+    {
+        return;
+    }
+    if (g_watches[index].handle)
+    {
+        Il2cpp::GC::FreeHandle(g_watches[index].handle);
+    }
+    g_watches.erase(g_watches.begin() + index);
+}
+
+void ClassesTab::ClearWatches()
+{
+    for (auto &w : g_watches)
+    {
+        if (w.handle)
+        {
+            Il2cpp::GC::FreeHandle(w.handle);
+        }
+    }
+    g_watches.clear();
+}
+
+size_t ClassesTab::WatchCount()
+{
+    return g_watches.size();
+}
+
+// 把一个 JSON 标量渲染成短文本。不是标量就返回空串（不显示）。
+static std::string JsonToText(const nlohmann::ordered_json &j)
+{
+    if (j.is_null())
+    {
+        return "null";
+    }
+    if (j.is_boolean())
+    {
+        return j.get<bool>() ? "true" : "false";
+    }
+    if (j.is_number_unsigned())
+    {
+        return std::to_string(j.get<uint64_t>());
+    }
+    if (j.is_number_integer())
+    {
+        return std::to_string(j.get<int64_t>());
+    }
+    if (j.is_number_float())
+    {
+        char buf[64]{0};
+        // %g：血量之类不需要小数点后 15 位；但也要能显示 0.5 这种。
+        snprintf(buf, sizeof(buf), "%.6g", j.get<double>());
+        return buf;
+    }
+    if (j.is_string())
+    {
+        return j.get<std::string>();
+    }
+    return {};
+}
+
+void ClassesTab::DrawWatches()
+{
+    if (g_watches.empty())
+    {
+        return;
+    }
+    ImGui::Separator();
+    ImGui::Text("关注值（每 200ms 自动刷新）");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("全部清除"))
+    {
+        ClearWatches();
+        return;
+    }
+
+    // 低频轮询。放在画之前一次性更新所有条目。
+    const double now = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now - g_watchLastPoll >= 0.2)
+    {
+        g_watchLastPoll = now;
+        for (auto &w : g_watches)
+        {
+            w.changed = false;
+            Il2CppObject *live =
+                w.handle ? Il2cpp::GC::GetHandleTarget(w.handle) : nullptr;
+            if (!live)
+            {
+                w.invalid = true;
+                continue;
+            }
+            w.invalid = false;
+            try
+            {
+                // paths 是 non-const 引用（dump 的签名如此），这里用副本。
+                auto paths = w.paths;
+                auto result = live->dump(paths);
+                std::string text = JsonToText(result.second);
+                if (text.empty())
+                {
+                    // 不是标量（子对象 / 数组）—— 关注叶子字段才有意义。
+                    text = "<非标量>";
+                }
+                if (text != w.lastValue)
+                {
+                    w.changed = !w.lastValue.empty();
+                    w.lastValue = text;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                w.invalid = true;
+                w.lastValue = std::string("<读取失败: ") + e.what() + ">";
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g_watches.size();)
+    {
+        auto &w = g_watches[i];
+        ImGui::PushID(static_cast<int>(i));
+        if (w.changed)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(120, 255, 120, 255));
+        }
+        ImGui::TextUnformatted(w.label.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (w.invalid)
+        {
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s",
+                               w.lastValue.empty() ? "<对象已失效>" : w.lastValue.c_str());
+        }
+        else
+        {
+            ImGui::TextUnformatted(w.lastValue.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x"))
+        {
+            RemoveWatchAt(i);
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::PopID();
+        ++i;
+    }
+}
+
 int maxLine{5};
 std::unordered_map<void *, HookerData> hookerMap;
 NeverDestroyedMutex hookerMtx;
@@ -3442,14 +3645,24 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         // GetClassType 同样可能返回空（元数据被裁剪时）。
         auto *currentType = Il2cpp::GetClassType(currentObj->klass);
         bool isValueType = currentType != nullptr && currentType->isValueType();
+        // 关注按钮只给**叶子上的原始类型**。结构体/数组 dump 出来是
+        // 一个对象，盯不出「值变了」—— 给个只会一直显示「<非标量>」的按钮
+        // 比不给更糟。
+        bool canWatch = isLast && currentType != nullptr && currentType->isPrimitive() &&
+                        currentObj != nullptr;
         if (isLast && isValueType)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(222, 222, 222, 255));
         }
         if (isLast && currentObj && savedSet[currentObj->klass].count(currentObj) == 0)
         {
-            auto width = ImGui::CalcTextSize("Save").x + ImGui::GetStyle().FramePadding.x * 5.f;
-            buttonPressed = ImGui::Button(key, ImVec2(ImGui::GetContentRegionAvail().x - width, 0));
+            // 三个按钮的宽度要先算出来，不能让最后一个「吃掉剩余宽度」——
+            // 那样每加一个按钮都要改一遍布局算式。
+            const ImGuiStyle &style = ImGui::GetStyle();
+            const float wSave = ImGui::CalcTextSize("Save").x + style.FramePadding.x * 5.f;
+            const float wWatch = canWatch ? ImGui::CalcTextSize("W").x + style.FramePadding.x * 3.f : 0.f;
+            buttonPressed =
+                ImGui::Button(key, ImVec2(ImGui::GetContentRegionAvail().x - wSave - wWatch, 0));
             if (ImGui::IsItemHeld())
             {
                 Tool::OpenNewTabFromClass(currentObj->klass);
@@ -3458,8 +3671,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             ImGui::SameLine();
             char buttonLabel[32]{0};
             sprintf(buttonLabel, "Save");
-            if (ImGui::Button(buttonLabel,
-                              ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x, 0)))
+            if (ImGui::Button(buttonLabel, ImVec2(wSave, 0)))
             {
                 savedSet[currentObj->klass].insert(currentObj);
                 SaveObjectWithRoot(currentObj);
@@ -3467,6 +3679,33 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             if (ImGui::IsItemHovered())
             {
                 ImGui::SetTooltip("%p", currentObj);
+            }
+            if (canWatch)
+            {
+                ImGui::SameLine();
+                if (ImGui::Button("W", ImVec2(wWatch, 0)))
+                {
+                    const size_t depth = static_cast<size_t>(it - paths.begin()) + 1;
+                    std::vector<std::string> watchPaths(dataMap[rootObj].second.begin(),
+                                                       dataMap[rootObj].second.begin() + depth);
+                    // 标签用「类名.最后两级路径」：只用叶子名（比如 "health"）
+                    // 在关注列表里根本认不出是哪个对象的 —— 同一个类里
+                    // 常常有好几个 health。也不适合用完整路径（可能十几级，
+                    // 文本会溢出面板）。
+                    std::string label =
+                        (rootObj->klass && rootObj->klass->getName()) ? rootObj->klass->getName() : "?";
+                    const size_t from = depth > 2 ? depth - 2 : 0;
+                    for (size_t k = from; k < depth; k++)
+                    {
+                        label += ".";
+                        label += watchPaths[k];
+                    }
+                    AddWatch(rootObj, watchPaths, label);
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("关注这个值：之后每 200ms 自动刷新，变了会变绿");
+                }
             }
         }
         else
@@ -3508,8 +3747,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         RequestRefresh(rootObj);
     }
     if (ConsumeRefresh(rootObj))
-    {
-        dataMap[rootObj].first = rootObj->dump(paths);
+    {        dataMap[rootObj].first = rootObj->dump(paths);
         // 重新 dump 之后 currentObj 可能变了（甚至变成 nullptr ——
         // 路径指向的对象在这一瞬间被销毁了）。下一帧会重新取，
         // 但这一帧后面的代码还在用它，这里显式同步。
@@ -3844,6 +4082,8 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             }
             ImGui::EndPopup();
         }
+        // 关注列表放在最底下，任何对象的检视器都能看到（不必回到加它的那一个）。
+        DrawWatches();
         poper.Update();
         ImGui::EndChild();
         ImGui::EndTable();

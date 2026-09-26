@@ -94,6 +94,36 @@ struct ClassesTab
     // savedSet 是 static 的，但计数要走它所在的那个 TU。
     static size_t SavedObjectCount();
 
+    // ---- 关注值（Watch）----
+    //
+    // JSON 检视器显示的是**一次性快照**：改了值要点 Refresh 才刷新。
+    // 但这个工具最常见的用法是盯着**一个数**（血量、弹药、分数、开关标志）
+    // 随游戏实时变化 —— 为此每次都点 Refresh 既繁琐又容易看错。
+    //
+    // 所以：把某个叶子字段钉进关注列表，之后每 200ms 自动重读一次，
+    // 值变了就高亮。这样「看一个数」从「反复手动刷新」变成「盯着看」。
+    //
+    // 刻意保持**只读**：写入已经在字段编辑里做过了，而且写入需要用户
+    // 明确输入新值。自动化的写入风险太高（写错一个偏移就是改坏游戏状态），
+    // 收益也不明确。
+    struct Watch
+    {
+        Il2CppObject *object;             // 原始指针，仅用于显示和去重
+        uint32_t handle;                  // GC 强根：必须，否则对象被回收后就是野指针
+        std::vector<std::string> paths;   // 从根对象到这个叶子字段的路径
+        std::string label;                // 显示用，如 "Player.health"
+        std::string lastValue;            // 上一次读到的值（用于判断是否变化）
+        bool changed;                     // 本次轮询里值变了
+        bool invalid;                     // 对象已被 GC 或路径失效
+    };
+    static void AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
+                         const std::string &label);
+    static void RemoveWatchAt(size_t index);
+    static void ClearWatches();
+    static size_t WatchCount();
+    // 在 JSON 检视器末尾画关注列表。由 ImGuiJson 调用。
+    static void DrawWatches();
+
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
     MethodList &buildMethodMap(Il2CppClass *klass);

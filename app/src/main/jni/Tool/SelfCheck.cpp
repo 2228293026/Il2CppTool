@@ -162,8 +162,20 @@ std::vector<Result> Collect()
         out.push_back(Info("数据目录", buf));
     }
 
-    // ---- 已保存的对象数 ----
-    // 这些是用户手动标记的，靠 GC 强根保活。数量异常偏大通常意味着
+    // ---- 关注值 ----
+    // 关注项各自持有一个 GC 强根。数量失控 = 强根失控 = 游戏对象永远回收不掉，
+    // 和「已保存对象」是同一类泄漏，所以放在一起看。
+    {
+        const size_t watched = ClassesTab::WatchCount();
+        if (watched > 0)
+        {
+            char buf[128]{0};
+            snprintf(buf, sizeof(buf), "%zu 项（每项一个 GC 强根，每 200ms 重读一次）", watched);
+            out.push_back(Info("关注值", buf));
+        }
+    }
+
+    // ---- 已保存的对象数 ----    // 这些是用户手动标记的，靠 GC 强根保活。数量异常偏大通常意味着
     // 「关掉了标签页但根没释放」——那会让游戏对象永远回收不掉。
     {
         out.push_back(Info("已保存对象", std::to_string(ClassesTab::SavedObjectCount())));
