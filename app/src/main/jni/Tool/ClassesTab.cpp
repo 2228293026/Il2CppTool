@@ -5370,6 +5370,11 @@ size_t ClassesTab::SavedObjectCount()
     }
     return total;
 }
+
+bool ClassesTab::FilterWorkerRunning()
+{
+    return g_workerRunning;
+}
 std::unordered_map<MethodInfo *, ClassesTab::OriginalMethodBytes> ClassesTab::oMap;
 std::unordered_map<Il2CppClass *, bool> ClassesTab::states;
 PopUpSelector ClassesTab::poper;
