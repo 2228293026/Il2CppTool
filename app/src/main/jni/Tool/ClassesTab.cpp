@@ -100,6 +100,27 @@ static Il2CppObject *ResolveSaved(Il2CppObject *obj)
     return obj;
 }
 
+// 「剩下多少宽度可用」，**并且保证不为负**。
+//
+// ImGui 的控件宽度如果算成负数，ImGui 自己并不知道这不对：
+// 画出来是一个退化的矩形（点不中），或者和右边的控件叠在一起。
+// 调试版有断言，正式版（我们就是正式版）静默画错。
+//
+// 手机上这个风险是实打实的：面板宽度随窗口缩放、tab 栏嵌套、
+// 字体缩放而变，而这里减掉的是**固定像素**的按钮宽度。
+// 窄一点的设备上，一个 "Save" + "W" 就要 70 多像素，
+// 剩下的不够时就是负数。
+static float AvailMinus(float reserved)
+{
+    return std::max(0.0f, ImGui::GetContentRegionAvail().x - reserved);
+}
+
+// 留出一个固定宽度按钮 + 边框内边距。
+static float AvailMinusButton(const char *label, float padFactor = 5.0f)
+{
+    return AvailMinus(ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * padFactor);
+}
+
 constexpr int MAX_CLASSES = 500;
 
 // ===================================================================
@@ -3684,8 +3705,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             const ImGuiStyle &style = ImGui::GetStyle();
             const float wSave = ImGui::CalcTextSize("Save").x + style.FramePadding.x * 5.f;
             const float wWatch = canWatch ? ImGui::CalcTextSize("W").x + style.FramePadding.x * 3.f : 0.f;
-            buttonPressed =
-                ImGui::Button(key, ImVec2(ImGui::GetContentRegionAvail().x - wSave - wWatch, 0));
+            // 两个按钮的宽度都是固定像素，窄屏上加起来会超过可用宽度 ——
+            // 减出来是负数，ImGui 会画出一个退化的、点不中的矩形。
+            buttonPressed = ImGui::Button(key, ImVec2(AvailMinus(wSave + wWatch), 0));
             if (ImGui::IsItemHeld())
             {
                 Tool::OpenNewTabFromClass(currentObj->klass);
@@ -3734,7 +3756,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         else
         {
             buttonPressed =
-                ImGui::Button(key, ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x, 0));
+                ImGui::Button(key, ImVec2(AvailMinus(ImGui::GetStyle().FramePadding.x), 0));
             if (ImGui::IsItemHeld())
             {
                 Tool::OpenNewTabFromClass(currentObj->klass);
@@ -3811,10 +3833,10 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                 {
                     ImGui::Text("%s = [Empty]", key.c_str());
                 }
-                else if (ImGui::Button(key.c_str(), ImVec2(key.length() <= 3 ? ImGui::GetContentRegionAvail().x -
-                                                                                   ImGui::GetStyle().FramePadding.x
-                                                                             : 0,
-                                                           0)))
+                else if (ImGui::Button(key.c_str(), ImVec2(key.length() <= 3
+                                                                ? AvailMinus(ImGui::GetStyle().FramePadding.x)
+                                                                : 0,
+                                                            0)))
                 {
                     try
                     {
@@ -4031,7 +4053,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::BeginChild("bottom");
-        if (ImGui::Button("Methods", ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x, 0)))
+        if (ImGui::Button("Methods", ImVec2(AvailMinus(ImGui::GetStyle().FramePadding.x), 0)))
         {
             ImGui::OpenPopup("MethodPopup");
         }
@@ -4074,7 +4096,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
         }
 
         if (ImGui::Button("Dump to file",
-                          ImVec2(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x, 0)))
+                          ImVec2(AvailMinus(ImGui::GetStyle().FramePadding.x), 0)))
         {
             ImGui::OpenPopup("ProceedPopUp");
         }
