@@ -54,7 +54,10 @@ namespace Tool
     void Draw();
     void Tracer();
     void Hooker();
-    void GameObjects();
+    // 原来的 GameObjects() 已删除：全项目**没有任何调用者**（死代码），
+    // 而且里面有三处必崩的空指针解引用 —— Camera / UnityObject / IsNativeObjectAlive
+    // 都是 FindClass 之后不判空直接就 ->。死代码里带着必崩的路径，
+    // 比没有更糟：将来有人「顺手接上」就会崩。
     void Dumper();
     // 停止并回收 dump 工作线程。必须在线程仍 joinable 时调用，
     // 否则全局 std::thread 的析构会 std::terminate。

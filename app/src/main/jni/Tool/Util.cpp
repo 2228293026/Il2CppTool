@@ -75,17 +75,36 @@ namespace Util
         return nameStr.substr(dotIndex + 1);
     }
 
+    // 数据目录。**只缓存成功**。
+    //
+    // 原来的写法是三个地方各来一句 `static auto path = Il2cpp::getDataPath();`
+    // —— 第一次调用如果拿不到（游戏还没就绪），"unknown_data_path" 会被
+    // **永久缓存**，之后每一次 FileWriter / FileReader 都写到那个
+    // 不存在的路径里。用户看到的是：配置存不进去、预设丢了、
+    // dump 完找不到文件 —— 而且没有任何错误提示指向真正的原因。
+    //
+    // getApplicationString 已经改成「失败不缓存、会重试」，这里不能
+    // 再用 static 把它冻结掉（同一个坑：上层一次缓存抵消下层修复）。
+    static const std::string &DataPath()
+    {
+        static const std::string kFallback = "unknown_data_path";
+        static std::string cached;
+        if (cached.empty() || cached == kFallback)
+        {
+            cached = Il2cpp::getDataPath();
+        }
+        return cached;
+    }
+
     FileWriter::FileWriter(const std::string &fileName)
     {
-        static auto path = Il2cpp::getDataPath();
-        this->fileName = path + "/" + fileName;
+        this->fileName = DataPath() + "/" + fileName;
         this->open();
     }
 
     void FileWriter::init(const std::string &fileName)
     {
-        static auto path = Il2cpp::getDataPath();
-        this->fileName = path + "/" + fileName;
+        this->fileName = DataPath() + "/" + fileName;
     }
 
     void FileWriter::open()
@@ -122,8 +141,7 @@ namespace Util
     }
     FileReader::FileReader(const std::string &fileName)
     {
-        static auto path = Il2cpp::getDataPath();
-        this->fileName = path + "/" + fileName;
+        this->fileName = DataPath() + "/" + fileName;
         fileStream.open(this->fileName);
     }
 
