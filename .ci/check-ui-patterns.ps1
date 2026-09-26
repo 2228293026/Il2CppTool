@@ -439,6 +439,61 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 I：加根失败之后**不许**把对象指针存下来 ----
+#
+# 第 97 轮在 Keyboard.cpp 里发现的：
+#
+#     openedKeyboardHandle = GC::NewHandle(kb);
+#     if (openedKeyboardHandle == 0) { LOGW("...可能读到已回收对象"); }
+#     openedKeyboard = kb;          // ← 明知没有根，还是存下来了
+#
+# 后果不是「读到脏数据」，是**崩游戏**：
+# updateImpl() 每帧解引用 openedKeyboard（get_status / get_text），
+# 而它跑在渲染线程的 eglSwapBuffers 钩子里。没有 GC 根的对象
+# 随时可能被回收 —— 解引用它 = use-after-free。
+#
+# 旧代码那句 LOGW 其实**已经知道**这件事了，但没有改变行为。
+# 这就是「失败路径没有出口」：它记录了失败，然后继续往下走。
+#
+# 形状：NewHandle 的结果被判过、并且失败分支只是记日志，
+# 紧接着却把同一个对象赋给一个「会被解引用」的全局/成员。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 找到 `<var>Handle = ...NewHandle(<obj>)`
+        $m = [regex]::Match($t, '^\s*(?:[\w:]+::)?(\w*[Hh]andle)\s*=\s*[\w:]*NewHandle\(\s*(\w+)\s*\)')
+        if (-not $m.Success) { continue }
+        $handleVar = $m.Groups[1].Value
+        $obj = $m.Groups[2].Value
+        # 往后 8 行：必须有一个 `return`（或 throw）在赋值之前
+        # 窗口要够宽 —— 失败分支里通常有一大段说明加清理调用；
+        # 第一次写 8 行，而赋值在第 28 行，规则**从来没被验证过**。
+        for ($k = $i + 1; $k -le [Math]::Min($i + 30, $lines.Count - 1); $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -match '^(//|\*|/\*)') { continue }
+            # 赋值给了另一个变量（不是同一个 obj）
+            if ($u -match "^\s*(?:[\w:]+::)?(\w+)\s*=\s*$obj\s*;") {
+                $dest = $Matches[1]
+                if ($dest -eq $obj) { continue }
+                # 赋值之前出现过 return 就算有出口
+                $before = $lines[$i..($k-1)] -join "`n"
+                $hasExit = $before -match '\breturn\b'
+                if (-not $hasExit) {
+                    $hits += [pscustomobject]@{
+                        File = $f.Name
+                        Line = $k + 1
+                        Rule = 'I: 加根失败后仍把对象存下来（无 GC 根的对象会被解引用 = 崩游戏）'
+                        Text = $u
+                    }
+                }
+                break
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

@@ -78,7 +78,30 @@ namespace Keyboard
         openedKeyboardHandle = Il2cpp::GC::NewHandle(kb);
         if (openedKeyboardHandle == 0)
         {
-            LOGW("键盘对象加根失败，后续状态查询可能读到已回收对象");
+            // 加根失败 = 这个托管对象**随时可能被 GC 回收**。
+            //
+            // 而 updateImpl() 每帧都要解引用 openedKeyboard（get_status /
+            // get_text），它跑在渲染线程的 eglSwapBuffers 钩子里 ——
+            // 解引用一个被回收的对象就是崩游戏，而且崩的是**游戏**，
+            // 不是这个工具。
+            //
+            // 旧代码在这里只 LOGW 一句「可能读到已回收对象」，然后
+            // **照样** openedKeyboard = kb：明知没有根还继续每帧解引用。
+            // Update() 的唯一守卫就是 if (openedKeyboard)，所以那条
+            // 「继续走下去」的路径是**实际会发生**的，不是理论风险。
+            //
+            // 正确做法是**别开这个键盘**：把刚打开的关掉，
+            // openedKeyboard 保持空 —— Update() 于是整个跳过。
+            LOGE("键盘对象加根失败，已放弃打开（否则每帧会解引用可能已回收的对象）");
+            if (kb->klass)
+            {
+                if (auto *destroyMethod = kb->klass->getMethod("Destroy"))
+                {
+                    destroyMethod->invoke_static<void>(kb);
+                }
+            }
+            lastCallback = nullptr;
+            return;
         }
         openedKeyboard = kb;
         lastCallback = callback;

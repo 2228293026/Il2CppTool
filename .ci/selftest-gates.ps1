@@ -175,6 +175,28 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
+$iCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'I 加根失败不许存指针' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'NewHandle\(kb\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $j = -1
+    for ($k = $i; $k -lt $i + 30; $k++) {
+        if ($ls[$k] -match '^\s*return;\s*$') { $j = $k; break }
+    }
+    if ($j -lt 0) { return $false }
+    $ls.RemoveAt($j)
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/Keyboard.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $iCheck 'app/src/main/jni/Tool/Keyboard.cpp'
 # ---- 12. 规则 H：把第 94 轮那个「每 2 秒改一次文件系统」复现出来 ----
 $hCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
