@@ -1481,6 +1481,29 @@ namespace Il2cpp
         return imagesCache;
     }
 
+    // 绕过缓存重新枚举一遍 image。
+    //
+    // 存在的理由：GetImages() 是**带缓存**的（非空就直接返回 imagesCache），
+    // 所以拿它去「检测有没有新 assembly」是**永远检测不到**的 ——
+    // 拿缓存和自己比，数量当然一样。
+    //
+    // il2cpp_domain_get_assemblies 本身返回的是域里持有的数组（不是拷贝），
+    // 这里只做一次浅拷贝，代价和 GetImages 首次调用同量级。
+    std::vector<Il2CppImage *> GetImagesFresh()
+    {
+        std::vector<Il2CppImage *> fresh;
+        const auto &[ass, size] = GetAssemblies();
+        fresh.reserve(size);
+        for (size_t i = 0; i < size; i++)
+        {
+            if (auto *img = GetImage(ass[i]))
+            {
+                fresh.push_back(img);
+            }
+        }
+        return fresh;
+    }
+
     // 安全地读 UnityEngine.Application 上的一个静态字符串属性。
     //
     // 旧代码是 `static auto Application = FindClass("UnityEngine.Application");

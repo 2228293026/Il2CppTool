@@ -875,23 +875,42 @@ void ObjectDrawManager::RetryPendingResolve()
     const double now = std::chrono::duration<double>(
                            std::chrono::steady_clock::now().time_since_epoch())
                            .count();
-    if (now - s_lastResolveRetry < 2.0)
+    // **指数退避**，不是固定 2 秒。
+    //
+    // FindClass 查不到时要遍历该程序集的所有类型做名字比对 —— 一个正常
+    // 规模的 Unity 游戏是十万量级的类型。固定 2 秒重试 = 每 2 秒几万次
+    // 字符串比较，**永远**持续下去（有的游戏就是没有某个 API，
+    // 那它永远解析不到）。这是我上一轮引入的一笔永久开销。
+    //
+    // 2s → 4s → 8s … 封顶 60s：真正可能成功的那几次依然很快，
+    // 确实解析不出来时成本衰减到可忽略。
+    static double s_retryInterval = 2.0;
+    if (now - s_lastResolveRetry < s_retryInterval)
     {
         return;
     }
     s_lastResolveRetry = now;
+    s_retryInterval = std::min(s_retryInterval * 2.0, 60.0);
 
-    const bool wasIncomplete = (g_GetTransform == nullptr || g_WorldToScreenPoint == nullptr);
     ResolveDrawingApis();
     if (g_CameraClass)
     {
         RefreshCamera();
     }
 
-    if (wasIncomplete && g_GetTransform && g_WorldToScreenPoint)
+    if (g_GetTransform && g_GetPosition && g_WorldToScreenPoint)
     {
         // 用 LOGI：正式版日志里能看到「晚到的解析」，是排障时的明确线索。
         LOGI("对象绘制: 方法解析已完成（重试生效），ESP 现在可用");
+        // 成功后退回快速重试，以便应对后续的早期失败
+        s_retryInterval = 2.0;
+    }
+    else if (s_retryInterval >= 60.0)
+    {
+        // 到顶了还解析不到，说明这个游戏就是没有相应 API。
+        // 停在这里，别再每分钟白烧一次 CPU。
+        LOGW("对象绘制: 多次重试仍无法解析到所需 API，已停止重试。"
+             "这个游戏可能裁剪了对应功能（例如没有 Renderer 包围盒）。");
     }
 }
 

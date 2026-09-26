@@ -56,7 +56,11 @@ namespace Il2cpp
     Il2CppAssembly *GetAssembly(const char *name);
     Il2CppClass *GetClass(Il2CppImage *image, const char *name);
     const std::tuple<Il2CppAssembly **, size_t> &GetAssemblies();
+    // 注意：这是**带缓存**的（非空就直接返回缓存）。要检测运行时新加载的
+    // assembly 必须用 GetImagesFresh() —— 用它去「看有没有变」永远看不到变化。
     const std::vector<Il2CppImage *> &GetImages();
+    // 绕过缓存重新枚举。用于「检测动态加载的 assembly」。
+    std::vector<Il2CppImage *> GetImagesFresh();
 
     // class
     FieldInfo *GetClassField(Il2CppClass *klass, const char *fieldName);

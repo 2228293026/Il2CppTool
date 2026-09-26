@@ -297,7 +297,11 @@ namespace Tool
             return;
         }
         s_lastImageRefresh = now;
-        auto fresh = Il2cpp::GetImages();
+        // **必须用 GetImagesFresh()**：GetImages() 是带缓存的（首次调用之后
+        // 永远返回同一个 vector），拿它去和 g_Images 比数量**永远不会不一样**
+        // —— 也就是拿缓存和自己比，检测不到任何新加载的 assembly。
+        // 上一版就踩了这个坑：功能看着写好了，实际上永远不触发。
+        auto fresh = Il2cpp::GetImagesFresh();
         fresh.erase(std::remove_if(fresh.begin(), fresh.end(),
                                    [](Il2CppImage *img) { return img == nullptr; }),
                     fresh.end());
