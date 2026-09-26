@@ -2212,10 +2212,21 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
             {
                 if (!RestorePatchedMethod(method, o.bytes))
                 {
-                    LOGE("恢复失败: %s", method->getName() ? method->getName() : "?");
+                    // **失败时绝不能清 o.bytes**。
+                    // 旧代码无条件 clear()，于是恢复失败之后：
+                    //   补丁还在内存里生效（原字节已经丢了，退不回去）
+                    //   而 `patched = !o.bytes.empty()` 变成 false，
+                    //   界面上显示「没打补丁」—— 工具在撒谎。
+                    //
+                    // 失败时必须保住原字节（用户可以重试），并且如实告诉用户。
+                    ReportFieldError(std::string("恢复 ") + (method->getName() ? method->getName() : "?") +
+                                     " 失败：原字节已保留，可再试一次");
                 }
-                o.bytes.clear();
-                o.text.clear();
+                else
+                {
+                    o.bytes.clear();
+                    o.text.clear();
+                }
             }
         }
     }
@@ -2253,10 +2264,21 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                 // 不能裸 memcpy：目标页此时通常是 R+X，直接写会 SIGSEGV。
                 if (!RestorePatchedMethod(method, o.bytes))
                 {
-                    LOGE("恢复失败: %s", method->getName() ? method->getName() : "?");
+                    // **失败时绝不能清 o.bytes**。
+                    // 旧代码无条件 clear()，于是恢复失败之后：
+                    //   补丁还在内存里生效（原字节已经丢了，退不回去）
+                    //   而 `patched = !o.bytes.empty()` 变成 false，
+                    //   界面上显示「没打补丁」—— 工具在撒谎。
+                    //
+                    // 失败时必须保住原字节（用户可以重试），并且如实告诉用户。
+                    ReportFieldError(std::string("恢复 ") + (method->getName() ? method->getName() : "?") +
+                                     " 失败：原字节已保留，可再试一次");
                 }
-                o.bytes.clear();
-                o.text.clear();
+                else
+                {
+                    o.bytes.clear();
+                    o.text.clear();
+                }
             }
             else
             {
