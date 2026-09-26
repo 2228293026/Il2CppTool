@@ -356,7 +356,8 @@ void ClassesTab::DrawWatches()
         return;
     }
     ImGui::Separator();
-    ImGui::Text("关注值（每 200ms 自动刷新）");
+    // 右键复制是隐藏操作，得在表头说一句 —— 否则用户根本不会去试。
+    ImGui::Text("关注值（每 200ms 自动刷新，右键某一行的值可复制）");
     ImGui::SameLine();
     if (ImGui::SmallButton("全部清除"))
     {
@@ -453,6 +454,32 @@ void ClassesTab::DrawWatches()
             else
             {
                 ImGui::TextUnformatted(w.lastValue.c_str());
+            }
+            // 右键复制。
+            //
+            // 为什么需要：找到 health = 87.4 之后，用户真正想做的事
+            // 通常是**把这个数拿走** —— 记到别的应用里、对比两次读数、
+            // 发到 issue 里。以前只能靠眼睛抄，一长串标签 + 一个
+            // 小数点很容易抄错，而抄错了根本看不出来。
+            //
+            // 放在右键菜单里而不是加一列按钮：这一行已经有 4 列了，
+            // 再加一列会让每行都挂一个图标，很吵；而右键是 ImGui 里
+            // 「针对这一项」的标准手势。
+            if (ImGui::BeginPopupContextItem("##watchcopy"))
+            {
+                // 对象已失效时 lastValue 是旧值，复制它容易让人误以为
+                // 现在还是这个数 —— 所以明确带上标记。
+                const std::string copyValue =
+                    w.invalid ? ("<对象已失效，上次读到 " + w.lastValue + ">") : w.lastValue;
+                if (ImGui::MenuItem("复制值", nullptr, false, !w.lastValue.empty()))
+                {
+                    ImGui::SetClipboardText(copyValue.c_str());
+                }
+                if (ImGui::MenuItem("复制 标签 = 值", nullptr, false, !w.lastValue.empty()))
+                {
+                    ImGui::SetClipboardText((w.label + " = " + copyValue).c_str());
+                }
+                ImGui::EndPopup();
             }
 
             ImGui::TableNextColumn();
