@@ -11,6 +11,13 @@ namespace Util
     void prependStringToBuffer(char *buffer, size_t capacity, const char *string);
     std::string extractClassNameFromTypename(const char *typeName);
 
+    // 数据目录（带「只缓存成功 + 失败会重试」的逻辑，见 Util.cpp 的 DataPath()）。
+    //
+    // ConfigSave 的原子写需要自己拼最终路径，所以要能拿到这个路径 ——
+    // 但**必须走这里**，不能直接调 Il2cpp::getDataPath()：
+    // 那个「上层一次 static 缓存抵消下层修复」的坑踩过一次。
+    const std::string &DataPathString();
+
     class FileWriter
     {
       public:

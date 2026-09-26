@@ -51,6 +51,16 @@ std::string g_hookError;
 
     std::vector<ClassesTab> classesTabs;
 
+    // 配置读失败过没有。**自检页要显示它** ——
+    // 这个 catch 会直接 ConfigSave() 覆盖掉那份坏文件，于是用户
+    // 「全部配置丢失」这件事在界面上**一点痕迹都没有**：
+    // 标签页回到默认、参数预设没了，而工具看起来一切正常。
+    static bool g_configLoadFailed = false;
+    bool ConfigLoadFailed()
+    {
+        return g_configLoadFailed;
+    }
+
     void ConfigLoad()
     {
         LOGD(__FUNCTION__);
@@ -63,15 +73,103 @@ std::string g_hookError;
         catch (nlohmann::json::exception &e)
         {
             LOGE("Failed to load class_tabs.json: %s", e.what());
+            // 覆盖之前先把坏文件留一份：万一还能手工抢救一点
+            // （比如从里面抠出几个参数预设），不至于彻底没了。
+            try
+            {
+                std::error_code ec;
+                const std::string bad = Util::DataPathString() + "/class_tabs.json";
+                const std::string bak = bad + ".corrupt";
+                std::filesystem::copy_file(bad, bak, std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec)
+                {
+                    LOGW("保留损坏配置副本失败: %s", ec.message().c_str());
+                }
+            }
+            catch (const std::exception &e)
+            {
+                // 留副本只是尽力而为，失败也不该影响「恢复可用状态」这件事。
+                LOGW("保留损坏配置副本时抛异常: %s", e.what());
+            }
+            catch (...)
+            {
+                LOGW("保留损坏配置副本时发生未知异常");
+            }
+            g_configLoadFailed = true;
             ConfigSave();
         }
     }
     void ConfigSave()
     {
         LOGD(__FUNCTION__);
-        Util::FileWriter configFile("class_tabs.json");
+        // **原子写**：先写 .part，成功后再 rename 替换正式文件。
+        //
+        // 旧代码直接 FileWriter("class_tabs.json") 打开写 —— ofstream 默认
+        // **截断**，所以进程在写的中途被杀（游戏崩、用户强杀、系统回收），
+        // 磁盘上留下的是一个**半截的 JSON**。下一次启动 ConfigLoad 读到它，
+        // nlohmann 解析失败，于是**全部**配置丢失 —— 标签页、参数预设、
+        // 改了半天的设置，一次崩溃就全没了。
+        //
+        // 而且它没有任何提示：保存那一下「看起来是成功的」。
+        //
+        // 这个模式不是新发明的：`Il2cpp.cpp` 导出 .cs 已经在用
+        // （`finalPath + ".part"` + `std::filesystem::rename`），
+        // 那边的注释写得更详细。这里复用同一套。
+        //
+        // 配置比导出更该这么做 —— 导出失败只是重导一次，配置丢了是全丢。
+        const std::string finalPath = Util::DataPathString() + "/class_tabs.json";
+        const std::string tempPath = finalPath + ".part";
+
+        struct TempCleanup
+        {
+            const std::string &path;
+            bool armed = true;
+            ~TempCleanup()
+            {
+                if (armed)
+                {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                }
+            }
+        } tempCleanup{tempPath};
+
         nlohmann::ordered_json j = classesTabs;
-        configFile.write(j.dump(2, ' ').c_str());
+        const std::string text = j.dump(2, ' ');
+
+        {
+            std::ofstream out(tempPath, std::ios::out | std::ios::trunc);
+            if (!out.is_open())
+            {
+                LOGE("配置无法写入: %s", tempPath.c_str());
+                return; // 正式文件保持原样
+            }
+            out << text;
+            out.flush();
+            // 不检查写盘结果就 rename，等于把「写了一半」的文件
+            // 变成正式的 —— 那比截断更糟，因为原来的好文件也没了。
+            if (!out.good())
+            {
+                LOGE("配置写入中断（磁盘满？): %s", tempPath.c_str());
+                return;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tempPath, finalPath, ec);
+        if (ec)
+        {
+            // 和 dump 一样：rename 失败就退回「拷贝 + 删除」，再不行报错。
+            LOGW("配置 rename 失败(%s)，退回拷贝", ec.message().c_str());
+            std::filesystem::remove(finalPath, ec);
+            std::filesystem::rename(tempPath, finalPath, ec);
+            if (ec)
+            {
+                LOGE("配置保存失败: %s", ec.message().c_str());
+                return;
+            }
+        }
+        tempCleanup.armed = false; // 已经改名，别把正式文件删了
     }
     void ConfigInit()
     {

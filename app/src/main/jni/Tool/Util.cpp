@@ -95,6 +95,11 @@ namespace Util
         }
         return cached;
     }
+    // 对外暴露（ConfigSave 的原子写要自己拼路径）。
+    const std::string &DataPathString()
+    {
+        return DataPath();
+    }
 
     FileWriter::FileWriter(const std::string &fileName)
     {

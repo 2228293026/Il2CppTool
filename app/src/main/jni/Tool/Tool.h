@@ -49,6 +49,11 @@ namespace Tool
 {
     void ConfigSave();
     void ConfigLoad();
+
+    // 本次启动读配置失败过（那份坏文件已被覆盖成默认，副本在 .corrupt）。
+    // 自检页用它把「配置被重置」这件事显示出来 —— 否则用户只看到
+    // 「设置怎么都回默认值了」，没有任何地方说明原因。
+    bool ConfigLoadFailed();
     void Init(Il2CppImage *image, std::vector<Il2CppImage *> images);
     void FilterClasses(const std::string &filter);
     void Draw();
