@@ -175,6 +175,24 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 12. 规则 H：把第 94 轮那个「每 2 秒改一次文件系统」复现出来 ----
+$hCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'H 自检项不许有副作用' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'static const bool kProbeResult') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # 把探针从「一次性」挪回「每 2 秒的采集路径里」
+    $ls.Insert($i, '    std::remove(Il2cpp::getDataPath().c_str());')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/SelfCheck.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $hCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
 # ---- 11. 门禁必须按 **UTF-8** 读源码，不能跟着系统区域设置走 ----
 # 第 92 轮 CI 红而本地绿，查出来是这一条：
 #

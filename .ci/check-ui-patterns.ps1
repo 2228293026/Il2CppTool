@@ -403,6 +403,42 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 H：自检项**不许有副作用**，尤其不许改文件系统 ----
+#
+# 第 94 轮：我自己在第 84 轮加的「数据目录可写」探针，每 2 秒
+# （Collect() 的刷新周期）在游戏的数据目录里建一个文件、写入、删掉。
+# 别的自检项都是只读的，只有这一条在**改文件系统** —— 而且
+# 目录可不可写是个**几乎不变**的属性，没有任何理由反复探测。
+#
+# 形状很好认：自检项里出现 fopen / remove / rename / copy_file，
+# 而它本来应该只是「读状态、给结论」。
+#
+# 排除：Util.cpp（那是 FileWriter 的实现本身）。
+# dump 的临时文件在 Il2cpp.cpp（它有自己的进度/取消通道）。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    if ($f.Name -ne 'SelfCheck.cpp') { continue }
+    # 允许**一次性的**探测：`static const bool x = []() { ... }();`
+    # 这种写法整个进程只执行一次，是「探一下就够」的正确形状。
+    # 真正要拦的是：写在**每 2 秒跑一次**的采集路径里的副作用。
+    $inOnceInit = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -match '^static\s+.*=\s*\[\]') { $inOnceInit = $true }
+        elseif ($t -match '^\}\(\);') { $inOnceInit = $false }
+        if ($inOnceInit) { continue }
+        if ($t -match '\b(fopen|remove|rename|copy_file|unlink|mkdir|system|popen)\s*\(') {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'H: 自检项有副作用（自检应该只读状态并给结论，不该改文件系统）'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

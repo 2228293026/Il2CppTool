@@ -246,10 +246,29 @@ std::vector<Result> Collect()
     //
     // 真的写一个探针再删掉：这是唯一能证明「可写」的方式，
     // 而这一页存在的意义就是把静默的环节摊开。
-    {
+    // ---- 但**只探一次**（第 94 轮改）----
+    // 原来是无条件 fopen/fputs/remove，而 Collect() 每 2 秒跑一次 ——
+    // 于是「只要自检这一页开着」，工具就每 2 秒在游戏的数据目录里
+    // 建一个文件、写入、删掉。别的检查都是只读的，只有这一条在
+    // **改文件系统**；而目录可不可写是个**几乎不变**的属性，
+    // 没有任何理由反复探测。
+    //
+    // 真正的失败模式（目录不可写）一次就暴露了。
+    // 现在整个进程只探一次。
+    static const bool kProbeResult = []() {
         const std::string probe = Il2cpp::getDataPath() + "/.il2cptool_write_probe";
-        FILE *f = fopen(probe.c_str(), "wb");
-        if (f == nullptr)
+        FILE *fp = fopen(probe.c_str(), "wb");
+        if (fp == nullptr)
+        {
+            return false;
+        }
+        const bool wrote = fputs("ok", fp) >= 0;
+        fclose(fp);
+        remove(probe.c_str());
+        return wrote;
+    }();
+    {
+        if (!kProbeResult)
         {
             out.push_back(Fail("数据目录可写",
                                "无法写入该目录 —— 参数预设和配置都不会被保存，"
@@ -257,17 +276,7 @@ std::vector<Result> Collect()
         }
         else
         {
-            const bool wrote = fputs("ok", f) >= 0;
-            fclose(f);
-            remove(probe.c_str());
-            if (wrote)
-            {
-                out.push_back(Ok("数据目录可写", "可写（已实际写入并删除一个探针文件）"));
-            }
-            else
-            {
-                out.push_back(Fail("数据目录可写", "文件能打开但写入失败 —— 配置不会保存"));
-            }
+            out.push_back(Ok("数据目录可写", "可写（已实际写入并删除一个探针文件）"));
         }
     }
     // ---- 补丁 · 原字节还在吗 ----
