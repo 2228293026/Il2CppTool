@@ -104,6 +104,11 @@ std::vector<Entry> Snapshot();
 // 条数。渲染线程每次都拷整个 vector 的话，先问一句更划算。
 size_t Count();
 
+    // 有多少条**还能撤销**。自检页每 2 秒刷新一次就要这个数字，
+    // 而 `Snapshot()` 会把每一条 Entry 整个拷出来 —— 每条 4 个 std::string
+    // 外加一个 vector<string>。几百条记录就是每 2 秒上千次堆分配。
+    size_t CountUndoable();
+
 void Clear();
 
 void DrawUI();

@@ -178,14 +178,10 @@ std::vector<Result> Collect()
         else
         {
             // 统计有多少条还能撤销 —— 全都不可撤销通常意味着句柄没拿到。
-            size_t undoable = 0;
-            for (const auto &e : ChangeLog::Snapshot())
-            {
-                if (ChangeLog::CanUndo(e))
-                {
-                    undoable++;
-                }
-            }
+            // 只数、不拷。Snapshot() 会把每条 Entry 整个拷出来
+            // （4 个 std::string + 一个 vector<string>），而这个页面
+            // 每 2 秒刷新一次 —— 几百条记录就是每 2 秒上千次堆分配。
+            const size_t undoable = ChangeLog::CountUndoable();
             snprintf(buf, sizeof(buf), "共 %zu 条，其中 %zu 条可撤销", records, undoable);
             if (undoable == 0)
             {

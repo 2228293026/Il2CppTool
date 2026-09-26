@@ -309,6 +309,20 @@ std::vector<Entry> Snapshot()
     return entries();
 }
 
+// 只数、不拷。理由见头文件的说明。
+size_t CountUndoable()
+{
+    std::lock_guard guard(mutex());
+    size_t n = 0;
+    for (const auto &e : entries())
+    {
+        if (CanUndoLocked(e))
+        {
+            n++;
+        }
+    }
+    return n;
+}
 size_t Count()
 {
     std::lock_guard guard(mutex());
