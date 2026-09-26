@@ -3559,15 +3559,43 @@ static std::unordered_map<Il2CppObject *, bool> g_refreshRequests;
 static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &type,
                                     const std::string &fieldName, const std::string &text);
 
+// 读一个叶子字段当前的值（文本）。读不到返回空串。
+//
+// **必须在写入之前调用**。第 73 轮是在写入之后才读「旧值」，
+// 于是读回来的就是刚写进去的新值 —— 撤销变成「把新值再写一遍」，
+// 按钮能点、不报错、什么也没发生。
+static std::string ReadScalarText(Il2CppObject *obj, const std::vector<std::string> &paths)
+{
+    if (obj == nullptr || paths.empty())
+    {
+        return {};
+    }
+    try
+    {
+        auto ps = paths; // dump 的签名要 non-const 引用
+        auto result = obj->dump(ps);
+        return JsonToText(result.second);
+    }
+    catch (...)
+    {
+        return {};
+    }
+}
+
 // ChangeLog 的撤销器：把字段退回到记录里的旧值。
 //
-// 和记录表一样全程 try/catch + 句柄判空 —— 撤销动作发生在
-// **ImGui 帧回调**里，从这里抛出去就是把渲染线程带崩。
+// 走 WriteWatchValue（第 66 轮写的那个按路径写入的函数），而不是
+// ParseAndSetNumericField：路径可能经过**值类型**，WriteWatchValue 内部
+// 会调 ensureIfValueType 把它写回父对象字段槽位 —— 不然撤销对
+// 嵌套 struct 里的字段是**无效的**。
+//
+// 全程 try/catch + 句柄判空：撤销发生在 **ImGui 帧回调**里，
+// 从这里抛出去就是把渲染线程带崩。
 static bool UndoFieldChange(const ChangeLog::Entry &entry)
 {
     try
     {
-        if (entry.handle == 0 || entry.field.empty() || entry.type.empty())
+        if (entry.handle == 0 || entry.paths.empty() || entry.oldValue.empty())
         {
             return false;
         }
@@ -3576,9 +3604,10 @@ static bool UndoFieldChange(const ChangeLog::Entry &entry)
         {
             return false; // 对象已经被回收了，退不回去
         }
-        // 走和写入时**完全同一套**解析（整串吃掉 + 范围检查），
-        // 否则「旧值 12abc」会被静默写成 12。
-        return ParseAndSetNumericField(obj, entry.type, entry.field, entry.oldValue);
+        std::string value = entry.oldValue; // 写入按值传，不能用 const 引用
+        // 最后一个参数是「交回被写入的对象」，撤销场景不需要知道，
+        // 传 nullptr。
+        return WriteWatchValue(obj, entry.paths, value, nullptr);
     }
     catch (...)
     {
@@ -3600,8 +3629,18 @@ static void FreeUndoHandle(uint32_t handle)
     }
 }
 
+// oldValue / ownerObj / paths 由**调用点在写入之前**读好传进来。
+//
+// 为什么不自己读：调用点在 setField / ParseAndSetNumericField **之后**，
+// 那时读到的已经是新值了 —— 第 73 轮就是这么写的，于是「恢复」
+// 会把新值再写一遍：按钮能点、不报错、但什么也没发生。
+//
+// ownerObj 是**持有该字段的那个对象**（可能是嵌套对象或装箱的
+// 值类型），不是整棵树的根 —— 字段路径就是相对它而言的。
 static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
-                              const std::string &type, const std::string &value)
+                              const std::string &type, const std::string &value,
+                              Il2CppObject *ownerObj, const std::vector<std::string> &paths,
+                              const std::string &oldValue)
 {
     if (!rootObj || !rootObj->klass || !rootObj->klass->getName())
     {
@@ -3609,39 +3648,14 @@ static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
     }
     const std::string target = std::string(rootObj->klass->getName()) + "." + field;
 
-    // 能不能撤销，取决于这是不是「单个数值字段」——
-    // 「整个对象」是加 GC 根这种操作，没有「单个旧值」可言。
-    if (!type.empty() && type != "(整个对象)" && !field.empty())
+    // 能撤销的充要条件：读到了旧值、知道字段在哪个对象上、路径非空。
+    if (ownerObj != nullptr && !paths.empty() && !oldValue.empty())
     {
-        // **先把旧值读出来**。RecordFieldChange 是在**写入之后**调用的
-        // （调用点在 setField 后面），所以现在读到的就是改之前的值。
-        //
-        // 用 dump 走一遍完整路径读，和写入用的是同一套路径表示。
-        std::string oldValue;
-        bool readOk = false;
-        // field 形如 "System.Int32 health"，dump 要的就是这个形式。
-        // 声明在 try 外面：后面 RecordUndoable 还要用。
-        const std::string fieldName = field;
-        try
-        {
-            auto paths = std::vector<std::string>{fieldName};
-            auto result = rootObj->dump(paths);
-            oldValue = JsonToText(result.second);
-            readOk = !oldValue.empty();
-        }
-        catch (...)
-        {
-            readOk = false;
-        }
-        if (readOk)
-        {
-            // 记录表**接管**这个句柄：条目被淘汰 / 清空时它自己会还回来。
-            // 不接管的话，对象会被一直钉着不回收；不接管也没法撤销。
-            uint32_t handle = Il2cpp::GC::NewHandle(rootObj);
-            ChangeLog::RecordUndoable(ChangeLog::Kind::Field, target, oldValue, value, handle, type,
-                                      fieldName);
-            return;
-        }
+        // 记录表**接管**这个句柄：条目被淘汰 / 恢复过 / 清空时它自己会还回来。
+        // 不接管的话对象会被一直钉着不回收；不接管也没法撤销。
+        uint32_t handle = Il2cpp::GC::NewHandle(ownerObj);
+        ChangeLog::RecordUndoable(ChangeLog::Kind::Field, target, oldValue, value, handle, paths);
+        return;
     }
     const std::string detail = type.empty() ? value : (type + " = " + value);
     ChangeLog::Record(ChangeLog::Kind::Field, target, detail);
@@ -4051,7 +4065,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             {
                 savedSet[currentObj->klass].insert(currentObj);
                 SaveObjectWithRoot(currentObj);
-                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根");
+                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", nullptr, {}, "");
             }
             if (ImGui::IsItemHovered())
             {
@@ -4201,7 +4215,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                     {
                         Keyboard::Open(
                             text.c_str(),
-                            [type = std::move(type), val = std::move(val), currentObj,
+                            [type = std::move(type), val = std::move(val), currentObj, paths,
                              rootObj](const std::string &value)
                             {
                                 LOGD("%s", value.c_str());
@@ -4217,8 +4231,10 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                 // 旧代码直接传 newStr（托管对象本身），等于把对象头
                                 // （klass 指针 + monitor）当字段内容写进去，字段直接损坏。
                                 // 引用类型字段也可以用 SetFieldValueObject 明确表达意图。
+                                // 旧值必须在 SetFieldValue **之前**读。
+                                const std::string prevValue = ReadScalarText(currentObj, paths);
                                 Il2cpp::SetFieldValue(currentObj, f, &newStr);
-                                RecordFieldChange(rootObj, val, "字符串", value);
+                                RecordFieldChange(rootObj, val, "字符串", value, currentObj, paths, prevValue);
                                 RequestRefresh(rootObj);
                             });
                     }
@@ -4236,7 +4252,7 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                             {
                                 poper.Open(
                                     "EnumSelector",
-                                    [fieldType, currentObj, field, rootObj](const std::string &result)
+                                    [fieldType, currentObj, field, paths, rootObj](const std::string &result)
                                     {
                                         auto *enumClass = fieldType->getClass();
                                         auto *enumField = enumClass ? enumClass->getField(result.c_str()) : nullptr;
@@ -4253,6 +4269,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                         auto raw = FieldInfo::getEnumStaticValue(enumField);
                                         auto *baseType = Il2cpp::GetEnumBaseType(enumClass);
                                         const char *baseName = baseType ? Il2cpp::GetTypeName(baseType) : nullptr;
+                                        // 旧值必须在两个分支的写入**之前**读 —— 之后
+                                        // 就只剩新值了（第 73 轮的 bug）。
+                                        const std::string prevValue = ReadScalarText(currentObj, paths);
 
                                         if (baseName && (strcmp(baseName, "System.Int64") == 0 ||
                                                          strcmp(baseName, "System.UInt64") == 0))
@@ -4265,7 +4284,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                             int32_t narrow = static_cast<int32_t>(raw);
                                             Il2cpp::SetFieldValue(currentObj, field, &narrow);
                                         }
-                                        RecordFieldChange(rootObj, field && field->getName() ? field->getName() : "?", "枚举", result);
+                                        RecordFieldChange(rootObj,
+                                                          field && field->getName() ? field->getName() : "?",
+                                                          "枚举", result, currentObj, paths, prevValue);
                                         RequestRefresh(rootObj);
                                     },
                                     fieldType);
@@ -4287,11 +4308,13 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                {
                                    bool b = value == "True";
                                    // split key by space
+                                   // 旧值必须在 setField **之前**读。
+                                   const std::string prevValue = ReadScalarText(currentObj, paths);
                                    currentObj->setField(val.c_str(), (int)b);
-                                   RecordFieldChange(rootObj, val, "布尔", value);
                                    ensureIfValueType(currentObj, paths, rootObj);
                                    RequestRefresh(rootObj);
-                               });
+                                   RecordFieldChange(rootObj, val, "布尔", value, currentObj, paths, prevValue);
+                                });
                 }
             }
             else if (value.is_number_float())
@@ -4319,9 +4342,15 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        {
                                            return;
                                        }
+                                       // **必须在写入之前**读旧值。放进下面的 if 里
+                                       // 就是错的：那时字段已经是新值了，于是
+                                       // 「恢复」等于「把新值再写一遍」——
+                                       // 按钮能点、不报错、什么也没发生。
+                                       const std::string prevValue = ReadScalarText(currentObj, paths);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text);
+                                           RecordFieldChange(rootObj, val, type, text, currentObj, paths,
+                                                             prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
                                        }
@@ -4355,9 +4384,15 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                        {
                                            return;
                                        }
+                                       // **必须在写入之前**读旧值。放进下面的 if 里
+                                       // 就是错的：那时字段已经是新值了，于是
+                                       // 「恢复」等于「把新值再写一遍」——
+                                       // 按钮能点、不报错、什么也没发生。
+                                       const std::string prevValue = ReadScalarText(currentObj, paths);
                                        if (ParseAndSetNumericField(currentObj, type, val, text))
                                        {
-                                           RecordFieldChange(rootObj, val, type, text);
+                                           RecordFieldChange(rootObj, val, type, text, currentObj, paths,
+                                                             prevValue);
                                            ensureIfValueType(currentObj, paths, rootObj);
                                            RequestRefresh(rootObj);
                                        }

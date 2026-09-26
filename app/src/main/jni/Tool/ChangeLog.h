@@ -43,10 +43,9 @@ struct Entry
     // 「退回去」比「看」常用得多：冻了个值玩够了、补丁打错了、
     // 想让游戏恢复正常 —— 每一次都需要撤销，而不是「记得当时
     // 改成了多少」再手填回去。
-    std::string oldValue;  // 改动**之前**的值（文本形式）
-    std::string type;      // 声明类型名，如 "System.Int32"
-    std::string field;     // 字段名，如 "health"
-    uint32_t handle = 0;   // 根对象的 GC 句柄（0 = 不可恢复）
+    std::string oldValue;               // 改动**之前**的值（文本形式）
+    std::vector<std::string> paths;     // 从被钉住的对象到这个叶子字段的路径
+    uint32_t handle = 0;                // 持有该字段的对象的 GC 句柄（0 = 不可恢复）
 };
 
 // 记录一条。thread-safe。target/detail 会被截断到合理长度。
@@ -54,13 +53,18 @@ void Record(Kind kind, const std::string &target, const std::string &detail);
 
 // 记录一条**可撤销**的字段改动。
 //
-// handle 必须是**根对象**的 GC 强根，所有权转移给记录表 ——
-// 记录表会在条目被淘汰或 Clear() 时自己释放它。
+// handle 必须是**持有该字段的那个对象**的 GC 强根（不是整棵树的根 ——
+// 字段可能在嵌套对象的第二层），所有权转移给记录表：记录表会在条目
+// 被淘汰、被恢复过、或 Clear() 时自己释放它。
 // 传 0 表示这次改动不可撤销（对象已经没了、或者「整对象保存」
 // 这类没有「单个旧值」可言的操作）。
+//
+// oldValue **必须是在写入之前读到的**。调用点如果在写完之后才记，
+// 读到的就是刚写进去的新值 —— 于是「恢复」变成「把新值再写一遍」：
+// 按钮能点、不报错、但什么也没发生。
 void RecordUndoable(Kind kind, const std::string &target, const std::string &oldValue,
-                    const std::string &newValue, uint32_t handle, const std::string &type,
-                    const std::string &field);
+                    const std::string &newValue, uint32_t handle,
+                    const std::vector<std::string> &paths);
 
 // 撤销动作由外部注入：ChangeLog 不认识 il2cpp，也不该认识。
 // 返回 true 表示恢复成功。

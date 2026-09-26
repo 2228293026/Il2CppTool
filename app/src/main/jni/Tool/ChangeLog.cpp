@@ -161,11 +161,17 @@ void SetHandleReleaser(HandleReleaser fn)
 }
 
 void RecordUndoable(Kind kind, const std::string &target, const std::string &oldValue,
-                    const std::string &newValue, uint32_t handle, const std::string &type,
-                    const std::string &field)
+                    const std::string &newValue, uint32_t handle,
+                    const std::vector<std::string> &paths)
 {
     if (target.empty())
     {
+        // 早退的话 handle 就**没人还了** —— 泄漏，而且是在最不起眼的地方。
+        // 不接管就不该由调用方交出来，所以这里直接释放。
+        if (handle != 0 && g_handleReleaser != nullptr)
+        {
+            g_handleReleaser(handle);
+        }
         return;
     }
     try
@@ -177,7 +183,7 @@ void RecordUndoable(Kind kind, const std::string &target, const std::string &old
         std::lock_guard guard(mutex());
         auto &v = entries();
         v.push_back({kind, Truncate(target, kMaxTarget), Truncate(detail, kMaxDetail),
-                     Truncate(oldValue, kMaxDetail), type, field, handle});
+                     Truncate(oldValue, kMaxDetail), paths, handle});
         if (v.size() > kMaxEntries)
         {
             // 淘汰最老的，**连同它们持有的 GC 句柄**。
@@ -186,6 +192,11 @@ void RecordUndoable(Kind kind, const std::string &target, const std::string &old
     }
     catch (...)
     {
+        // 记录失败但句柄已经收下了 → 同样要还回去。
+        if (handle != 0 && g_handleReleaser != nullptr)
+        {
+            g_handleReleaser(handle);
+        }
     }
 }
 
@@ -226,11 +237,20 @@ void MarkUndone(const Entry &entry)
             return;
         }
         // 只作废「可恢复」，条目本身留着 —— 它仍然是一条记录。
+        //
+        // **句柄必须归还**，不能只置零。置零 = 那个对象永远不会被回收，
+        // 而用户每点一次「恢复」就漏一个 —— 这是第 73 轮引入的泄漏，
+        // 第 74 轮审出来。
         if (e->handle != 0)
         {
+            if (g_handleReleaser != nullptr)
+            {
+                g_handleReleaser(e->handle);
+            }
             e->handle = 0;
         }
         e->oldValue.clear();
+        e->paths.clear();
     }
     catch (...)
     {
