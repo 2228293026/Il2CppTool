@@ -515,7 +515,11 @@ void DrawUI()
                                     ImGui::CalcTextSize("追踪").x + 8.0f);
             ImGui::TableSetupColumn("target", ImGuiTableColumnFlags_WidthFixed, avail * 0.34f);
             ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("undo", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+            // 宽度按**最宽的那个词**算，而不是按「恢复」两个字。
+            // 52 是给「恢复」留的；「不可恢复」四个中文字放不下，
+            // 会被裁成「不可…」—— 而那正是最需要看清的一种状态（第 104 轮）。
+            ImGui::TableSetupColumn("undo", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::CalcTextSize("不可恢复").x + 14.0f);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextColored(KindColor(it->kind), "%s", KindLabel(it->kind));
@@ -562,7 +566,36 @@ void DrawUI()
             {
                 // 占位，保证三列/四列的行高一致 —— 少一个控件会让这一行
                 // 比别的行矮一点，扫起来像有东西没加载出来。
-                ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+                // 不可恢复的行**必须看得出来**（第 104 轮）。
+                //
+                // 旧代码这一格只放一个看不见的 Dummy，于是：
+                //   · 逐条点了「恢复」，那一行在界面上**完全没变化**；
+                //   · 点了「全部恢复」，整个列表看起来**一模一样**，
+                //     只有上面那行文字说明发生了什么。
+                //
+                // 而用户真正要回答的问题是「**现在游戏里还挂着哪些改动**」。
+                // 列表长一个样，这个问题就**没法回答** —— 只能回去一条条点，
+                // 点到「恢复」按钮不见了才知道那条已经退过了。
+                //
+                // 三种状态要分开说：
+                //   已经恢复过   退过了（按钮消失是因为 oldValue 被清空）
+                //   本来就不可恢复  从来没有可回退的原值 / 撤销器没注入
+                // 混成一句「不可恢复」是不够的 —— 前者是正常的，后者是问题。
+                const bool reverted = it->handle == 0 && it->oldValue.empty();
+                if (reverted)
+                {
+                    ImGui::TextDisabled("已恢复");
+                }
+                else
+                {
+                    ImGui::TextDisabled("不可恢复");
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip(
+                            "这一条没有可回退的原值（或者撤销器没注入），"
+                            "所以无法自动恢复。改动【仍然生效】。");
+                    }
+                }
             }
             ImGui::EndTable();
         }

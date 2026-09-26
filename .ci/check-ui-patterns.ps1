@@ -562,6 +562,48 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 L：不可恢复的条目**不许**只用一个看不见的占位 ----
+#
+# 第 104 轮：改动记录页里，一条「已经恢复过」的记录和一条
+# 「还能恢复」的记录，渲染出来**完全一样** ——
+# 区别只是最后那格的按钮换成了一个 ImGui::Dummy。
+#
+# 于是：
+#   · 逐条点「恢复」，那一行在界面上没有任何变化
+#   · 点「全部恢复」，整个列表看起来一模一样
+#
+# 而用户要回答的问题是「现在游戏里还挂着哪些改动」。
+# 列表长一个样，这个问题就没法回答。
+#
+# 形状：`if (可恢复) { 画按钮 } else { ImGui::Dummy(...) }` ——
+# else 分支只画一个不可见的占位，等于「这一行没有任何状态」。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch '^ImGui::Dummy\(') { continue }
+        # else 分支里只有 Dummy：往后 4 行里没有任何可见控件
+        $visible = $false
+        for ($k = $i + 1; $k -le [Math]::Min($i + 4, $lines.Count - 1); $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -match '^(\}|\{)$') { break }
+            if ($u -match 'ImGui::(Text|Button|SmallButton|Checkbox|MenuItem|TextDisabled|TextColored|Image|Separator)\w*\s*\(') {
+                $visible = $true
+                break
+            }
+        }
+        if (-not $visible) {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'L: 不可恢复的条目只画了不可见占位（用户看不出这一行的状态）'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

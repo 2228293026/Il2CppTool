@@ -250,6 +250,25 @@ Test-Rule 'K 扫描范围含 Il2cpp' {
     return $true
 } $covCheck '.ci/check-ui-patterns.ps1'
 
+# ---- 17. 规则 L：把「只画不可见占位」复现出来（第 104 轮）----
+$lCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'L 不可恢复的行要有可见状态' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'ImGui::TextDisabled\("已恢复"\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # 换成一个不可见的占位 = 复现第 104 轮那个「这一行没有任何状态」
+    $ls[$i] = '                ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ChangeLog.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $lCheck 'app/src/main/jni/Tool/ChangeLog.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
