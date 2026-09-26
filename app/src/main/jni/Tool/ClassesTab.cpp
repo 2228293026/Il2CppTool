@@ -266,6 +266,24 @@ ClassesTab::Json &ClassesTab::getJsonObject(Il2CppObject *object)
     return dataMap[object].first.second;
 }
 
+// 构造「<说明> [<地址>]」形式的控件标签。
+//
+// 这个字符串**同时是 ImGui 的控件 ID**，所以必须**逐个对象唯一**。
+//
+// 直接写 `snprintf(buff, 256, "%s [%p]", name, ptr)` 是不安全的：
+// name 来自 il2cpp 元数据（类名、参数名），而元数据本来就不要求是
+// 合法 C# 标识符 —— 混淆游戏里名字可以很长。一旦长到把 " [%p]" 挤掉，
+// 两个**不同**的对象就会生成**同一个** buff → ID 冲突 → 点 A 选中 B。
+//
+// 而且这种错误完全静默：界面上看不出任何异常，只是「偶尔选错对象」。
+//
+// 所以显式给地址留足空间：64 位下 "%p" 是 "0x" + 16 位十六进制 = 18 字符，
+// 加上空格和方括号共 20。前面的文字用精度截断。
+static void FormatObjectButton(char (&buff)[256], const char *desc, const void *object)
+{
+    snprintf(buff, sizeof(buff), "%.220s [%p]", desc ? desc : "?", object);
+}
+
 void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *prefix,
                                      std::function<void(Il2CppObject *)> onSelect, bool canNew)
 {
@@ -426,8 +444,10 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                         continue;
                     }
                     const char *className = object->klass->getName();
+                    // 标签同时是 ImGui 的控件 ID，必须逐个对象唯一 ——
+                    // 理由和精度截断都见 FormatObjectButton 的注释。
                     char buff[256];
-                    snprintf(buff, sizeof(buff), "%s [%p]", prefix, static_cast<void *>(object));
+                    FormatObjectButton(buff, prefix, object);
                     auto size = ImGui::GetWindowSize();
                     if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                     {
@@ -527,8 +547,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                                 continue;
                             }
                             char buff[256];
-                            snprintf(buff, sizeof(buff), "%s [%p]",
-                                     setKlass->getName() ? setKlass->getName() : "?", static_cast<void *>(object));
+                            FormatObjectButton(buff, setKlass->getName(), object);
                             auto size = ImGui::GetWindowSize();
                             if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                             {
@@ -614,8 +633,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                             continue;
                         }
                         char buff[256];
-                        snprintf(buff, sizeof(buff), "%s [%p]", klass->getName() ? klass->getName() : "?",
-                                 static_cast<void *>(object));
+                        FormatObjectButton(buff, klass->getName(), object);
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
@@ -693,8 +711,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                             continue;
                         }
                         char buff[256];
-                        snprintf(buff, sizeof(buff), "%s [%p]", klass->getName() ? klass->getName() : "?",
-                                 static_cast<void *>(object));
+                        FormatObjectButton(buff, klass->getName(), object);
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
@@ -776,7 +793,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                             continue;
                         }
                         char buff[256];
-                        snprintf(buff, sizeof(buff), "%s [%p]", prefix, static_cast<void *>(object));
+                        FormatObjectButton(buff, prefix, object);
                         auto size = ImGui::GetWindowSize();
                         if (ImGui::Button(buff, ImVec2(size.x / 1.5, 0)))
                         {
