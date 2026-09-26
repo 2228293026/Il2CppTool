@@ -14,6 +14,29 @@
 #include <unordered_map>
 #include "sstream"
 
+static bool SpawnDetached(const std::function<void()> &body, const char *what,
+                          const std::function<void()> &onFail = {})
+{
+    try
+    {
+        std::thread(body).detach();
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("无法创建后台线程(%s): %s", what, e.what());
+    }
+    catch (...)
+    {
+        LOGE("无法创建后台线程(%s): 未知异常", what);
+    }
+    if (onFail)
+    {
+        onFail();
+    }
+    return false;
+}
+
 extern std::vector<Il2CppImage *> g_Images;
 extern Il2CppImage *g_Image;
 
@@ -23,6 +46,12 @@ extern Il2CppImage *g_Image;
 // objectMap[klass] = ...，UI 手上的引用会被整个换掉 → 迭代野指针 / UAF。
 static NeverDestroyedMutex g_scanResultMutex;
 static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> g_pendingScanResults;
+// 后台扫描的**失败原因**。和 g_pendingScanResults 共用一把锁。
+//
+// 为什么需要它：扫描失败时如果什么都不发布，objectMap 会保留**上一次的
+// 结果**，用户点了「Find Objects」看到列表没变，就会以为「扫出来就是这些」
+// —— 而不是「根本没扫成功」。界面上没有任何提示。
+static std::unordered_map<Il2CppClass *, std::string> g_pendingScanErrors;
 
 // savedSet 里是「用户手动保存、要长期留着」的对象，同样必须保活：
 // 它们在列表里可能挂很久，游戏侧随时可能销毁对应实体。
@@ -253,15 +282,29 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
     {
         scanFlag->store(true);
         auto keepAlive = scanFlag;
-        std::thread(
-            [keepAlive](Il2CppClass *klass)
+        // 线程创建失败会让 std::thread 的构造函数抛异常 —— 裸写就是
+        // std::terminate，整个游戏进程崩掉。统一走 SpawnDetached。
+        // （它还会在失败时复位 scanFlag，否则按钮会永远显示「扫描中…」。）
+        Il2CppClass *scannedKlass = klass;
+        Il2CppClass *scanFailedKlass = klass;
+        SpawnDetached(
+            [keepAlive, scannedKlass]()
             {
+                auto klass = scannedKlass;
                 // 后台线程是 il2cpp 的 foreign thread：GC::FindObjects 会 stop_gc_world
                 // 并遍历 GC 结构，不 attach 就是崩溃/静默错数据；用完必须 detach，
                 // 否则 il2cpp 的 attached-thread 表里会留下悬空条目。
                 if (!Il2cpp::EnsureAttached())
                 {
                     LOGE("对象扫描: 无法 attach 到 il2cpp VM");
+                    // 必须**发布一个失败结果**，不能什么都不写。
+                    // 什么都不写的话：用户点了「Find Objects」，界面毫无变化
+                    // （旧的 objectMap 原样保留 → 看起来像「扫出来就是这些」），
+                    // 界面上没有任何提示，只有 logcat 里一行 LOGE。
+                    {
+                        std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
+                        g_pendingScanErrors[klass] = "无法 attach 到 il2cpp VM";
+                    }
                     keepAlive->store(false);
                     return;
                 }
@@ -277,23 +320,37 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                     auto objs = Il2cpp::GC::FindObjects(klass);
                     std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
                     g_pendingScanResults[klass] = std::move(objs);
+                    // 成功了就清掉上一轮的失败提示。
+                    g_pendingScanErrors.erase(klass);
                 }
                 catch (const std::exception &e)
                 {
                     LOGE("FindObjects(%s) 失败: %s", klass ? klass->getName() : "?", e.what());
+                    std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
+                    g_pendingScanErrors[klass] = e.what();
                 }
                 catch (...)
                 {
                     LOGE("FindObjects 未知异常");
+                    std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
+                    g_pendingScanErrors[klass] = "扫描时发生未知异常";
                 }
                 keepAlive->store(false);
             },
-            klass)
-            .detach();
+            "Find Objects",
+            [keepAlive, scanFailedKlass]()
+            {
+                // 线程没起来：复位标志，否则按钮会永远显示「扫描中…」，
+                // 而且界面上没有任何解释。
+                keepAlive->store(false);
+                std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
+                g_pendingScanErrors[scanFailedKlass] = "无法创建扫描线程（线程资源不足）";
+            });
     }
     ImGui::PopID();
 
     // 把后台线程的结果并进来（objectMap 只在 UI 线程被改动）
+    std::string scanError;
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
         if (!g_pendingScanResults.empty())
@@ -306,6 +363,19 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
             }
             g_pendingScanResults.clear();
         }
+        if (!g_pendingScanErrors.empty())
+        {
+            if (auto it = g_pendingScanErrors.find(klass); it != g_pendingScanErrors.end())
+            {
+                scanError = it->second;
+            }
+            g_pendingScanErrors.clear();
+        }
+    }
+    if (!scanError.empty())
+    {
+        ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "对象扫描失败: %s", scanError.c_str());
+        ImGui::TextDisabled("下面的列表是**上一次**的结果，不是本次的。");
     }
     ImGuiIO &io = ImGui::GetIO();
     float width = io.DisplaySize.x;
@@ -811,6 +881,22 @@ static std::string StableParamKey(const char *paramName, int index)
     snprintf(buf, sizeof(buf), "%s#%d", paramName ? paramName : "?", index);
     return buf;
 }
+
+// 起一个后台线程，返回是否成功。
+//
+// **std::thread 的构造函数在线程创建失败时会抛 std::system_error**
+// （线程/栈资源耗尽）。裸写就是 std::terminate → 整个游戏进程崩掉，
+// 而且这个工具恰好最容易触发：它在游戏进程里，游戏自己已经吃掉了一堆
+// 线程，每次勾选 Hook 还会再起一个。
+//
+// 抛出还有第二重危害：异常会穿过 ImGui 的 Begin/End，栈失配 → 下一帧
+// IM_ASSERT → __builtin_trap() → 无声的 SIGILL。
+//
+// 失败时调用 onFail（如果有的话）把「进行中」这类状态复位 —— 否则
+// 界面上会永远显示「处理中…」。
+// （定义放在 ClassesTab.cpp 前部：对象扫描和 Hook 都要用。）
+
+
 
 void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const MethodParamList &paramsInfo,
                             Il2CppObject *thiz)
@@ -2338,7 +2424,7 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
             if (ImGui::Button("Continue?"))
             {
                 state = true;
-                std::thread hookThread(
+                SpawnDetached(
                     [this, klass]
                     {
                         for (auto &[method, paramsInfo] : methodMap[klass])
@@ -2348,8 +2434,16 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
 
                             Tool::ToggleHooker(method, 1);
                         }
+                    },
+                    "TraceAll",
+                    [this, klass]()
+                    {
+                        // 线程没起来。上面已经把 state 置成 true 了，
+                        // 这里必须退回去，否则按钮会一直显示「Restore」，
+                        // 而实际上一个方法都没 hook 上。
+                        states[klass] = false;
+                        LOGE("Trace all: 无法创建后台线程，state 已回滚");
                     });
-                hookThread.detach();
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
@@ -2531,6 +2625,10 @@ void ClassesTab::Draw(int index, bool closeable)
 
         {
             static bool processing = false;
+            // processing 是本函数内的 static —— lambda **不能按引用捕获它**
+            // （没有自动存储期）。SpawnDetached 的失败回调需要复位它，
+            // 所以把地址取出来传进回调。
+            bool *processingFlag = &processing;
             ImGui::SameLine();
             char label[12]{0};
             if (!traceState)
@@ -2555,7 +2653,7 @@ void ClassesTab::Draw(int index, bool closeable)
                     else
                     {
                         traceState = false;
-                        std::thread hookThread(
+                        SpawnDetached(
                             [this]
                             {
                                 LOGD("Restoring all methods...");
@@ -2571,8 +2669,12 @@ void ClassesTab::Draw(int index, bool closeable)
                                 maxProgress = 0;
                                 progress = 0;
                                 LOGD("Done");
+                            },
+                            "RestoreAll",
+                            [processingFlag]()
+                            {
+                                *processingFlag = false;
                             });
-                        hookThread.detach();
                     }
                 }
             }
@@ -2586,7 +2688,7 @@ void ClassesTab::Draw(int index, bool closeable)
                 if (ImGui::Button("Continue?"))
                 {
                     traceState = true;
-                    std::thread hookThread(
+                    SpawnDetached(
                         [this]
                         {
                             LOGD("Tracing all methods...");
@@ -2622,8 +2724,12 @@ void ClassesTab::Draw(int index, bool closeable)
                             maxProgress = 0;
                             progress = 0;
                             LOGD("Done");
+                        },
+                        "HookToggle",
+                        [processingFlag]()
+                        {
+                            *processingFlag = false;
                         });
-                    hookThread.detach();
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
@@ -3769,9 +3875,22 @@ void ClassesTabWorker::EnsureStarted()
     {
         g_worker.join();
     }
-    g_workerRunning = true;
-    g_worker = std::thread(WorkerLoop);
-    LOGI("类筛选工作线程已启动");
+    // **必须 try/catch**：std::thread 的构造函数在线程创建失败时抛异常，
+    // 裸写就是 std::terminate → 整个游戏进程崩掉。而且这里在 init 路径上，
+    // 抛出去会一路穿过 ImGui 初始化。
+    try
+    {
+        g_workerRunning = true;
+        g_worker = std::thread(WorkerLoop);
+        LOGI("类筛选工作线程已启动");
+    }
+    catch (const std::exception &e)
+    {
+        // 线程没起来：g_workerRunning 必须复位，否则 Shutdown 会去 join
+        // 一个根本没启动的线程。
+        g_workerRunning = false;
+        LOGE("类筛选工作线程启动失败: %s（搜索将退回同步模式，可能略有卡顿）", e.what());
+    }
 }
 
 void ClassesTabWorker::Shutdown()

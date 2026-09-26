@@ -303,6 +303,11 @@ static void RescanGameObjectsInBackground() {
     if (g_scanThread.joinable())
         g_scanThread.join();
 
+    // **必须 try/catch**：std::thread 的构造函数在线程创建失败时抛异常。
+    // 裸写是 std::terminate → 游戏崩。而且 g_rescanBusy 会一直停在 true，
+    // 用户再也点不了「重新扫描」，也没人告诉他为什么。
+    try
+    {
     g_rescanInProgress.store(true);
     g_scanThread = std::thread([]() {
         // 关键：这是新线程，il2cpp 不知道它。
@@ -358,6 +363,13 @@ static void RescanGameObjectsInBackground() {
         g_rescanBusy.store(false);
         g_rescanInProgress.store(false);
     });
+    }
+    catch (const std::exception &e)
+    {
+        g_rescanBusy.store(false);   // 否则再也点不了「重新扫描」
+        g_rescanInProgress.store(false);
+        LOGE("无法创建对象扫描线程: %s（对象列表不会自动更新，可手动重试）", e.what());
+    }
 }
 
 // 处理扫描结果：构建UI用的对象列表，检测场景切换
