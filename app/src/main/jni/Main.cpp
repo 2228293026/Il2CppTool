@@ -217,7 +217,12 @@ void draw_thread()
                     for (auto &[name, data] : hookerMap)
                     {
                         int hits = data.hitCount.load(std::memory_order_relaxed);
-                        if (hits > 0 && data.method)
+                        // **不按 hits > 0 过滤**。旧代码这么写，于是：
+                        //   刚追踪、还没被调用过的方法**根本不显示** ——
+                        //   用户看到「追踪方法数量: 5」而列表是空的，
+                        //   分不清是「没追踪上」还是「没被调用」。
+                        // 追踪的价值恰恰包括回答「我追踪的这些方法到底跑没跑过」。
+                        if (data.method)
                         {
                             sortedHooker.push_back({data.method, hits, data.callsPerSecond});
                         }
@@ -229,13 +234,42 @@ void draw_thread()
                     {
                         ImGui::OpenPopup("QuickRestorePopup");
                     }
-                    // 先按频率降序，频率相同再按累计次数降序
+                    ImGui::SameLine();
+                    if (ImGui::Button("重新计数"))
+                    {
+                        // 清零 + 清曲线，让「接下来 30 秒」成为干净的基线。
+                        //
+                        // 为什么需要：追踪往往开着跑很久，累计次数能到几百万，
+                        // 而曲线窗口只有 30 秒 —— 两者对不上，用户没法判断
+                        // 「现在」是哪些方法在跑。归零之后「次/秒」和「次数」
+                        // 说的是同一段时间。
+                        std::lock_guard guard(hookerMtx);
+                        for (auto &[addr, data] : hookerMap)
+                        {
+                            data.hitCount.store(0, std::memory_order_relaxed);
+                            data.sampledHitCount = 0;
+                            data.callsPerSecond = 0.f;
+                            data.rateHistory.clear();
+                            // 归 0 让 SampleHookRates 认为是「第一次见到」，
+                            // 只记基线不产生一个假的尖峰。
+                            data.lastSampleTime = 0.0;
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip("把累计次数和曲线全部归零，作为新的基线");
+                    }
+                    // 频率相同时，累计次数多的排前面；都相同则按名字排，
+                    // 否则「全是 0」时（刚追踪还没被调用）顺序会随
+                    // unordered_map 的插入顺序跳动。
                     std::sort(sortedHooker.begin(), sortedHooker.end(),
                               [](const auto &a, const auto &b)
                               {
                                   if (a.callsPerSecond != b.callsPerSecond)
                                       return a.callsPerSecond > b.callsPerSecond;
-                                  return a.hitCount > b.hitCount;
+                                  if (a.hitCount != b.hitCount)
+                                      return a.hitCount > b.hitCount;
+                                  return std::strcmp(a.method->getName(), b.method->getName()) < 0;
                               });
                     ImGui::BeginChild("TracerList", ImVec2(0, 0), ImGuiChildFlags_None,
                                       ImGuiWindowFlags_HorizontalScrollbar);
