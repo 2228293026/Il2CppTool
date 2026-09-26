@@ -1824,8 +1824,25 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 }
                 else if (resultType->isEnum())
                 {
-                    callResults.at(method).push_back(
-                        {result->invoke_method<Il2CppString *>("ToString")->to_string(), nullptr});
+                    // invoke_method 的结果**可能为 null**（方法被裁剪、
+                    // 或者被别的 hook 干扰时）。而 to_string() 是
+                    // strlen(nullptr) → 直接段错误。
+                    //
+                    // 周围的分支全都判了空（result、resultType 都判了），
+                    // 只有这里没判 —— 读代码时很容易以为已经覆盖到了。
+                    Il2CppString *enumText = result->invoke_method<Il2CppString *>("ToString");
+                    if (enumText)
+                    {
+                        callResults.at(method).push_back({enumText->to_string(), nullptr});
+                    }
+                    else
+                    {
+                        char typeText[96]{0};
+                        snprintf(typeText, sizeof(typeText), "枚举取不到 ToString (%p)",
+                                 static_cast<void *>(result));
+                        callResults.at(method).push_back({typeText, result});
+                        LOGE("枚举 ToString 返回空: %p", static_cast<void *>(result));
+                    }
                 }
                 else
                 {
