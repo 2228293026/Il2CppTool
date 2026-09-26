@@ -109,6 +109,36 @@ if (-not $SkipSelfTest) {
 #
 # 所以这条不是「记得加 -Encoding」，是**结构上禁止**：
 # 门禁脚本里任何读文本的地方都必须显式声明编码。
+# ---- 门禁的扫描范围不能悄悄少一个目录 ----
+#
+# 第 101 轮发现的：check-ui-patterns.ps1 的 $dirs 只有 Tool / Menu / Includes
+# 加上 jni 根目录，**Il2cpp 目录 5009 行从来���被扫过** ——
+# 而 Il2cpp.cpp 正是 FindClass / NewHandle / GetHandleTarget 的所在地。
+#
+# 这是「门禁绿着，但它没看过一大片代码」的第五次：
+#   63 轮  排除模式吃掉所有语句
+#   64 轮  同上
+#   85 轮  markdown 规则根本不存在
+#   90 轮  jni 根目录（Main.cpp）不在范围里
+#   101 轮 Il2cpp 目录不在范围里
+#
+# 所以这条是元检查：check-structure.ps1 覆盖的目录，UI 门禁也必须覆盖。
+# 拿一个已知的、覆盖面更广的检查当**对照**，而不是再手写一份清单 ——
+# 手写的那份迟早会和实际脱节。
+Invoke-Check '门禁扫描范围不缺失' {
+    $structDirs = @('Tool', 'Il2cpp', 'Menu', 'Includes')
+    $uiText = [IO.File]::ReadAllText((Join-Path $root '.ci/check-ui-patterns.ps1'))
+    $missing = @()
+    foreach ($d in $structDirs) {
+        if ($uiText -notmatch [regex]::Escape("jni/$d")) { $missing += $d }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Host "  这些目录在 check-structure.ps1 里被覆盖，但 UI 门禁没扫："
+        Write-Host ('    ' + ($missing -join ', '))
+        $script:rc = 1
+    }
+}
+
 Invoke-Check '门禁自身声明编码' {
     $bad = @()
     foreach ($g in Get-ChildItem .ci -Filter *.ps1 -File) {

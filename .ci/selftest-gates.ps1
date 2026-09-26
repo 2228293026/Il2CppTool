@@ -229,6 +229,27 @@ Test-Rule 'J 裸参数形状（ResolveSaved）' {
     return $false
 } $j2Check 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 16. 扫描范围：Il2cpp 目录必须在内（第 101 轮）----
+# 第 101 轮最大的发现不是那个 bug，是**这个 bug 所在的文件从来没被扫过**：
+# check-ui-patterns.ps1 的 $dirs 少了 Il2cpp，5009 行 Il2cpp.cpp / Il2cpp.h
+# 对规则 A / A2 / B2 / D / E / F / G / H / I / J 全都是不可见的。
+$covCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-all.ps1', '-SkipSelfTest')
+}
+Test-Rule 'K 扫描范围含 Il2cpp' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $idx = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'jni/Il2cpp') { $idx = $k; break }
+    }
+    if ($idx -lt 0) { return $false }
+    $ls.RemoveAt($idx)
+    [IO.File]::WriteAllText((Join-Path $root '.ci/check-ui-patterns.ps1'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+    return $true
+} $covCheck '.ci/check-ui-patterns.ps1'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

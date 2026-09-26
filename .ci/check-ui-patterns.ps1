@@ -36,7 +36,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $dirs = @(
     (Join-Path $root 'app/src/main/jni/Tool'),
     (Join-Path $root 'app/src/main/jni/Menu'),
-    (Join-Path $root 'app/src/main/jni/Includes')
+    (Join-Path $root 'app/src/main/jni/Includes'),
+    (Join-Path $root 'app/src/main/jni/Il2cpp')
 )
 
 $files = foreach ($d in $dirs) {
@@ -526,7 +527,23 @@ foreach ($f in $files) {
         #   `return obj;`              —— 裸参数  （ClassesTab::ResolveSaved）
         # 第一版只写了前一种，于是 ResolveSaved **从门禁底下溜过去了**，
         # 而它和前一个是**完全同一个 bug**。
-        if ($t -notmatch '^return\s+(\w+\.(gameObject|transform|gameObjectHandle|transformHandle)|obj|object)\s*;') { continue }
+        # 三种形状（第 101 轮补上第三种）：
+        #   `return info.gameObject;`                       成员访问
+        #   `return obj;`                                   裸参数
+        #   `h ? GetHandleTarget(h) : m_objects[i];`       三元表达式
+        #
+        # 第三种是 `liveObjects()` 里的，规则 J 第一版**没抓到它** ——
+        # 而它和前两个是完全同一个 bug。所以每加一种形状都要重新想一遍：
+        # 「这个 bug 还可能长成什么别的样子？」
+        if ($t -notmatch '^return\s+(\w+\.(gameObject|transform|gameObjectHandle|transformHandle)|obj|object)\s*;') {
+            # else 分支必须**不是** nullptr —— `: nullptr` 恰恰是**正确**的写法
+            #（ClassesTab 里有两处 `handle ? GetHandleTarget(handle) : nullptr`），
+            # 第一版没收紧，把这两处也报出来了。
+            # 而且第一版的否定预查还踩了一个**回溯**坑：`:` 后面的 `\s*`
+            # 可以把空格吐回去，于是预查看到的是 " nullptr" 而不是 nullptr，
+            # 照样成立。**预查必须放在 `\s*` 前面**。
+            if ($t -notmatch 'GetHandleTarget\([^)]*\)\s*:(?!\s*nullptr)\s*[\w\.\[\]]') { continue }
+        }
         # 必须紧跟着「if (handle) return GetHandleTarget(...)」这种形状才值得报
         # GetHandleTarget 可能在**前面**也可能在**后面**：
         #   `if (handle) return GetHandleTarget(...); return obj;`   （前）

@@ -306,7 +306,24 @@ namespace Il2cpp
                 out.reserve(m_objects.size());
                 for (size_t i = 0; i < m_objects.size(); i++)
                 {
-                    auto *obj = m_handles[i] ? GetHandleTarget(m_handles[i]) : m_objects[i];
+                    // **句柄为 0 就跳过**，不退回 m_objects[i]（第 101 轮改）。
+                    //
+                    // reset()/add() 里 `NewHandle` 失败时会存一个 0 句柄
+                    // （它们不能直接失败退出 —— 那会让整个类的对象列表凭空消失）。
+                    // 而这个三元表达式的 else 分支正是「加根失败 → 退回裸指针」，
+                    // 于是调用方拿到一个**没有根的地址**去解引用。
+                    //
+                    // 这是同一个 bug 的第三个地方：
+                    //   ResolveGameObject  return info.gameObject;   (98 轮)
+                    //   ResolveSaved       return obj;               (99 轮)
+                    //   liveObjects        : m_objects[i]            (101 轮)
+                    // 前两个被规则 J 抓到了，这个没抓到 —— 因为它不是 return，
+                    // 是三元表达式。规则 J 因此也扩了（第 101 轮）。
+                    if (!m_handles[i])
+                    {
+                        continue; // 没加根成功：不认识它，也不碰它
+                    }
+                    auto *obj = GetHandleTarget(m_handles[i]);
                     if (obj == nullptr)
                     {
                         if (m_handles[i])
