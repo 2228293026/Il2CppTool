@@ -205,6 +205,68 @@ std::vector<Result> Collect()
         out.push_back(Info("数据目录", buf));
     }
 
+
+    // ---- 数据目录**可写**吗 ----
+    //
+    // 上面那行只证明路径取到了，不证明能写。真机上路径可能取不到、或者
+    // 目录权限不对，fopen 会失败 —— 而配置的读写**全部**静默失败
+    //（ConfigSave 里没有任何出口）。表现是「参数预设设了、重开就没了」，
+    // 用户完全不知道是保存失败还是根本没保存。
+    //
+    // 真的写一个探针再删掉：这是唯一能证明「可写」的方式，
+    // 而这一页存在的意义就是把静默的环节摊开。
+    {
+        const std::string probe = Il2cpp::getDataPath() + "/.il2cptool_write_probe";
+        FILE *f = fopen(probe.c_str(), "wb");
+        if (f == nullptr)
+        {
+            out.push_back(Fail("数据目录可写",
+                               "无法写入该目录 —— **参数预设和配置都不会被保存**，"
+                               "而保存失败没有任何提示"));
+        }
+        else
+        {
+            const bool wrote = fputs("ok", f) >= 0;
+            fclose(f);
+            remove(probe.c_str());
+            if (wrote)
+            {
+                out.push_back(Ok("数据目录可写", "可写（已实际写入并删除一个探针文件）"));
+            }
+            else
+            {
+                out.push_back(Fail("数据目录可写", "文件能打开但写入失败 —— 配置不会保存"));
+            }
+        }
+    }
+    // ---- 补丁 · 原字节还在吗 ----
+    //
+    // 补丁是本工具里唯一改**可执行代码**的操作，而它的原字节是
+    // **唯一的退路** —— 原字节没了就等于这个补丁永远退不回去。
+    // 方法体被重新加载时 methodPointer 会变，那份原字节对应的已经不是
+    // 当前代码了（写回去会破坏），所以这两者要分开报。
+    {
+        size_t patched = 0;
+        size_t restorable = 0;
+        ClassesTab::PatchStats(&patched, &restorable);
+        if (patched > 0)
+        {
+            char buf[176]{0};
+            if (restorable < patched)
+            {
+                snprintf(buf, sizeof(buf),
+                         "%zu 个方法已打补丁，其中 %zu 个**无法恢复**（方法体已重新加载）", patched,
+                         patched - restorable);
+                out.push_back(Warn("补丁 · 原字节", buf));
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "%zu 个方法已打补丁，全部可恢复", patched);
+                out.push_back(Ok("补丁 · 原字节", buf));
+            }
+        }
+    }
+
     // ---- 关注值 ----
     // 关注项各自持有一个 GC 强根。数量失控 = 强根失控 = 游戏对象永远回收不掉，
     // 和「已保存对象」是同一类泄漏，所以放在一起看。

@@ -290,6 +290,27 @@ void ClassesTab::WatchStats(size_t *total, size_t *frozen, size_t *frozenInvalid
 // 用户一折叠，冻结就**静默失效**，而那一行的按钮还显示「解冻」。
 //
 // 形状和第 82 轮那个一样：**作用在游戏状态上的东西，不该挂在界面上**。
+void ClassesTab::PatchStats(size_t *patched, size_t *restorable)
+{
+    if (patched) *patched = 0;
+    if (restorable) *restorable = 0;
+    for (const auto &entry : oMap)
+    {
+        if (entry.second.bytes.empty())
+        {
+            continue;
+        }
+        if (patched) (*patched)++;
+        // 方法体被卸载 / 重新加载之后，methodPointer 会变，
+        // 这时那份原字节对应的已经不是当前代码了 —— 写回去等于破坏。
+        MethodInfo *m = entry.first;
+        if (restorable && m != nullptr && m->methodPointer != nullptr)
+        {
+            (*restorable)++;
+        }
+    }
+}
+
 void ClassesTab::ApplyFreezes()
 {
     // 每帧都跑（不是按 200ms）：冻结的意义就是压过游戏自己的更新 ——

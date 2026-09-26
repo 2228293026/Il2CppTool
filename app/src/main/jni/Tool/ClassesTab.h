@@ -141,6 +141,11 @@ struct ClassesTab
     // 冻结的每帧写回。由 Tool::Draw() **无条件**调用 ——
     // 不能放在 CollapsingHeader("关注值") 里面，否则折叠时冻结会静默失效。
     static void ApplyFreezes();
+    // 被打了补丁的方法数，以及**还能不能恢复**的数。
+    // 补丁是唯一改可执行代码的操作，而它的原字节是唯一的退路 ——
+    // 原字节没了就等于永远退不回去，所以这两个数要能被看见。
+    static void PatchStats(size_t *patched, size_t *restorable);
+
 
     // 必须在任何 RecordUndoable 之前调用，否则记录表没有恢复能力。
     static void InitChangeLogUndo();
