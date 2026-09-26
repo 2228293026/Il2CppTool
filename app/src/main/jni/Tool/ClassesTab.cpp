@@ -4154,8 +4154,9 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             }
             ImGui::EndPopup();
         }
-        // 关注列表放在最底下，任何对象的检视器都能看到（不必回到加它的那一个）。
-        DrawWatches();
+        // 关注列表**不在**这里画 —— 见 Tool::Draw 里的说明：
+        // ImGuiJson 只在有打开的对象 tab 时才被调用，放在这里会让
+        // 「把对象 tab 全关掉」直接让关注列表消失并停止刷新。
         poper.Update();
         ImGui::EndChild();
         ImGui::EndTable();
