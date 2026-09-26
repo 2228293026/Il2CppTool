@@ -1209,6 +1209,40 @@ static void ReportFieldError(const std::string &msg)
     LOGW("字段写入失败: %s", msg.c_str());
 }
 
+// 显示上面那条错误。由 Tool::Draw 调用（见那里的说明），
+// **不能**放在 ImGuiJson 里 —— 那儿是「有打开的对象 tab」才会走的路径。
+//
+// 之前挂在 ImGuiJson 里有两个后果，都比「看不见」更糟：
+//
+// 一、参数解析错误（第 46 轮加的）发生在 CallerView 的页签里，
+//    而 CallerView 和 ImGuiJson 是**两个完全不同的界面**。
+//    结果是「参数 health 无法解析」这句话出现在对象检视器里 ——
+//    用户在一个界面操作，却在另一个界面看到报错，还以为是陈旧残留。
+//
+// 二、过期清除也挂在同一个 if 里。没有对象 tab 打开时**永远不清**，
+//    于是一分钟前的错误会一直留着，等你下次随便打开一个对象检视器
+//    才突然冒出来，指着一个你根本没在看的字段。
+//
+// 所以：设置和显示必须放在**同一个、一直都在**的地方。
+void ClassesTab::DrawFieldErrorBanner()
+{
+    if (g_fieldError.empty())
+    {
+        return;
+    }
+    const double now = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now - g_fieldErrorAt > 8.0)
+    {
+        g_fieldError.clear();
+        return;
+    }
+    // 一直显示到过期为止（而不是只显示剩下的秒数）—— 秒数每帧都在变，
+    // 数字跳动比不显示更让人分心。
+    ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "⚠ 上一次写入失败：%s", g_fieldError.c_str());
+}
+
 void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const MethodParamList &paramsInfo,
                             Il2CppObject *thiz)
 {
@@ -3679,23 +3713,6 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
     {
         ImGui::TextDisabled("对象已失效（可能已被 GC 回收），请重新 Inspect");
         return;
-    }
-
-    // 上一次字段写入失败的原因（键盘回调在别的帧里设置的）。
-    // 显示 8 秒后自动消失，避免一直挂在界面上。
-    if (!g_fieldError.empty())
-    {
-        const double now = std::chrono::duration<double>(
-                               std::chrono::steady_clock::now().time_since_epoch())
-                               .count();
-        if (now - g_fieldErrorAt > 8.0)
-        {
-            g_fieldError.clear();
-        }
-        else
-        {
-            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "字段写入失败：%s", g_fieldError.c_str());
-        }
     }
 
     for (auto it = paths.begin() + (paths.size() > 3 ? paths.size() - 4 : 0); it != paths.end(); ++it)

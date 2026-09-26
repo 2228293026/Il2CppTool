@@ -123,6 +123,10 @@ struct ClassesTab
     static size_t WatchCount();
     // 在 JSON 检视器末尾画关注列表。由 ImGuiJson 调用。
     static void DrawWatches();
+    // 显示「上一次写入失败」的原因。挂在工具页而不是对象检视器里 ——
+    // 设置它的回调可能来自 CallerView（另一个界面），而对象检视器
+    // 只在有打开的对象 tab 时才绘制。
+    static void DrawFieldErrorBanner();
 
     std::unordered_map<MethodInfo *, CircularBuffer<std::pair<std::string, Il2CppObject *>>> callResults{};
 
