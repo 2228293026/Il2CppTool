@@ -780,18 +780,36 @@ void ObjectDrawManager::DrawAll() {
 // 这样正式版的日志里能看到「晚到的解析」，排障时是个明确的线索。
 static void ResolveDrawingApis()
 {
-    if (g_GetTransform == nullptr)
+    // 门禁挂在 **g_GetName** 上（不是 g_GetTransform）。
+    //
+    // 原来挂在 g_GetTransform 上，于是：get_transform 拿到了、get_name
+    // 没拿到（元数据被裁剪/改名）时，g_GetTransform 非空 → 整个块跳过
+    // → g_GetName 永远为 null → ESP 的名称标签整个会话都不显示。
+    // 三个变量在**不同的时候**可能分别失败，门禁必须覆盖最晚失败的那个。
+    if (g_GetName == nullptr || g_GetComponent == nullptr || g_GameObjectClass == nullptr)
     {
-        if (auto *c = Il2cpp::FindClass("UnityEngine.GameObject"))
+        if (g_GameObjectClass == nullptr)
         {
-            g_GameObjectClass = c;
-            g_GetTransform = c->getMethod("get_transform");
-            g_GetName = c->getMethod("get_name");
-            // GameObject.GetComponent<T>() 在 il2cpp 里是泛型方法，编译后名字是
-            // "GetComponent<Renderer>"（元数据里保留泛型参数）。用单参的
-            // "GetComponent" 拿到的是 GetComponent(Type)，传错参数会取到
-            // 随便什么东西 —— 比拿不到更糟，因为它「成功」了。
-            g_GetComponent = c->getMethod("GetComponent<UnityEngine.Renderer>", 0);
+            g_GameObjectClass = Il2cpp::FindClass("UnityEngine.GameObject");
+        }
+        if (auto *c = g_GameObjectClass)
+        {
+            if (g_GetTransform == nullptr)
+            {
+                g_GetTransform = c->getMethod("get_transform");
+            }
+            if (g_GetName == nullptr)
+            {
+                g_GetName = c->getMethod("get_name");
+            }
+            if (g_GetComponent == nullptr)
+            {
+                // GameObject.GetComponent<T>() 在 il2cpp 里是泛型方法，编译后名字是
+                // "GetComponent<Renderer>"（元数据里保留泛型参数）。用单参的
+                // "GetComponent" 拿到的是 GetComponent(Type)，传错参数会取到
+                // 随便什么东西 —— 比拿不到更糟，因为它「成功」了。
+                g_GetComponent = c->getMethod("GetComponent<UnityEngine.Renderer>", 0);
+            }
         }
     }
     if (g_GetPosition == nullptr)
@@ -817,20 +835,38 @@ static void ResolveDrawingApis()
             g_IsNativeObjectAlive = c->getMethod("IsNativeObjectAlive");
         }
     }
-    if (g_CameraClass == nullptr)
+    // 相机这一组的门禁**必须是 g_WorldToScreenPoint 本身**。
+    //
+    // 旧写法是 `if (g_CameraClass == nullptr) { ...; if (ResolveMainCamera()) {...} }` ——
+    // 门禁挂在「类」上，但真正需要的是「方法」。于是：
+    //   第 1 次重试：Camera 类找到了（g_CameraClass 被赋值），
+    //               但此刻场景还没加载完，ResolveMainCamera() 返回空
+    //               → g_WorldToScreenPoint 保持 null
+    //   第 2 次重试：g_CameraClass 非空 → **整个 if 块跳过**
+    //   之后永远不会再解析
+    //
+    // 也就是说 ESP 的投影会**整个会话都是死的**，而原因是「场景当时没加载完」
+    // —— 一个本来完全可以自愈的时序问题。
+    //
+    // 这正是我在第 39/40 轮反复遇到的「门禁挂在错误的变量上」：
+    // 门禁必须挂在**你要确保的那个东西**上。
+    if (g_WorldToScreenPoint == nullptr)
     {
-        if (auto *c = Il2cpp::FindClass("UnityEngine.Camera"))
+        if (g_CameraClass == nullptr)
         {
-            g_CameraClass = c;
-            if (ResolveMainCamera())
+            if (auto *c = Il2cpp::FindClass("UnityEngine.Camera"))
             {
-                // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有
-                // 多个重载（含带 MonoOrStereoscopicEye 的两参版本），按下标取
-                // 很容易挑错签名；而 invoke 是按「尾部再塞一个 MethodInfo*」
-                // 的约定直接 reinterpret 成函数指针调的，签名一错就等于把隐藏
-                // 参数喂到枚举参数的位置上 → 寄存器/栈错乱。
-                g_WorldToScreenPoint = c->getMethod("WorldToScreenPoint", 1);
+                g_CameraClass = c;
             }
+        }
+        if (g_CameraClass != nullptr && ResolveMainCamera())
+        {
+            // 不能盲目取重载列表里的 [1]。Camera.WorldToScreenPoint 有
+            // 多个重载（含带 MonoOrStereoscopicEye 的两参版本），按下标取
+            // 很容易挑错签名；而 invoke 是按「尾部再塞一个 MethodInfo*」
+            // 的约定直接 reinterpret 成函数指针调的，签名一错就等于把隐藏
+            // 参数喂到枚举参数的位置上 → 寄存器/栈错乱。
+            g_WorldToScreenPoint = g_CameraClass->getMethod("WorldToScreenPoint", 1);
         }
     }
 }
