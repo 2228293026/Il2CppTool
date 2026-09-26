@@ -144,10 +144,37 @@ void Clear()
 
 void DrawUI()
 {
-    const auto list = Snapshot();
+    // Snapshot() 是**深拷贝**：512 条 × 2 个 std::string = 1024 次堆分配。
+    // 绘制是每帧调用的，所以直接每帧拷贝就是每帧 1024 次分配 ——
+    // 这正是我给类列表加渲染上限（第 51 轮）时解决的**同一个问题**，
+    // 换个文件又犯了一次。
+    //
+    // 便宜的判断：只在**条数变了**或者**过了 1 秒**时才重新拷。
+    // 条数变更是 O(1) 的（Count() 只加一次锁取 size）。
+    // 例外是「已满 512 条之后又加一条又丢一条」—— 条数不变，内容会滞后
+    // 最多 1 秒。改动记录本来就不是逐帧刷新的实时数据，1 秒完全够。
+    static std::vector<Entry> cached;
+    static size_t cachedCount = 0;
+    static double lastRefresh = 0.0;
+    const double now = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now - lastRefresh > 1.0)
+    {
+        const size_t n = Count();
+        if (n != cachedCount || cached.empty())
+        {
+            cached = Snapshot();
+            cachedCount = n;
+        }
+        lastRefresh = now;
+    }
+    const auto &list = cached;
 
+    // 注意：ImGui **不解析 markdown**（第 49 轮在自检页犯过一次）。
+    // 写 **粗体** 会在界面上显示成 literally 带星号的文本。
     ImGui::TextDisabled(
-        "记录本工具**改动了目标游戏的什么**。这些改动只存在于游戏进程内存里 ——\n"
+        "记录本工具「改动了目标游戏的什么」。这些改动只存在于游戏进程内存里 ——\n"
         "游戏一关就全部消失，工具自己也不会留下任何痕迹。\n"
         "改了十几个字段之后想不起来「当时把哪个设成了多少」时，看这一页。");
     ImGui::Separator();
@@ -172,21 +199,54 @@ void DrawUI()
     if (ImGui::SmallButton("清空"))
     {
         Clear();
+        // 立刻让下一帧重新取一次，否则界面上还要再显示最多 1 秒
+        // 才消失 —— 用户点了「清空」却看到内容还在，会以为按钮没生效。
+        lastRefresh = 0.0;
+        cached.clear();
+        cachedCount = 0;
         return;
     }
     ImGui::Separator();
 
     // 新的在最上面：当下关心的永远是刚改的那几条。
+    //
+    // 三列固定布局。不用「标签 + SameLine + 值」：target 最多 220 字符
+    // （类名 + 字段路径），SameLine 之后 detail（也就是**新值**，这一页
+    // 真正要看的**东西**）会被顶到屏幕外。
+    // 关注值那一页已经犯过一次，这里不重复犯。
     for (auto it = list.rbegin(); it != list.rend(); ++it)
     {
         ImGui::PushID(static_cast<int>(it - list.rbegin()));
-        ImGui::TextColored(KindColor(it->kind), "%s", KindLabel(it->kind));
-        ImGui::SameLine();
-        ImGui::TextUnformatted(it->target.c_str());
-        if (!it->detail.empty())
+        if (ImGui::BeginTable("##changelogrow", 3, ImGuiTableFlags_SizingStretchProp))
         {
-            ImGui::SameLine();
-            ImGui::TextDisabled("→  %s", it->detail.c_str());
+            const float avail = ImGui::GetContentRegionAvail().x;
+            ImGui::TableSetupColumn("kind", ImGuiTableColumnFlags_WidthFixed,
+                                    ImGui::CalcTextSize("追踪").x + 8.0f);
+            ImGui::TableSetupColumn("target", ImGuiTableColumnFlags_WidthFixed, avail * 0.42f);
+            ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextColored(KindColor(it->kind), "%s", KindLabel(it->kind));
+            ImGui::TableNextColumn();
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("%s", it->target.c_str());
+            }
+            ImGui::TextUnformatted(it->target.c_str());
+            ImGui::TableNextColumn();
+            if (it->detail.empty())
+            {
+                ImGui::TextDisabled("-");
+            }
+            else
+            {
+                ImGui::TextUnformatted(it->detail.c_str());
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("%s", it->detail.c_str());
+                }
+            }
+            ImGui::EndTable();
         }
         ImGui::PopID();
     }
