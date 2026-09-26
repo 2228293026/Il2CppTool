@@ -145,6 +145,49 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 8. 规则 E：把第 83 轮那个 bug 原样注入，必须被抓到 ----
+# 这是**同一个真实缺陷**的复现，不是造一个假的：第 83 轮
+# 「折叠关注值 → 冻结全停」就是这么写的。
+$eCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'E 游戏状态挂在面板上' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $af = -1
+    for ($i = 0; $i -lt $ls.Count; $i++) {
+        if ($ls[$i] -match '^\s*ClassesTab::ApplyFreezes\(\);') { $af = $i; break }
+    }
+    if ($af -lt 0) { return $false }
+    $ls.RemoveAt($af)
+    $ch = -1
+    for ($i = 0; $i -lt $ls.Count; $i++) {
+        if ($ls[$i] -match 'CollapsingHeader\("关注值"\)') { $ch = $i; break }
+    }
+    if ($ch -lt 0) { return $false }
+    $ls.Insert($ch + 2, (' ' * 8 + 'ClassesTab::ApplyFreezes();'))
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/Tool.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $eCheck 'app/src/main/jni/Tool/Tool.cpp'
+
+# 反向：同一个面板里、但被 Button 包着的调用是**合法**的，不该拦
+Test-Rule 'E 不误报（Button 包裹）' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $ch = -1
+    for ($i = 0; $i -lt $ls.Count; $i++) {
+        if ($ls[$i] -match 'CollapsingHeader\("关注值"\)') { $ch = $i; break }
+    }
+    if ($ch -lt 0) { return $false }
+    $ls.Insert($ch + 2, (' ' * 8 + 'if (ImGui::Button("面板内的按钮"))'))
+    $ls.Insert($ch + 3, (' ' * 12 + '{'))
+    $ls.Insert($ch + 4, (' ' * 16 + 'ClassesTab::ApplyFreezes();'))
+    $ls.Insert($ch + 5, (' ' * 12 + '}'))
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/Tool.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $eCheck 'app/src/main/jni/Tool/Tool.cpp' -ExpectRed $false
 # ---- 7. markdown 规则：渲染文本里的 ** 必须被抓到，注释/日志里的必须放过 ----
 # 这是第 44/49 轮的老缺陷，第 84 轮又犯了一次。规则本身要能红，
 # 也要证明**不误报** —— 一个把注释和日志也拦下来的检查会被人加白名单，

@@ -233,6 +233,61 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 E：改游戏状态的调用**不能**被挂在「面板可不可见」上 ----
+#
+# 同一个缺陷在两轮里各犯了一次：
+#   第 82 轮  DrawUI() 在 BeginTabItem("对象绘制") 里，
+#             却把 drawObjects **搬空**了 —— 同帧的 Tick()/DrawAll() 看到空列表，
+#             于是「打开那一页 → ESP 全停」。
+#   第 83 轮  冻结的每帧写回循环在 DrawWatches() 里，
+#             而 DrawWatches() 只在 CollapsingHeader("关注值") **展开**时被调用 ——
+#             于是「折叠那一栏 → 冻结全停」。
+#
+# 两次都**不报错**，按钮还显示着正确状态，只是那个东西不工作了。
+#
+# 原则：**作用在游戏状态上的东西，不该挂在界面上。**
+# 界面是按需渲染的，游戏状态不是。
+#
+# 规则：改游戏状态的调用，它的**直接父条件**如果是 BeginTabItem /
+# CollapsingHeader，就是缺陷。父条件是 Button / Checkbox / MenuItem
+# 这些「用户主动触发」的没问题 —— 那些本来就该在点了之后才执行。
+foreach ($f in $files) {
+    $lines = Get-Content $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 前视断言里**不能**排除 :: —— ClassesTab::ApplyFreezes() 和
+        # Tool::ToggleHooker(...) 全都是限定名调用，排除掉就等于这条规则
+        # 只认裸调用，而真实代码里几乎全是限定名。第 87 轮自己踩了一次。
+        $isMutator = $t -match '(?<![\w.>])(SetFieldValue|setField|ParseAndSetNumericField|WriteWatchValue|ApplyFreezes|ToggleHooker|DobbyInstrument|DobbyDestroy|NewHandle|FreeHandle|SelectObject|RemoveDrawObject|ClearAllDrawObjects|RestorePatchedMethod|ProcessScannedObjects)\s*\('
+        if (-not $isMutator) { continue }
+        # 函数**定义**那一行会以 { 结尾（不是调用），要排除 ——
+        # 不然 ool ToggleHooker(MethodInfo*, int) { 会被当成调用点。
+        if ($t -match '\{\s*$') { continue }
+        if ($t -match 'static\s+(void|bool|Il2CppObject)') { continue }
+        $ind = $lines[$i] -replace '^(\s*).*', '$1'
+        $indLen = $ind.Length
+        # 往上找**直接父条件**：第一个缩进比它浅、且是 if/else if 的行
+        for ($k = $i - 1; $k -ge 0; $k--) {
+            $u = $lines[$k].Trim()
+            if ($u -eq '' -or $u -match '^(//|\*|/\*)') { continue }
+            $uInd = ($lines[$k] -replace '^(\s*).*', '$1').Length
+            if ($uInd -ge $indLen) { continue }
+            if ($u -match '^\}\s*else if\b' -or $u -match '^else if\b' -or $u -match '^if\s*\(') {
+                if ($u -match 'ImGui::(BeginTabItem|CollapsingHeader)\(') {
+                    $hits += [pscustomobject]@{
+                        File = $f.Name
+                        Line = $i + 1
+                        Rule = 'E: 改游戏状态的调用被挂在面板可见性上（折叠/切页即失效，且不报错）'
+                        Text = $t
+                    }
+                }
+                break
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
