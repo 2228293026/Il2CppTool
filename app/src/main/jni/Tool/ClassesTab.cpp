@@ -2494,6 +2494,18 @@ void ClassesTab::Draw(int index, bool closeable)
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), "筛选中…");
         }
+        else if (const char *filterFailure = GetFilterFailure(); filterFailure != nullptr)
+        {
+            // 上一轮筛选失败了。明确说出来，而不是让用户对着一个
+            // 空列表 + 一句「没有匹配」怀疑是自己关键字打错了。
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "筛选失败: %s", filterFailure);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("重试"))
+            {
+                FilterClasses(filter);
+            }
+        }
         if (ImGui::Button(filterBuffer, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)) && !Keyboard::IsOpen())
         {
             Keyboard::Open(
@@ -3471,6 +3483,13 @@ struct ClassesTab::FilterState
     // 结果
     bool hasResult = false;
     uint64_t resultGen = 0;
+    // 本轮失败的原因；空 = 成功。
+    //
+    // 存在的意义是**失败也必须有出口**：attach 失败或抛异常时，
+    // 如果直接 return 而不走到统一发布结果那段，hasResult 永远是 false、
+    // resultGen 永远对不上 requestGen → IsFilterPending() 恒为 true
+    // → 标签页**永久**显示「筛选中…」，列表永远是空的，界面上没有任何解释。
+    const char *failure = nullptr;
     std::vector<Il2CppClass *> classes;
     std::vector<Il2CppClass *> filteredClasses;
     ClassesTab::ClassMethodMap methodMap;
@@ -3513,6 +3532,8 @@ namespace
         std::vector<Il2CppClass *> allClasses;
         std::vector<Il2CppClass *> filtered;
         ClassesTab::ClassMethodMap methodMap;
+        // 失败原因。空 = 成功。非空 = 这一轮没能完成。
+        const char *failure = nullptr;
 
         try
         {
@@ -3520,9 +3541,16 @@ namespace
             if (!attachGuard.attached)
             {
                 LOGE("后台筛选: 无法 attach 到 il2cpp VM");
-                return;
+                failure = "无法 attach 到 il2cpp VM（游戏可能仍在加载，或该线程未被支持）";
+                // 注意：**不能直接 return**。
+                // 下面统一发布结果的代码块才是「这一轮有结论了」的出口；
+                // 从这里 return 的话 hasResult 永远为 false、resultGen 永远
+                // 对不上 requestGen，于是 IsFilterPending() 恒为 true ——
+                // 标签页会**永久**显示「筛选中…」，列表永远是空的，
+                // 而界面上除了那行「筛选中」没有任何解释。
             }
-
+            else
+            {
             if (st->includeAllImages)
             {
                 for (auto image : st->images)
@@ -3675,22 +3703,29 @@ namespace
                         methodMap[klass].push_back({m, m->getParamsInfo()});
                     }
                 }
-            }
-        }
+            } // ← 关闭遍历类的 for
+            }   // ← 关闭 `else`（attach 成功分支）
+        }       // ← 关闭 try
         catch (const std::exception &e)
         {
             LOGE("后台筛选异常: %s", e.what());
+            failure = "筛选时发生异常";
         }
         catch (...)
         {
             LOGE("后台筛选未知异常");
+            failure = "筛选时发生未知异常";
         }
 
+        // 无论成功还是失败，这里都是「这一轮有结论了」的出口。
+        // 失败时**照样**发布结果（空的 + 带失败原因），这样 UI 不会永远
+        // 卡在「筛选中…」，而是明确显示失败。
         std::lock_guard guard(st->mutex);
         st->classes = std::move(allClasses);
         st->filteredClasses = std::move(filtered);
         st->methodMap = std::move(methodMap);
         st->resultGen = st->requestGen;
+        st->failure = failure;
         st->hasResult = true;
     }
 
@@ -3795,6 +3830,16 @@ bool ClassesTab::IsFilterPending()
     }
     std::lock_guard guard(filterState->mutex);
     return !filterState->hasResult && filterState->resultGen != filterState->requestGen;
+}
+
+const char *ClassesTab::GetFilterFailure()
+{
+    if (!filterState)
+    {
+        return nullptr;
+    }
+    std::lock_guard guard(filterState->mutex);
+    return filterState->failure;
 }
 
 bool ClassesTab::PollFilterResult()
