@@ -266,6 +266,9 @@ namespace Tool
     void Init(Il2CppImage *image, std::vector<Il2CppImage *> images)
     {
         ConfigInit();
+        // 改动记录的撤销器要在**第一次记录之前**注入 ——
+        // 否则在这之前记下的条目全都不可撤销。
+        ClassesTab::InitChangeLogUndo();
         InitScreenSize();
         
         g_Images = images;

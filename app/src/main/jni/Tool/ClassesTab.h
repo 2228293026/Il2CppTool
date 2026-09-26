@@ -132,6 +132,9 @@ struct ClassesTab
     static void ClearWatches();
     static size_t WatchCount();
     // 在 JSON 检视器末尾画关注列表。由 ImGuiJson 调用。
+    // 把「撤销器」和「句柄释放器」注入改动记录。
+    // 必须在任何 RecordUndoable 之前调用，否则记录表没有恢复能力。
+    static void InitChangeLogUndo();
     static void DrawWatches();
     // 显示「上一次写入失败」的原因。挂在工具页而不是对象检视器里 ——
     // 设置它的回调可能来自 CallerView（另一个界面），而对象检视器

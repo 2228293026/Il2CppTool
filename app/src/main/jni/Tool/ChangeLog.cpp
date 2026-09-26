@@ -101,6 +101,142 @@ std::string ExportText(const std::vector<Entry> &list)
 }
 } // namespace
 
+namespace {
+Restorer g_restorer = nullptr;
+// 句柄释放器。由外部注入（和撤销器一样，ChangeLog 不认识 il2cpp）。
+HandleReleaser g_handleReleaser = nullptr;
+
+// 找到这条记录并就地修改。用 target+detail 定位：同一条记录
+// （同样的字段、同样的值）**只会有一条**，因为每次改动都会记一条，
+// 而「改回同样的值」也会单独记一条。所以按内容定位是够的。
+Entry *FindEntry(const std::string &target, const std::string &detail)
+{
+    auto &v = entries();
+    for (auto it = v.rbegin(); it != v.rend(); ++it)
+    {
+        if (it->target == target && it->detail == detail)
+        {
+            return &(*it);
+        }
+    }
+    return nullptr;
+}
+
+// 淘汰最老的 drop 条，**顺带释放它们持有的句柄**。
+//
+// 不释放的后果不是「多用一点内存」，而是那些对象**永远不会被回收** ——
+// 而 512 条记录对应的可能是几百个游戏对象。整张表被 Clear() 时同理。
+void DropOldestLocked(size_t drop)
+{
+    auto &v = entries();
+    if (drop == 0 || drop > v.size())
+    {
+        return;
+    }
+    if (g_handleReleaser != nullptr)
+    {
+        for (size_t i = 0; i < drop; i++)
+        {
+            if (v[i].handle != 0)
+            {
+                g_handleReleaser(v[i].handle);
+                v[i].handle = 0;
+            }
+        }
+    }
+    v.erase(v.begin(), v.begin() + drop);
+}
+} // namespace
+
+void SetRestorer(Restorer fn)
+{
+    std::lock_guard guard(mutex());
+    g_restorer = fn;
+}
+
+void SetHandleReleaser(HandleReleaser fn)
+{
+    std::lock_guard guard(mutex());
+    g_handleReleaser = fn;
+}
+
+void RecordUndoable(Kind kind, const std::string &target, const std::string &oldValue,
+                    const std::string &newValue, uint32_t handle, const std::string &type,
+                    const std::string &field)
+{
+    if (target.empty())
+    {
+        return;
+    }
+    try
+    {
+        // detail 用「旧 -> 新」，和头文件里那句注释写的一致 ——
+        // 之前注释写着 "100 -> 999" 而代码只记新值（第 68 轮那个
+        // 「注释说的 vs 代码做的」）。现在先让它们一致。
+        std::string detail = newValue.empty() ? oldValue : (oldValue + " -> " + newValue);
+        std::lock_guard guard(mutex());
+        auto &v = entries();
+        v.push_back({kind, Truncate(target, kMaxTarget), Truncate(detail, kMaxDetail),
+                     Truncate(oldValue, kMaxDetail), type, field, handle});
+        if (v.size() > kMaxEntries)
+        {
+            // 淘汰最老的，**连同它们持有的 GC 句柄**。
+            DropOldestLocked(v.size() - kMaxEntries);
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
+bool CanUndo(const Entry &entry)
+{
+    return entry.handle != 0 && !entry.oldValue.empty() && g_restorer != nullptr;
+}
+
+bool Undo(const Entry &entry)
+{
+    if (!CanUndo(entry))
+    {
+        return false;
+    }
+    Restorer fn = g_restorer;
+    if (fn == nullptr)
+    {
+        return false;
+    }
+    try
+    {
+        return fn(entry);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+void MarkUndone(const Entry &entry)
+{
+    try
+    {
+        std::lock_guard guard(mutex());
+        Entry *e = FindEntry(entry.target, entry.detail);
+        if (e == nullptr)
+        {
+            return;
+        }
+        // 只作废「可恢复」，条目本身留着 —— 它仍然是一条记录。
+        if (e->handle != 0)
+        {
+            e->handle = 0;
+        }
+        e->oldValue.clear();
+    }
+    catch (...)
+    {
+    }
+}
+
 void Record(Kind kind, const std::string &target, const std::string &detail)
 {
     if (target.empty())
@@ -139,7 +275,9 @@ size_t Count()
 void Clear()
 {
     std::lock_guard guard(mutex());
-    entries().clear();
+    // 先把句柄全还回去再清表。直接 clear() 的话对象就**永远不会被回收** ——
+    // 「清空改动记录」这个按钮会变成一个看不见的泄漏。
+    DropOldestLocked(entries().size());
 }
 
 void DrawUI()
@@ -219,13 +357,14 @@ void DrawUI()
     for (auto it = list.rbegin(); it != list.rend(); ++it)
     {
         ImGui::PushID(static_cast<int>(it - list.rbegin()));
-        if (ImGui::BeginTable("##changelogrow", 3, ImGuiTableFlags_SizingStretchProp))
+        if (ImGui::BeginTable("##changelogrow", 4, ImGuiTableFlags_SizingStretchProp))
         {
             const float avail = ImGui::GetContentRegionAvail().x;
             ImGui::TableSetupColumn("kind", ImGuiTableColumnFlags_WidthFixed,
                                     ImGui::CalcTextSize("追踪").x + 8.0f);
-            ImGui::TableSetupColumn("target", ImGuiTableColumnFlags_WidthFixed, avail * 0.42f);
+            ImGui::TableSetupColumn("target", ImGuiTableColumnFlags_WidthFixed, avail * 0.34f);
             ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("undo", ImGuiTableColumnFlags_WidthFixed, 52.0f);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextColored(KindColor(it->kind), "%s", KindLabel(it->kind));
@@ -247,6 +386,33 @@ void DrawUI()
                 {
                     ImGui::SetTooltip("%s", it->detail.c_str());
                 }
+            }
+
+            ImGui::TableNextColumn();
+            if (CanUndo(*it))
+            {
+                if (ImGui::SmallButton("恢复"))
+                {
+                    if (Undo(*it))
+                    {
+                        MarkUndone(*it);
+                        // 立刻重取快照，否则界面上这一条还会显示最多 1 秒，
+                        // 用户会以为「点了没反应」。
+                        lastRefresh = 0.0;
+                        cached.clear();
+                        cachedCount = 0;
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("把字段退回到改动前的值（%s）", it->oldValue.c_str());
+                }
+            }
+            else
+            {
+                // 占位，保证三列/四列的行高一致 —— 少一个控件会让这一行
+                // 比别的行矮一点，扫起来像有东西没加载出来。
+                ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
             }
             ImGui::EndTable();
         }

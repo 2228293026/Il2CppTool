@@ -249,6 +249,19 @@ static std::string JsonToText(const nlohmann::ordered_json &j)
     return {};
 }
 
+// 注入改动记录用的两个回调。定义在文件更靠后（记录撤销那一段），
+// 但 InitChangeLogUndo() 在文件前部就要引用它们，所以这里前向声明。
+static bool UndoFieldChange(const ChangeLog::Entry &entry);
+static void FreeUndoHandle(uint32_t handle);
+
+void ClassesTab::InitChangeLogUndo()
+{
+    // 一次性注入。重复调用也只是覆盖成同样的函数指针，无副作用 ——
+    // 这里的幂等性不靠假设，靠「SetX 只是赋值」。
+    ChangeLog::SetRestorer(&UndoFieldChange);
+    ChangeLog::SetHandleReleaser(&FreeUndoHandle);
+}
+
 void ClassesTab::DrawWatches()
 {
     if (g_watches.empty())
@@ -3542,6 +3555,51 @@ static std::unordered_map<Il2CppObject *, bool> g_refreshRequests;
 // 这里**不**去读旧值：写之前它就已经被覆盖了，而界面显示的 JSON 是
 // 上一帧 dump 的快照，不一定是最新的。与其给一个可能不对的「原值 → 新值」，
 // 不如只如实记「新值」。
+// 前向声明：撤销器要用它，而它的定义在文件更靠后（字段编辑那段）。
+static bool ParseAndSetNumericField(Il2CppObject *object, const std::string &type,
+                                    const std::string &fieldName, const std::string &text);
+
+// ChangeLog 的撤销器：把字段退回到记录里的旧值。
+//
+// 和记录表一样全程 try/catch + 句柄判空 —— 撤销动作发生在
+// **ImGui 帧回调**里，从这里抛出去就是把渲染线程带崩。
+static bool UndoFieldChange(const ChangeLog::Entry &entry)
+{
+    try
+    {
+        if (entry.handle == 0 || entry.field.empty() || entry.type.empty())
+        {
+            return false;
+        }
+        Il2CppObject *obj = Il2cpp::GC::GetHandleTarget(entry.handle);
+        if (obj == nullptr)
+        {
+            return false; // 对象已经被回收了，退不回去
+        }
+        // 走和写入时**完全同一套**解析（整串吃掉 + 范围检查），
+        // 否则「旧值 12abc」会被静默写成 12。
+        return ParseAndSetNumericField(obj, entry.type, entry.field, entry.oldValue);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+static void FreeUndoHandle(uint32_t handle)
+{
+    try
+    {
+        if (handle != 0)
+        {
+            Il2cpp::GC::FreeHandle(handle);
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
 static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
                               const std::string &type, const std::string &value)
 {
@@ -3550,6 +3608,41 @@ static void RecordFieldChange(Il2CppObject *rootObj, const std::string &field,
         return;
     }
     const std::string target = std::string(rootObj->klass->getName()) + "." + field;
+
+    // 能不能撤销，取决于这是不是「单个数值字段」——
+    // 「整个对象」是加 GC 根这种操作，没有「单个旧值」可言。
+    if (!type.empty() && type != "(整个对象)" && !field.empty())
+    {
+        // **先把旧值读出来**。RecordFieldChange 是在**写入之后**调用的
+        // （调用点在 setField 后面），所以现在读到的就是改之前的值。
+        //
+        // 用 dump 走一遍完整路径读，和写入用的是同一套路径表示。
+        std::string oldValue;
+        bool readOk = false;
+        // field 形如 "System.Int32 health"，dump 要的就是这个形式。
+        // 声明在 try 外面：后面 RecordUndoable 还要用。
+        const std::string fieldName = field;
+        try
+        {
+            auto paths = std::vector<std::string>{fieldName};
+            auto result = rootObj->dump(paths);
+            oldValue = JsonToText(result.second);
+            readOk = !oldValue.empty();
+        }
+        catch (...)
+        {
+            readOk = false;
+        }
+        if (readOk)
+        {
+            // 记录表**接管**这个句柄：条目被淘汰 / 清空时它自己会还回来。
+            // 不接管的话，对象会被一直钉着不回收；不接管也没法撤销。
+            uint32_t handle = Il2cpp::GC::NewHandle(rootObj);
+            ChangeLog::RecordUndoable(ChangeLog::Kind::Field, target, oldValue, value, handle, type,
+                                      fieldName);
+            return;
+        }
+    }
     const std::string detail = type.empty() ? value : (type + " = " + value);
     ChangeLog::Record(ChangeLog::Kind::Field, target, detail);
 }

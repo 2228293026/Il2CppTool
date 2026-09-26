@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -36,10 +37,48 @@ struct Entry
     Kind kind;
     std::string target;  // 例："Player.health" / "UnityEngine.Camera::get_main"
     std::string detail;  // 例："100 -> 999" / "Int32 返回值改为 1"
+    // ---- 恢复（撤销）所需的信息 ----
+    //
+    // 没有这些就只能「看」，不能「退回去」。而对改内存的工具来说，
+    // 「退回去」比「看」常用得多：冻了个值玩够了、补丁打错了、
+    // 想让游戏恢复正常 —— 每一次都需要撤销，而不是「记得当时
+    // 改成了多少」再手填回去。
+    std::string oldValue;  // 改动**之前**的值（文本形式）
+    std::string type;      // 声明类型名，如 "System.Int32"
+    std::string field;     // 字段名，如 "health"
+    uint32_t handle = 0;   // 根对象的 GC 句柄（0 = 不可恢复）
 };
 
 // 记录一条。thread-safe。target/detail 会被截断到合理长度。
 void Record(Kind kind, const std::string &target, const std::string &detail);
+
+// 记录一条**可撤销**的字段改动。
+//
+// handle 必须是**根对象**的 GC 强根，所有权转移给记录表 ——
+// 记录表会在条目被淘汰或 Clear() 时自己释放它。
+// 传 0 表示这次改动不可撤销（对象已经没了、或者「整对象保存」
+// 这类没有「单个旧值」可言的操作）。
+void RecordUndoable(Kind kind, const std::string &target, const std::string &oldValue,
+                    const std::string &newValue, uint32_t handle, const std::string &type,
+                    const std::string &field);
+
+// 撤销动作由外部注入：ChangeLog 不认识 il2cpp，也不该认识。
+// 返回 true 表示恢复成功。
+using Restorer = bool (*)(const Entry &entry);
+void SetRestorer(Restorer fn);
+
+// GC 句柄的释放器。和撤销器一样由外部注入 —— ChangeLog 不认识 il2cpp，
+// 但它需要**在条目被淘汰 / 清空时把句柄还回去**，否则那个对象
+// 永远不会被回收（512 条记录可能对应几百个游戏对象）。
+using HandleReleaser = void (*)(uint32_t handle);
+void SetHandleReleaser(HandleReleaser fn);
+
+// 这一条现在还能不能撤销（对象还在、值没被恢复过、有注入的恢复器）。
+bool CanUndo(const Entry &entry);
+// 真正执行恢复。
+bool Undo(const Entry &entry);
+// 恢复成功后调用：这一条的可恢复状态作废（再点一次会跳过）。
+void MarkUndone(const Entry &entry);
 
 // 快照。返回的副本之后随便改，不影响内部状态。
 std::vector<Entry> Snapshot();
