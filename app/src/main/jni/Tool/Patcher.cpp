@@ -305,7 +305,31 @@ std::vector<uint8_t> Patcher::patch()
 #ifdef __aarch64__
     {
         constexpr size_t kScanWindow = 64; // 足够短，也不至于扫到无关代码
-        const size_t scanLen = std::min(kScanWindow, bytes.size());
+        // 旧代码写的是 `std::min(kScanWindow, bytes.size())` —— 但 bytes 是
+        // **我们生成的 stub**（movPtr+ret 之类，最多 20 字节），不是目标方法。
+        // 于是 scanLen 实际等于 stub 长度（约 20），扫不满 64 字节。
+        //
+        // 后果：序言稍长一点、`ret` 在偏移 24/28 处的常见方法，会被判成
+        // 「找不到 ret」而**拒绝打补丁** —— 哪怕补丁明明装得下。
+        // 清单 5.2（给较大方法打补丁应生效）会直接失败。
+        //
+        // 这里就是要读**目标方法**的前若干字节，和 stub 大小无关。
+        //
+        // 另外要夹到「本页还剩多少字节」：方法体都在同一个 RX 段里，但
+        // **最后几个方法**可能紧贴映射末尾。直接读 64 字节会跨进未映射页
+        // → SIGSEGV，而 Patcher 是本项目风险最高的子系统，崩溃在这里最难查。
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(target);
+        const uintptr_t pageEnd = (addr & ~(static_cast<uintptr_t>(4095))) + 4096;
+        size_t scanLen = kScanWindow;
+        if (addr + scanLen > pageEnd)
+        {
+            scanLen = static_cast<size_t>(pageEnd - addr);
+        }
+        if (scanLen < 4)
+        {
+            LOGE("Patcher::patch: 方法起始处剩余可读字节不足 4，无法确认边界，拒绝写入");
+            return {};
+        }
         const long long retOffset = FindFirstRetArm64((const uint8_t *)target, scanLen);
         if (retOffset < 0)
         {
