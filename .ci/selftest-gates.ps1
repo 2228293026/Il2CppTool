@@ -140,6 +140,31 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 6. 结构检查：删掉一个 } 必须被抓到 ----
+# 这是第 74 轮真实发生过的损坏（按行号搬代码，误删 `});`）。
+$structCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-structure.ps1')
+}
+Test-Rule '结构（花括号配平）' {
+    param($t)
+    $marker = "else if (value.is_number_float())"
+    $p = $t.IndexOf($marker)
+    if ($p -lt 0) { return $false }
+    $lineStart = $t.LastIndexOf("`n", $p) + 1
+    $lineEnd = $t.IndexOf("`n", $p)
+    if ($lineEnd -lt 0) { $lineEnd = $t.Length }
+    $line = $t.Substring($lineStart, $lineEnd - $lineStart)
+    # 删掉紧挨着它**上面**那一行（就是那个 '}'）—— 复现第 74 轮的损坏
+    $prevEnd = $lineStart - 1
+    $prevStart = $t.LastIndexOf("`n", $prevEnd - 1) + 1
+    $prevLine = $t.Substring($prevStart, $prevEnd - $prevStart)
+    if ($prevLine.Trim() -ne '}') { return $false }
+    $out = $t.Substring(0, $prevStart) + $t.Substring($prevEnd)
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'), $out,
+        (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $structCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 5. 宿主检查：把 DrawWatches 挂回对象检视器 ----
 $hostGate = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-hosts.ps1')

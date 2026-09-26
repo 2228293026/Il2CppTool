@@ -86,6 +86,10 @@ if (-not $SkipSelfTest) {
     }
 }
 
+Invoke-Check '结构完整（花括号配平）' {
+    powershell -ExecutionPolicy Bypass -File .\.ci\check-structure.ps1
+    if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
+}
 Invoke-Check '跨界面内容的宿主（挂错宿主 = 功能消失）' {
     powershell -ExecutionPolicy Bypass -File .\.ci\check-hosts.ps1
     if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
