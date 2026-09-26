@@ -796,6 +796,22 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
     // }
 }
 
+// 参数在预设里的稳定键：参数名 + 序号。
+//
+// **不能用 paramMap 的 key** —— 那个 key 形如 "%p%s%d"，嵌了 MethodInfo*
+// （进程内的代码地址，每次启动都不同）。用它当预设的键，预设在第二次
+// 启动后就再也匹配不上任何参数：用户选了预设、界面毫无反应、也不报错。
+// 而它在单次会话内完全正常，所以这个 bug 极难被发现。
+//
+// 方法本身已经由 MethodSignature 定位了，所以「参数名 + 序号」在
+// 方法内部是唯一的。
+static std::string StableParamKey(const char *paramName, int index)
+{
+    char buf[224]{0};
+    snprintf(buf, sizeof(buf), "%s#%d", paramName ? paramName : "?", index);
+    return buf;
+}
+
 void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const MethodParamList &paramsInfo,
                             Il2CppObject *thiz)
 {
@@ -1374,16 +1390,40 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                 if (found && paramMap)
                 {
                     auto &target = (*paramMap)[method];
-                    for (const auto &[key, text] : found->values)
+                    size_t applied = 0;
+                    // 按稳定键（参数名 + 序号）回填，并换算成当前会话的
+                    // paramMap key。详见「存为预设」处关于为什么不能用
+                    // paramMap key 当预设键的说明。
+                    for (int k = 0; k < paramsInfo.size(); k++)
                     {
-                        auto &pv = target[key];
-                        pv.value = text;
+                        const auto &[pname, ptype] = paramsInfo[k];
+                        auto vIt = found->values.find(StableParamKey(pname, k));
+                        if (vIt == found->values.end())
+                        {
+                            continue;
+                        }
+                        char liveKey[256]{0};
+                        snprintf(liveKey, sizeof(liveKey), "%p%s%d", (const void *)method, pname, k);
+                        auto &pv = target[liveKey];
+                        pv.value = vIt->second;
                         // 关键：清掉 object。预设里根本没存它（可能早就
                         // 被 GC 回收了），留着旧的只会把野指针交给 VM。
                         pv.object = nullptr;
+                        applied++;
                     }
-                    LOGI("已载入参数预设 \"%s\"（%zu 个参数，引用类型需重新选择）",
-                         currentName.c_str(), found->values.size());
+                    if (applied == 0)
+                    {
+                        // 一定要说出来：静默什么都不发生，用户会以为功能坏了。
+                        LOGW("预设 \"%s\" 没有匹配上任何参数（该方法签名可能已变）",
+                             currentName.c_str());
+                        ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f),
+                                           "该预设的参数名与当前方法不匹配（游戏版本可能已变），未应用任何值。");
+                    }
+                    else
+                    {
+                        LOGI("已载入参数预设 \"%s\"：%zu 个参数（引用类型需重新选择）",
+                             currentName.c_str(), applied);
+                    }
                 }
             }
             ImGui::SameLine();
@@ -1417,13 +1457,25 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             }
             MethodPreset preset;
             preset.name = name;
-            for (const auto &[key, pv] : (*paramMap)[method])
+            // 按**稳定键**（参数名 + 序号）存，不按 paramMap 的 key。
+            //
+            // paramMap 的 key 形如 "%p%s%d"，里面嵌了 MethodInfo* —— 那是
+            // 进程内的代码地址，**每次启动都不一样**（ASLR / il2cpp 布局变化）。
+            // 用它当预设的键，预设在**第二次启动后就再也匹配不上任何参数**：
+            // 用户选了预设、界面毫无反应、也不报错。而它在单次会话内是好的，
+            // 所以极难被发现。
+            for (int k = 0; k < paramsInfo.size(); k++)
             {
-                if (!pv.value.empty())
+                const auto &[pname, ptype] = paramsInfo[k];
+                char liveKey[256]{0};
+                snprintf(liveKey, sizeof(liveKey), "%p%s%d", (const void *)method, pname, k);
+                auto it = (*paramMap)[method].find(liveKey);
+                if (it == (*paramMap)[method].end() || it->second.value.empty())
                 {
-                    // 只存文本。object 一律不存。
-                    preset.values[key] = pv.value;
+                    continue;
                 }
+                // 只存文本。object 一律不存。
+                preset.values[StableParamKey(pname, k)] = it->second.value;
             }
             auto &list = methodPresets[method];
             auto existing = std::find_if(list.begin(), list.end(),

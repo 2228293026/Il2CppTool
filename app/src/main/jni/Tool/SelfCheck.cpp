@@ -141,6 +141,21 @@ std::vector<Result> Collect()
         out.push_back(Info("数据目录", buf));
     }
 
+    // ---- 构建信息 ----
+    // 出问题时能一眼确认跑的是哪个版本，省掉一轮来回。
+    {
+        char buf[128]{0};
+        snprintf(buf, sizeof(buf), "v0.9 / %s 构建", __DATE__);
+        out.push_back(Info("构建", buf));
+    }
+    {
+        const std::string unity = Il2cpp::getUnityVersion();
+        const std::string game = Il2cpp::getGameVersion();
+        char buf[256]{0};
+        snprintf(buf, sizeof(buf), "Unity %s / 游戏 %s", unity.c_str(), game.c_str());
+        out.push_back(Info("目标", buf));
+    }
+
     return out;
 }
 
