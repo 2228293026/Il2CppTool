@@ -175,6 +175,37 @@ Test-Rule 'PowerShell BOM' {
     return $true
 } $bomCheck '.ci/check-hosts.ps1'
 
+# ---- 14. 规则 J：把第 98 轮那个「加根失败退回裸指针」复现出来 ----
+$jCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'J 不许退回裸指针' {
+    param($t)
+    # 用行数组拼，避免嵌套 here-string。
+    # 锚点按**真实文本**写。函数体里那行注释也在 —— 漏掉它就匹配不上，
+    # 而「注入成功=False」意味着这条自检又一次在**测空气**。
+    $good = @(
+        '    if (!info.gameObjectHandle)',
+        '    {',
+        '        // 加根没成功。不退回裸指针 —— 那个地址随时可能是野的。',
+        '        return nullptr;',
+        '    }',
+        '    return Il2cpp::GC::GetHandleTarget(info.gameObjectHandle);'
+    ) -join "`r`n"
+    $bad = @(
+        '    if (info.gameObjectHandle)',
+        '    {',
+        '        return Il2cpp::GC::GetHandleTarget(info.gameObjectHandle);',
+        '    }',
+        '    return info.gameObject;'
+    ) -join "`r`n"
+    if ($t.Contains($good)) {
+        [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ObjectDrawManager.cpp'),
+            $t.Replace($good, $bad), (New-Object Text.UTF8Encoding($false)))
+        return $true
+    }
+    return $false
+} $jCheck 'app/src/main/jni/Tool/ObjectDrawManager.cpp'
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

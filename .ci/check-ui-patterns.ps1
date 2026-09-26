@@ -494,6 +494,46 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 J：解引用托管对象之前**必须**走句柄，不能退回裸指针 ----
+#
+# 第 98 轮在 ObjectDrawManager 里发现的：
+#
+#     static Il2CppObject* ResolveGameObject(const GameObjectInfo& info) {
+#         if (info.gameObjectHandle) return GetHandleTarget(info.gameObjectHandle);
+#         return info.gameObject;      // ← 加根失败时退回「没有根的裸指针」
+#     }
+#
+# 而 RootGameObject() 在加根失败时**只打一行 LOGW 就继续**，
+# 于是这个分支实际会发生：
+#
+#     加根失败 → 句柄 0 → Resolve 返回裸指针
+#            → DrawAll 每帧 transform->invoke_method(g_GetPosition)
+#            → 对一个随时会被 GC 回收的对象解引用 = 崩游戏
+#
+# 讽刺的是这个函数**上面的注释写的正好是反过来的**：
+#     「对象已回收时返回 nullptr —— 此时绝不能去解引用 info.gameObject 那个旧地址」
+#
+# 形状：函数体里 `return <裸指针成员>;`（而不是 nullptr），
+# 且该成员是某个 Il2CppObject* / Transform* 类型的裸指针。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 只看形如 `return info.<字段>;` 的裸退回
+        if ($t -notmatch '^return\s+\w+\.(gameObject|transform|gameObjectHandle|transformHandle)\s*;') { continue }
+        # 必须紧跟着「if (handle) return GetHandleTarget(...)」这种形状才值得报
+        $ctx = $lines[[Math]::Max(0, $i - 8)..$i] -join "`n"
+        if ($ctx -notmatch 'GetHandleTarget') { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'J: 加根失败时退回裸指针（该对象可能被 GC 回收，调用方会解引用它）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

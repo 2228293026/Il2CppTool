@@ -178,24 +178,41 @@ static void RootGameObject(GameObjectInfo& info)
     }
 }
 
-// 通过句柄取回仍然有效的对象指针。对象已回收时返回 nullptr —— 此时绝不能
-// 去解引用 info.gameObject 那个旧地址。
+// 通过句柄取回仍然有效的对象指针。
+//
+// **句柄为 0 时返回 nullptr，而不是 info.gameObject。**（第 98 轮改）
+//
+// 旧代码在这里 `return info.gameObject;` —— 也就是「加根失败时，
+// 退回那个没有根的裸指针」。而 RootGameObject() 在加根失败时
+// **只打一行 LOGW 就继续**，所以这个分支不是理论情况：
+//
+//     加根失败 → 句柄 0 → Resolve 返回裸指针
+//            → DrawAll 每帧 transform->invoke_method(g_GetPosition)
+//            → 对一个随时会被 GC 回收的对象解引用 = 崩游戏
+//
+// 上面两行注释（「绝不能去解引用 info.gameObject 那个旧地址」）
+// 说的正是这件事 —— **注释是对的，代码是错的**。
+//
+// 真正的失败（句柄指向的对象被回收）本来就由 GetHandleTarget 返回
+// nullptr 来表达。加根失败是另一种失败，它表达的是「我们不敢碰它」。
+// 两者都该返回 nullptr，调用方一律跳过。
 static Il2CppObject* ResolveGameObject(const GameObjectInfo& info)
 {
-    if (info.gameObjectHandle)
+    if (!info.gameObjectHandle)
     {
-        return Il2cpp::GC::GetHandleTarget(info.gameObjectHandle);
+        // 加根没成功。不退回裸指针 —— 那个地址随时可能是野的。
+        return nullptr;
     }
-    return info.gameObject;
+    return Il2cpp::GC::GetHandleTarget(info.gameObjectHandle);
 }
 
 static Il2CppObject* ResolveTransform(const GameObjectInfo& info)
 {
-    if (info.transformHandle)
+    if (!info.transformHandle)
     {
-        return Il2cpp::GC::GetHandleTarget(info.transformHandle);
+        return nullptr;
     }
-    return info.transform;
+    return Il2cpp::GC::GetHandleTarget(info.transformHandle);
 }
 
 static std::vector<Il2CppObject*> g_cachedGameObjects;
@@ -410,7 +427,11 @@ static void ProcessScannedObjects() {
                     std::remove_if(ObjectDrawManager::drawObjects.begin(),
                                    ObjectDrawManager::drawObjects.end(),
                                    [](const DrawObject& obj) {
-                                       return !IsValidGameObject(obj.target.gameObject);
+                                       // 走句柄，不碰裸指针。直接拿 target.gameObject
+                                       // 判活就是解引用一个可能已被回收的地址 ——
+                                       // 而这段代码的用途恰恰是「清理失效对象」，
+                                       // 所以它是最容易自己踩雷的地方（第 98 轮）。
+                                       return !IsValidGameObject(ResolveGameObject(obj.target));
                                    }),
                     ObjectDrawManager::drawObjects.end());
                 after = ObjectDrawManager::drawObjects.size();
@@ -586,6 +607,16 @@ void ObjectDrawManager::Tick() {
                     // 重新拿到的 transform 也要加根，否则下一帧它就可能消失
                     Il2cpp::GC::FreeHandle(drawObj.target.transformHandle);
                     drawObj.target.transformHandle = Il2cpp::GC::NewHandle(transform);
+                    if (drawObj.target.transformHandle == 0)
+                    {
+                        // 上一行刚把旧句柄放掉了，现在这个 transform **没有任何根**。
+                        // 而下面紧接着就会拿它去取世界坐标 —— 必须在这里就停下，
+                        // 不能带着一个可能被回收的对象往下走（第 98 轮）。
+                        LOGW("重新获取的 transform 加根失败，本帧跳过这个目标");
+                        drawObj.target.transform = nullptr;
+                        drawObj.target.screenPosition.z = -1;
+                        continue;
+                    }
                     drawObj.target.transform = transform;
                 }
             }
