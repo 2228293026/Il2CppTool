@@ -231,6 +231,43 @@ static bool CanUndoLocked(const Entry &entry)
 // 那条。于是用户点**旧**那条的「恢复」，被作废（并释放句柄）的是**新**
 // 那条 —— 下一帧新那条的按钮还在，再点就是**用已释放的句柄**，
 // 直接崩在用户的游戏里。
+size_t UndoAll(size_t *skipped, size_t *failed)
+{
+    if (skipped) *skipped = 0;
+    if (failed) *failed = 0;
+
+    // 先把「要恢复哪些」在锁内定下来，**倒着**。
+    // 不能一边遍历一边恢复：UndoById 会自己加锁，而锁不可重入。
+    std::vector<uint64_t> ids;
+    {
+        std::lock_guard guard(mutex());
+        for (size_t i = entries().size(); i-- > 0;)
+        {
+            const Entry &e = entries()[i];
+            if (!CanUndoLocked(e))
+            {
+                // 句柄没了（对象被回收）或已经恢复过 —— 这一条恢复不了。
+                if (skipped) (*skipped)++;
+                continue;
+            }
+            ids.push_back(e.id);
+        }
+    }
+
+    size_t done = 0;
+    for (uint64_t id : ids)
+    {
+        if (UndoById(id))
+        {
+            done++;
+        }
+        else if (failed)
+        {
+            (*failed)++;
+        }
+    }
+    return done;
+}
 bool UndoById(uint64_t id)
 {
     try
@@ -391,6 +428,41 @@ void DrawUI()
     {
         const std::string text = ExportText(list);
         ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::SameLine();
+    // 「全部恢复」：把这一轮做过的改动**一次性退回去**。
+    //
+    // 只有逐条「恢复」的时候，用户的真实场景是：连改了五处，想全部退干净。
+    // 逐条点五次很烦，而更糟的是**漏点一条** —— 界面上不会告诉他
+    // 「还有一条没退」，而他会以为游戏已经回到原样了。
+    if (ImGui::SmallButton("全部恢复"))
+    {
+        size_t skipped = 0;
+        size_t failed = 0;
+        const size_t done = UndoAll(&skipped, &failed);
+        // 立刻重取快照，否则列表上还要最多 1 秒才显示成恢复后的样子。
+        lastRefresh = 0.0;
+        cached.clear();
+        cachedCount = 0;
+
+        char msg[224]{0};
+        if (done == 0 && skipped == 0 && failed == 0)
+        {
+            snprintf(msg, sizeof(msg), "没有可恢复的记录");
+        }
+        else if (failed == 0 && skipped == 0)
+        {
+            snprintf(msg, sizeof(msg), "已恢复 %zu 条", done);
+        }
+        else
+        {
+            // 关键：**必须**说出有多少条没恢复，以及为什么。
+            // 少恢复几条在界面上和「全恢复了」长得一模一样。
+            snprintf(msg, sizeof(msg),
+                     "已恢复 %zu 条；%zu 条对象已失效跳过，%zu 条恢复失败",
+                     done, skipped, failed);
+        }
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.f, 1.f), "%s", msg);
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("清空"))
