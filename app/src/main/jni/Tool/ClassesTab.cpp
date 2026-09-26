@@ -2227,12 +2227,33 @@ bool ClassesTab::isMethodHooked(MethodInfo *method)
 // 必须和 Patcher::patch() 走同样的流程：mprotect 成可写 → memcpy → 刷 I-cache →
 // 恢复 R+X。旧代码只有裸 memcpy，既没改页保护（只读页上直接写会 SIGSEGV），
 // 也没刷 I-cache（CPU 可能还在执行旧字节），等于恢复失败或跑飞。
-static bool RestorePatchedMethod(MethodInfo *method, const std::vector<uint8_t> &originalBytes)
+static bool RestorePatchedMethod(MethodInfo *method, const ClassesTab::OriginalMethodBytes &orig)
 {
-    if (!method || !method->methodPointer || originalBytes.empty())
+    if (!method || !method->methodPointer || orig.bytes.empty())
     {
         return false;
     }
+    // **地址对不上就拒绝**（第 105 轮）。
+    //
+    // 这个检查必须放在**这里**，而不是两个调用点各写一遍 ——
+    // 「恢复」只有一处实现，不变量就该由它自己保证；
+    // 散到调用点上，第三个调用点出现时就漏掉了。
+    //
+    // oMap 是按 MethodInfo* 做 key 的，而方法体被重新加载之后
+    // （热重载、换 domain），**新的方法完全可能落在同一个地址上**。
+    // 这时 orig.bytes 里存的是**旧方法**的原始字节 —— 写回去等于把
+    // 旧方法的代码塞进新方法。那不是崩溃，是**把游戏改坏了**，
+    // 而且极难排查（游戏行为诡异但不会报错）。
+    //
+    // appliedAt == 0 = 加该字段之前记的老数据，那种情况**放行**：
+    // 拒绝一个本来没问题的恢复，比放行更糟。
+    if (orig.appliedAt != nullptr && orig.appliedAt != method->methodPointer)
+    {
+        LOGE("RestorePatchedMethod: 方法体地址已变（%p -> %p），手上的原字节属于另一个方法，拒绝写入",
+             orig.appliedAt, method->methodPointer);
+        return false;
+    }
+    const std::vector<uint8_t> &originalBytes = orig.bytes;
     auto *target = (void *)method->methodPointer;
     if (!KittyMemory::ProtectAddr(target, originalBytes.size(), PROT_READ | PROT_WRITE | PROT_EXEC))
     {
@@ -2303,6 +2324,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                 else
                 {
                     o.bytes = std::move(patched);
+                    o.appliedAt = method->methodPointer;
                 }
             }
         }
@@ -2310,7 +2332,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
         {
             if (ImGui::Button("Restore"))
             {
-                if (!RestorePatchedMethod(method, o.bytes))
+                if (!RestorePatchedMethod(method, o))
                 {
                     // **失败时绝不能清 o.bytes**。
                     // 旧代码无条件 clear()，于是恢复失败之后：
@@ -2362,7 +2384,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
             {
                 // 走和打补丁一致的恢复流程（mprotect + memcpy + 刷 I-cache + 恢复 R+X），
                 // 不能裸 memcpy：目标页此时通常是 R+X，直接写会 SIGSEGV。
-                if (!RestorePatchedMethod(method, o.bytes))
+                if (!RestorePatchedMethod(method, o))
                 {
                     // **失败时绝不能清 o.bytes**。
                     // 旧代码无条件 clear()，于是恢复失败之后：
@@ -2414,6 +2436,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                                            return;
                                        }
                                        oMap[method].bytes = std::move(patched);
+                    oMap[method].appliedAt = method->methodPointer;
                                        oMap[method].text = b;
                                    });
                     }
@@ -2528,6 +2551,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                                         return false;
                                     }
                                     oMap[method].bytes = std::move(patched);
+                    oMap[method].appliedAt = method->methodPointer;
                                     oMap[method].text = text;
                                     return true;
                                 };
@@ -2587,6 +2611,7 @@ void ClassesTab::PatcherView(Il2CppClass *klass, MethodInfo *method, const Metho
                                 return;
                             }
                             oMap[method].bytes = std::move(patched);
+                    oMap[method].appliedAt = method->methodPointer;
                             oMap[method].text = result;
                         },
                         type);

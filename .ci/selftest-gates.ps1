@@ -404,7 +404,7 @@ Test-Rule 'F 失败后清掉恢复数据' {
     $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
     $i = -1
     for ($k = 0; $k -lt $ls.Count; $k++) {
-        if ($ls[$k] -match 'if \(!RestorePatchedMethod\(method, o\.bytes\)\)') { $i = $k; break }
+        if ($ls[$k] -match 'RestorePatchedMethod\(method, o\)\)') { $i = $k; break }
     }
     if ($i -lt 0) { return $false }
     # 把「成功才清」的那 18 行换成第 80 轮的无条件版本

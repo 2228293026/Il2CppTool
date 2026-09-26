@@ -203,6 +203,17 @@ struct ClassesTab
     {
         std::vector<uint8_t> bytes;
         std::string text;
+        // 打补丁时这个方法体的地址（第 105 轮加）。
+        //
+        // 没有它就没法分辨「这份原字节属于当前这段代码」还是
+        // 「属于**同一地址上的另一个方法**」—— oMap 是按 MethodInfo*
+        // 做 key 的，而方法体被重新加载之后（热重载、换 domain），
+        // 新的方法完全可能落在同一个地址上。此时点「Restore」会把
+        // **旧方法的原始字节**写进**新方法的代码**里 —— 那不是崩溃，
+        // 是把游戏改坏了，而且极难排查。
+        //
+        // 0 = 还没记录（老数据 / 没打过补丁）。
+        void *appliedAt = nullptr;
     };
     static std::unordered_map<MethodInfo *, OriginalMethodBytes> oMap;
     static PopUpSelector poper; // still a prototype!
