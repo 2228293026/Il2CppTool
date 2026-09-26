@@ -52,7 +52,12 @@ namespace Tool
     void Init(Il2CppImage *image, std::vector<Il2CppImage *> images);
     void FilterClasses(const std::string &filter);
     void Draw();
-    void Tracer();
+    // 原来的 Tracer() 已删除：只有声明、**没有定义、没有调用者**。
+    //
+    // 注意别和「追踪（Trace）」功能搞混：那个功能是有的，页签名就叫
+    // "Tracer"，走的是 HookerView（追踪用 Dobby 的 DobbyInstrument 实现，
+    // 与 Frida 无关，见 README）。
+    // 被删的只是这个**空的函数声明**。
     void Hooker();
     // 原来的 GameObjects() 已删除：全项目**没有任何调用者**（死代码），
     // 而且里面有三处必崩的空指针解引用 —— Camera / UnityObject / IsNativeObjectAlive

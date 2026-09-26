@@ -45,7 +45,9 @@ struct ClassesTab
 
     std::vector<Class> classes{};
     std::vector<Class> filteredClasses{};
-    std::vector<Il2CppClass *> tracer{};
+    // 原来的 tracer（std::vector<Il2CppClass *>）已删除：全项目没有任何
+    // 读它的地方（唯一一处是注释掉的 "Add to Tracer" 按钮）。
+    // 留着只会让人以为「按类追踪」这个功能存在。
     std::vector<MethodInfo *> tracedMethods;
 
     // 扫描结果缓存。

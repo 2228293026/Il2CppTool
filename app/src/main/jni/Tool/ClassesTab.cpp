@@ -2441,6 +2441,17 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
                 PatcherView(klass, method, paramsInfo, thiz);
                 ImGui::EndTabItem();
             }
+            // 标签保留 "Tracer"：它对应的正是 README 里写的「追踪（Trace）」功能 ——
+            // 而追踪**就是**用 Dobby 的 DobbyInstrument 实现的，所以里面放
+            // HookerView（"Hooker" 是代码里的实现名，"Tracer" 是功能名）。
+            //
+            // 我一度把它改成 "Hooker"，理由是「页签叫什么就该是什么」——
+            // 但那会让**用户**看到的词和 README 里的功能名对不上：
+            // 照着 README 找「追踪」的人会以为页签不见了。
+            // 代价是代码名和页签名不一致，可以接受。
+            //
+            // 被删掉的是 Tool::Tracer()：**只有声明、没有定义、没有调用者**。
+            // 它和这个页签没有关系（页签走的是 HookerView）。
             if (ImGui::BeginTabItem("Tracer"))
             {
                 HookerView(klass, method, paramsInfo, thiz);

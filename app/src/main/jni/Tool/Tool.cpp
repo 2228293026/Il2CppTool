@@ -43,7 +43,8 @@ namespace Tool
         Il2CppObject *object;
     };
 
-    std::vector<Il2CppClass *> tracer;
+    // 原来的 std::vector<Il2CppClass *> tracer 已删除：文件级变量，
+    // 全项目没有任何地方读它，也没有别的 TU  extern 它。死变量。
 
     std::vector<ClassesTab> classesTabs;
 
