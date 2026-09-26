@@ -2735,7 +2735,12 @@ bool ClassesTab::MethodViewer(Il2CppClass *klass, MethodInfo *method, const Meth
     // 而这些字符串全部来自 il2cpp 元数据（混淆过的名字可以很长），
     // 旧代码是无界 sprintf + 无容量 prepend，栈溢出只是时间问题。
     char treeLabel[512]{0};
-    snprintf(treeLabel, sizeof(treeLabel), "%s %s(%zu)###", method->getReturnType()->getName(), method->getName(),
+    // getReturnType() 可能返回空（il2cpp_method_get_return_type 对某些
+    // 泛型/裁剪过的元数据会返回 null）。这一行是**每个方法行**都要走的，
+    // 也就是说只要游戏里有一个方法返回类型拿不到，打开类列表就崩。
+    auto *returnType = method->getReturnType();
+    const char *returnTypeName = returnType ? returnType->getName() : "void";
+    snprintf(treeLabel, sizeof(treeLabel), "%s %s(%zu)###", returnTypeName, method->getName(),
              paramsInfo.size());
     int pushedColor = 0;
     if (methodIsStatic)
