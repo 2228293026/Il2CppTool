@@ -38,6 +38,15 @@ static std::atomic<bool> s_touchCaptured{false};
 // 触摸偏移自检结果：0 = 未自检，1 = 通过，-1 = 失败。
 static std::atomic<int> s_touchOffsetOk{0};
 
+// 上一帧向游戏**如实报告过**的手指数量（第 110 轮）。
+//
+// 存在的唯一理由：`get_touchCount` 的异常边界在出错时需要返回一个值。
+// 那个值不能是 0 —— 返回 0 等于告诉游戏「手指凭空消失了」，
+// 绝大多数游戏把这当作取消（角色停住、镜头拖拽弹回、蓄力被丢弃），
+// 而这恰恰是这个 hook 本身花了三段注释去避免的现象。
+// 宁可这一帧菜单没收到触摸，也不能让游戏看到一次假的手指抬起。
+static std::atomic<int> s_lastTouchCount{0};
+
 int Unity::TouchOffsetCheck()
 {
     return s_touchOffsetOk.load();
@@ -133,6 +142,14 @@ static bool ShouldCaptureAt(float x, float y, const ImGuiIO &io)
 
 bool Input_GetMouseButton(int n, MethodInfo *method)
 {
+    // 异常边界（第 110 轮）。
+    //
+    // 这是 REPLACE_NAME_ORIG 装上去的**游戏输入路径**上的函数：
+    // 游戏每帧调它，异常逃出去就是整局游戏崩掉。
+    // 边界放在**整个函数**外面，而不是只包住 ImGui 那一段 ——
+    // hook 失败时那些 `oInput_GetMouseButton(...)` 直通调用同样在里面。
+    try
+    {
     // hook 失败时直通，绝不能调用空的原函数指针
     if (!oInput_GetMouseButton)
         return false;
@@ -160,9 +177,34 @@ bool Input_GetMouseButton(int n, MethodInfo *method)
     if (io.WantCaptureMouse && !(collapsed && fullScreen && (io.MousePos.x > size.x && io.MousePos.y > size.y)))
         return false;
     return oInput_GetMouseButton(n, mi);
+    }
+    catch (const std::exception &e)
+    {
+        // 出错时**如实**问原函数，而不是编一个 false。
+        // 返回 false 等于告诉游戏「这一帧没有按键」—— 那是它的正常输入，
+        // 不会触发任何「手指凭空消失」类的取消行为。
+        LOGE("Input_GetMouseButton: 转发鼠标输入时抛出异常: %s", e.what());
+        if (oInput_GetMouseButton)
+            return oInput_GetMouseButton(n, method);
+    }
+    catch (...)
+    {
+        LOGE("Input_GetMouseButton: 转发鼠标输入时抛出未知异常");
+        if (oInput_GetMouseButton)
+            return oInput_GetMouseButton(n, method);
+    }
+    return false;
 }
 int get_touchCount(MethodInfo *method)
 {
+    // 异常边界（第 110 轮）—— 和 Input_GetMouseButton 同理：
+    // 这是 REPLACE_NAME_ORIG 装上去的**游戏输入路径**，游戏每帧调它。
+    //
+    // 里面最危险的一行是 `invoke_static_method<UnityEngine_Touch>("GetTouch", 0)`：
+    // 手指在「数出个数」和「取第 0 个」之间收回去的话，托管那边会抛，
+    // 而 il2cpp 把它翻成 C++ 异常 —— 没有边界就是整局游戏崩掉。
+    try
+    {
     // 输入 hook 没装成功时必须直通原函数，不能去调还为空的 o_get_touchCount
     if (!o_get_touchCount)
         return 0;
@@ -294,6 +336,22 @@ int get_touchCount(MethodInfo *method)
     }
 
     return count;
+    }
+    catch (const std::exception &e)
+    {
+        // 异常时**返回手指的真实数量**，而不是 0。
+        //
+        // 返回 0 等于告诉游戏「手指凭空消失了」—— 绝大多数游戏把这当作
+        // 取消（角色停住、镜头拖拽弹回、蓄力被丢弃），
+        // 那正是这个 hook 本身要避免的现象（第 109 轮那段注释）。
+        // 宁可这一帧菜单没收到触摸，也不能让游戏看到一次假的手指抬起。
+        LOGE("get_touchCount: 转发触摸时抛出异常: %s", e.what());
+    }
+    catch (...)
+    {
+        LOGE("get_touchCount: 转发触摸时抛出未知异常");
+    }
+    return s_lastTouchCount;
 }
 
 namespace Unity

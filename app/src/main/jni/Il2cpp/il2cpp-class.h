@@ -540,7 +540,32 @@ T MethodInfo::invoke_static(Args... args)
     using Invoker = T (*)(Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(std::forward<Args>(args)..., this);
+    // 异常边界（第 110 轮）。
+    //
+    // 下面这一行是**进托管代码**。托管那边抛的异常（`GetTouch(0)` 在
+    // 手指已经收回去时会抛 IndexOutOfRange/Argument）会被 il2cpp 翻成
+    // C++ 异常；而**调用方通常没有任何边界** ——
+    // 尤其 `get_touchCount` 那个 hook 跑在游戏的输入路径上，
+    // 异常一路逃出去就是整局游戏崩掉。
+    //
+    // 放在这里而不是各个调用点，是因为这里是**唯一**的收口：
+    // 五个调用点里只有一个（Unity.cpp）会崩游戏，但它记不住自己崩过。
+    try
+    {
+        return invoker(std::forward<Args>(args)..., this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke_static(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke_static(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T, typename... Args>
@@ -574,7 +599,25 @@ T MethodInfo::invoke(Il2CppObject *instance, Args &&...args)
     using Invoker = T (*)(Il2CppObject *, Args..., MethodInfo *);
     auto address = _getHookedMap((uintptr_t)this->methodPointer);
     auto invoker = reinterpret_cast<Invoker>(address);
-    return invoker(instance, std::forward<Args>(args)..., this);
+    // 异常边界 —— 和 invoke_static 同理（第 110 轮）：
+    // 这一行进托管代码，异常会被 il2cpp 翻成 C++ 异常，
+    // 而调用方（尤其 hook 路径上的那些）通常没有边界。
+    try
+    {
+        return invoker(instance, std::forward<Args>(args)..., this);
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("invoke(%s): 托管调用抛出异常: %s", getName() ? getName() : "?", e.what());
+    }
+    catch (...)
+    {
+        LOGE("invoke(%s): 托管调用抛出未知异常", getName() ? getName() : "?");
+    }
+    if constexpr (!std::is_void_v<T>)
+        return T{};
+    else
+        return;
 }
 
 template <typename T>

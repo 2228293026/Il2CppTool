@@ -604,7 +604,7 @@ foreach ($f in $files) {
     }
 }
 
-# ---- 模式 N：Dobby 的替换函数必须**整个函数体**都在异常边界里 ----
+# ---- 模式 N：钩子替换函数（Dobby / REPLACE 家族）必须**整个函数体**都在异常边界里 ----
 #
 # 第 108 轮的发现，三处：
 #
@@ -642,10 +642,23 @@ $castNames = @('reinterpret_cast', 'const_cast', 'static_cast', 'dynamic_cast')
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
     $txt = Get-Content -Encoding UTF8 $f.FullName -Raw
+    # Dobby 家族
     foreach ($m in [regex]::Matches($txt, 'Dobby(?:Hook|Instrument)\s*\([^,]*,\s*(?:\(\s*void\s*\*\s*\)|\(\s*[\w:]*callback\w*\s*\))?\s*&?\s*(\w+)')) {
         $n = $m.Groups[1].Value
         if ($castNames -contains $n) { continue }
         $hookNames[$n] = $true
+    }
+    # KittyMemory 的行内替换家族（第 110 轮补上）
+    #
+    # REPLACE_NAME_ORIG("类名", "方法名", 替换函数, 原函数)
+    # REPLACE("类名", "方法名", 替换函数)
+    #
+    # 这两个和 DobbyHook 是**同一类东西**：都把游戏自己的方法换成我们的函数，
+    # 都在游戏的执行路径上跑。它装的是 Input.get_touchCount 和
+    # Input.GetMouseButton —— 游戏每帧各调一次，是全项目调用最频繁的
+    # 两个 hook。第 108 轮只按 Dobby 取名单，正好漏掉了它们。
+    foreach ($m in [regex]::Matches($txt, 'REPLACE(?:_NAME)?(?:_ORIG)?\s*\([^,]+,[^,]+,\s*&?\s*(\w+)')) {
+        $hookNames[$m.Groups[1].Value] = $true
     }
 }
 foreach ($name in $hookNames.Keys) {
@@ -671,7 +684,7 @@ foreach ($name in $hookNames.Keys) {
                 $hits += [pscustomobject]@{
                     File = $f.Name
                     Line = $i + 1
-                    Rule = 'N: Dobby 替换函数没有异常边界（逃进 trampoline = std::terminate = 崩游戏）'
+                    Rule = 'N: 钩子替换函数没有异常边界（异常逃进游戏执行路径 = std::terminate = 崩游戏）'
                     Text = $t
                 }
             }
