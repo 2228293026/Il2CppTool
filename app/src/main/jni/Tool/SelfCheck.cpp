@@ -14,6 +14,25 @@ namespace SelfCheck
 {
 namespace
 {
+// 状态的**唯一**文字来源（第 117 轮）。
+//
+// 表格里画的和「复制自检报告」里写的必须用同一个词 ——
+// 两处各写一份字面量的话，改了一处忘了另一处，报告里就会出现
+// 界面上根本不存在的状态词，而读报告的人**无从判断哪边是真的**。
+const char *StatusLabel(Status s)
+{
+    switch (s)
+    {
+    case Status::Ok:
+        return "通过";
+    case Status::Warn:
+        return "警告";
+    case Status::Fail:
+        return "失败";
+    default:
+        return "信息";
+    }
+}
 Result Ok(std::string name, std::string detail)
 {
     return {std::move(name), Status::Ok, std::move(detail)};
@@ -493,6 +512,40 @@ void DrawUI()
     {
         ImGui::TextColored(ImVec4(0.4f, 1.f, 0.5f, 1.f), "全部通过");
     }
+    ImGui::SameLine();
+    // 「复制自检报告」（第 117 轮）。
+    //
+    // 这一页存在的意义就是**被别人看见**：用户报「菜单没反应」
+    // 的时候，我要看的就是这份列表。以前他只能截图 ——
+    // 而 15 行小字截图看不清、搜不到字，还经常漏掉失败那几行。
+    //
+    // 改动记录页和日志页早就有「复制」，只有自检页没有 ——
+    // 恰恰是**最该**被复制的那一页。
+    //
+    // 输出用纯文本：名字、状态、详情三段，制表符分隔。
+    // 不加时间戳（每次复制都不一样的话，两份报告没法逐行对比），
+    // 也不加 Markdown（ImGui 不解析，而粘到 issue 里 Markdown 才有意义）。
+    if (ImGui::SmallButton("复制自检报告"))
+    {
+        std::string text;
+        for (const auto &r : cached)
+        {
+            if (!text.empty())
+            {
+                text += '\n';
+            }
+            text += r.name;
+            text += '\t';
+            text += StatusLabel(r.status);
+            text += '\t';
+            text += r.detail;
+        }
+        ImGui::SetClipboardText(text.c_str());
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("把 %zu 项检查结果整份复制成「项目<TAB>状态<TAB>详情」", cached.size());
+    }
 
     ImGui::Separator();
     if (ImGui::BeginTable("selfcheck", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
@@ -510,16 +563,16 @@ void DrawUI()
             switch (r.status)
             {
             case Status::Ok:
-                ImGui::TextColored(ImVec4(0.4f, 1.f, 0.5f, 1.f), "通过");
+                ImGui::TextColored(ImVec4(0.4f, 1.f, 0.5f, 1.f), "%s", StatusLabel(r.status));
                 break;
             case Status::Warn:
-                ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "警告");
+                ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "%s", StatusLabel(r.status));
                 break;
             case Status::Fail:
-                ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "失败");
+                ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", StatusLabel(r.status));
                 break;
             default:
-                ImGui::TextDisabled("信息");
+                ImGui::TextDisabled("%s", StatusLabel(r.status));
                 break;
             }
             ImGui::TableNextColumn();
