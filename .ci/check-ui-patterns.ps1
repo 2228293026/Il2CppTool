@@ -889,6 +889,51 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 S：FileWriter 写完**必须**看 ok() ----
+#
+# 第 119/120 轮。`FileWriter::ok()` 是第 90 轮就有的，
+# 但**一个调用点都没用** —— 「写盘失败了」这件事从来传不上来。
+#
+# 而所有写盘点都在**用户看得见的地方**：
+#     导出对象 json      写失败照样打 "Done save"，用户以为文件在
+#     tool_conf.json     设置改完立刻生效，用户以为存上了
+#     class_tabs.json    参数预设/筛选结果，用户以为存上了
+#
+# 最糟的是**静默丢数据**：界面上它已经变了，而下次启动回到旧值，
+# 中间没有任何一步说过「没写成功」。
+#
+# 形状：函数里 `Util::FileWriter X(...)` 出现了，但整个函数里
+# 从头到尾没读过 `X.ok()`。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    # 按函数切块（缩进 4 的定义行，或更粗的）
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        $m = [regex]::Match($t, 'Util::FileWriter\s+(\w+)\s*\(')
+        if (-not $m.Success) { continue }
+        $var = $m.Groups[1].Value
+        # 往后看到函数结束（缩进 <= 定义行缩进且以 } 结尾）
+        $ind = ($lines[$i] -replace '^(\s*).*', '$1').Length
+        $body = @()
+        for ($k = $i; $k -lt $lines.Count; $k++) {
+            $body += $lines[$k]
+            $kt = $lines[$k].Trim()
+            if ($k -gt $i -and $kt -match '^\}' -and
+                ($lines[$k] -replace '^(\s*).*', '$1').Length -le $ind) { break }
+        }
+        $bt = $body -join "`n"
+        if ($bt -notmatch ('\b' + [regex]::Escape($var) + '\.ok\(\)')) {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = "S: FileWriter ``$var`` 写完没有看 ok()（写盘失败会被当成成功 = 静默丢数据）"
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

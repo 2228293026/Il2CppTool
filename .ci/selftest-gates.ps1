@@ -422,6 +422,24 @@ Test-Rule 'R UI 层的保存要看返回值' {
     return $true
 } $rCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 24. 规则 S：把「写盘不看 ok()」复现出来（第 120 轮）----
+$sCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'S 写盘必须看 ok()' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(!fileWriter\.ok\(\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = '        ;'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $sCheck 'app/src/main/jni/Main.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

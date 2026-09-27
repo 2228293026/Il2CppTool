@@ -4929,7 +4929,21 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
                                            std::vector<uintptr_t> visited{};
                                            nlohmann::ordered_json j = object->dump(visited, 9999);
                                            file.write(j.dump(2, ' ').c_str());
-                                           LOGD("Done save");
+                                            // 「导出对象」也是一次保存，而它以前**从不看**成败：
+                                            // 写失败了用户照样看到「Done save」，
+                                            // 以为文件已经落盘 —— 那个 json 其实根本不存在（第 120 轮）。
+                                            //
+                                            // 这里在**后台线程**上（ChangeMaxListArraySize 会把工作
+                                            // 丢到线程池），所以不能弹界面，只能记日志：
+                                            // 写盘失败只可能出在空间不足 / 目录不存在这两种情况。
+                                            if (!file.ok())
+                                            {
+                                                LOGE("导出对象失败：%s 没能写入磁盘", fileName);
+                                            }
+                                            else
+                                            {
+                                                LOGD("Done save");
+                                            }
                                            ImGui::CloseCurrentPopup();
                                        });
             }

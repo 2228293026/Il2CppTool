@@ -31,7 +31,7 @@ void logcatJson(nlohmann::ordered_json &json)
 }
 
 template <typename T>
-void ConfigSet(const char *key, T value);
+bool ConfigSet(const char *key, T value);
 
 // Target lib here
 #define targetLibName OBFUSCATE("libil2cpp.so")
@@ -422,7 +422,13 @@ void draw_thread()
                     if (ImGui::Selectable(possibleScale[i], selected))
                     {
                         selectedScale = i;
-                        ConfigSet("selectedScale", selectedScale);
+                        // 保存失败要红字说出来（第 120 轮）：界面上已经变了，
+                        // 而没落盘 = 下次启动又变回去。
+                        if (!ConfigSet("selectedScale", selectedScale))
+                        {
+                            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                                               "缩放没能保存：下次启动会回到旧值（详见日志）");
+                        }
                         doChangeScale = true;
                     }
                     if (selected)
@@ -441,7 +447,12 @@ void draw_thread()
             ImGui::Text("字体");
             if (ImGui::Checkbox("加载完整中日韩字形", &g_fontFullRangeRequested))
             {
-                ConfigSet("fontFullRange", g_fontFullRangeRequested);
+                // 勾选框已经变了，而没落盘的话下次启动又变回去 —— 说出来（第 120 轮）。
+                if (!ConfigSet("fontFullRange", g_fontFullRangeRequested))
+                {
+                    ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                                       "这个选项没能保存：下次启动会回到旧值（详见日志）");
+                }
                 g_fontRangeDirty = true;
             }
             if (ImGui::IsItemHovered())
@@ -587,13 +598,46 @@ void draw_thread()
 static nlohmann::ordered_json gConf;
 
 template <typename T>
-void ConfigSet(const char *key, T value)
+bool ConfigSet(const char *key, T value)
 {
     LOGD(__FUNCTION__);
-    gConf[key] = value;
-    LOGD("ConfigWrite %s = %s", key, gConf[key].dump().c_str());
-    Util::FileWriter fileWriter("tool_conf.json");
-    fileWriter.write(gConf.dump(2).c_str());
+    // 返回成败，而且**不许抛**（第 120 轮）。
+    //
+    // 这一层以前是 void，写盘成败完全不管。后果有两层：
+    //
+    // 1. `gConf[key] = value` 在类型不匹配时抛 json::type_error，
+    //    `gConf.dump(2)` 也会分配 —— 两者都在**渲染线程**上
+    //    （下面 425/444 两处就是设置界面里的控件），
+    //    异常逃出去 = 这一整帧的菜单不画。
+    //
+    // 2. 更要紧的是**静默丢设置**：用户在界面上把缩放改了、
+    //    勾了「加载完整中日韩字形」，界面上立刻生效、他以为存上了，
+    //    而 `tool_conf.json` 没写成功 —— 下次启动**回到旧值**。
+    //    和第 119 轮那个配置保存是同一个病，只是这次丢的是主配置。
+    try
+    {
+        gConf[key] = value;
+        LOGD("ConfigWrite %s = %s", key, gConf[key].dump().c_str());
+        Util::FileWriter fileWriter("tool_conf.json");
+        fileWriter.write(gConf.dump(2).c_str());
+        // FileWriter::ok() 是第 90 轮就有的，**一直没人用** ——
+        // 于是「写失败了」这件事从来传不上来。
+        const bool ok = fileWriter.ok();
+        if (!ok)
+        {
+            LOGE("ConfigSet: tool_conf.json 写入失败（%s）—— 本次改动不会被记住", key);
+        }
+        return ok;
+    }
+    catch (const std::exception &e)
+    {
+        LOGE("ConfigSet(%s) 抛出异常: %s", key, e.what());
+    }
+    catch (...)
+    {
+        LOGE("ConfigSet(%s) 抛出未知异常", key);
+    }
+    return false;
 }
 
 template <typename T>
@@ -613,13 +657,27 @@ T ConfigGet(const char *key, T defaultValue)
         catch (const nlohmann::json::exception &e)
         {
             LOGE("配置项 %s 类型错误(%s)，改用默认值并修正配置", key, e.what());
-            ConfigSet(key, defaultValue);
+            // 这里顺手把配置**改对了**（写盘）。所以它其实是一次写入，
+            // 只是被包在一次读取里 —— 写失败的话，下次启动还会再错一次。
+            // 必须记下来（第 120 轮）。
+            if (!ConfigSet(key, defaultValue))
+            {
+                LOGE("配置项 %s 的修正没能写回磁盘：下次启动还会再报一次同样的错", key);
+            }
             return defaultValue;
         }
     }
     else
     {
-        ConfigSet(key, defaultValue);
+        // 键**不存在**时也会写盘补上默认值。
+        // 所以「读一个设置」在这种情况下是一次写入 —— 而 ConfigGet 是从
+        // 渲染线程上被调用的（第 653 行那段注释说的就是这条链）。
+        // 写失败只记日志：这里返回默认值对**读**来说没有错，
+        // 错的是「下次启动它又没了」，记下来就够了（第 120 轮）。
+        if (!ConfigSet(key, defaultValue))
+        {
+            LOGE("配置项 %s 缺失，补默认值时没能写回磁盘：下次启动还会再补一次", key);
+        }
     }
     return defaultValue;
 }
@@ -699,12 +757,23 @@ void ConfigInit()
             Tool::MarkConfigLoadFailed();
             Util::FileWriter fileWriter("tool_conf.json");
             fileWriter.write("{}");
+            // 清空写失败的话，下次启动还会拿这份坏配置去解析（第 120 轮）。
+            // MarkConfigLoadFailed 只在**这一次进程**里有效。
+            if (!fileWriter.ok())
+            {
+                LOGE("tool_conf.json 解析失败后清空写入也失败了：下次启动会再失败一次");
+            }
         }
     }
     else
     {
         Util::FileWriter fileWriter("tool_conf.json");
         fileWriter.write("{}");
+        // 首次创建失败：这一项没有用户数据可丢，但下次启动还会再进这个分支。
+        if (!fileWriter.ok())
+        {
+            LOGE("tool_conf.json 首次创建失败：下次启动会再试一次");
+        }
     }
 }
 
@@ -774,7 +843,13 @@ void on_init()
     if (selectedScale < 0 || selectedScale >= scaleFactors.size())
     {
         selectedScale = 3;
-        ConfigSet("selectedScale", selectedScale);
+        // 启动期修正：写失败的话下次启动还会越界再修一次。
+        // 这里没有界面可提示（还在 on_init），所以只能记日志（第 120 轮）。
+        if (!ConfigSet("selectedScale", selectedScale))
+        {
+            LOGE("selectedScale 越界已修正为 %d，但没能写回磁盘：下次启动还会再修一次",
+                 selectedScale);
+        }
     }
     doChangeScale = true;
     markPhase("配置");
