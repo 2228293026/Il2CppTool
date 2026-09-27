@@ -534,12 +534,30 @@ void ClassesTab::DrawWatches()
             if (w.history.size() >= 4)
             {
                 ImGui::SameLine();
+                // 这里的 "##spark" 是**每一行都用同一个字面量**，
+                // 看上去像是「所有行的图共用一个 ID，悬停提示会串」。
+                //
+                // 第 115 轮我真这么以为过，还加了一层 `PushID(i)` 并写下
+                // 一大段解释 —— **然后发现自己看漏了**：这个行循环在
+                // 开头（TableBegin 之前）已经有
+                //     ImGui::PushID(static_cast<int>(i));
+                // 它把整行都圈进了一个独立 ID 作用域，所以每一行的
+                // "##spark" 本来就是不同的。
+                //
+                // 多加的那层 PushID 不会出错（只是 ID 层级深一层），
+                // 但它连同那段**错误的原因说明**都得撤掉 ——
+                // 一条把不存在的原因写得很笃定的注释，比没有注释更糟：
+                // 下一个人会照着它去找一个找不到的 bug。
+                //
+                // 教训：**说「这里有 bug」之前，先把外层的作用域读完。**
+                // 控件 ID 有层级（PushID / 窗口 / 表格列），
+                // 只看控件字面量会得出「ID 冲突」的错误结论。
                 ImGui::PlotLines("##spark", w.history.data(), static_cast<int>(w.history.size()), 0,
-                          nullptr, FLT_MAX, FLT_MAX, ImVec2(64.0f, 0.0f));
+                                 nullptr, FLT_MAX, FLT_MAX, ImVec2(64.0f, 0.0f));
                 if (ImGui::IsItemHovered())
                 {
-                    ImGui::SetTooltip("最近 %zu 次轮询（约 %.1f 秒）的走势",
-                                      w.history.size(), w.history.size() * 0.2);
+                    ImGui::SetTooltip("最近 %zu 次轮询（约 %.1f 秒）的走势", w.history.size(),
+                                      w.history.size() * 0.2);
                 }
             }
             // 右键复制。
