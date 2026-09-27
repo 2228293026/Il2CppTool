@@ -166,6 +166,76 @@ static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &
 // （第 118 轮加 CopyToClipboard 时才用上）。
 static void ReportFieldError(const std::string &msg);
 
+// 批量操作（追踪全部 / 恢复全部）的结果汇报（第 121 轮）。
+//
+// 这些批量操作都在**后台线程**上跑，而它们的成败**以前完全没人看**：
+//   · 每个方法各自成败，失败的那些悄悄消失
+//   · 日志里写的是「尝试了 N 个」而不是「成功了 N 个」
+//   · 按钮在**开跑之前**就切成了「已追踪 / 可恢复」
+//
+// 于是用户看到的是「追踪全部成功了」，而实际上有一半没 hook 上 ——
+// 而追踪不到的方法，正是他最想看的那些。
+//
+// 为什么用原子量而不是 ReportFieldError：那个函数写的是一个
+// 全局 std::string，从后台线程写会和界面线程读它**数据竞争**。
+// 原子量没有这个问题，而且不需要额外加锁。
+struct BulkResult
+{
+    std::atomic<size_t> ok{0};
+    std::atomic<size_t> failed{0};
+    std::atomic<bool> done{false};
+    const char *label = nullptr; // 只由界面线程写，工作线程只读
+
+    void Begin(const char *what)
+    {
+        ok.store(0, std::memory_order_relaxed);
+        failed.store(0, std::memory_order_relaxed);
+        done.store(false, std::memory_order_relaxed);
+        label = what;
+    }
+    // 记一个方法的结果。工作线程调。
+    void Add(bool succeeded)
+    {
+        if (succeeded)
+        {
+            ok.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    void Finish()
+    {
+        done.store(true, std::memory_order_relaxed);
+    }
+    // 界面线程把结果说清楚。**一次说完**，之后就淡出，
+    // 免得一条过期消息一直挂在界面上。
+    void Report()
+    {
+        if (!done.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+        const size_t good = ok.load(std::memory_order_relaxed);
+        const size_t bad = failed.load(std::memory_order_relaxed);
+        const char *what = label ? label : "批量操作";
+        if (bad == 0)
+        {
+            ImGui::TextColored(ImVec4(0.4f, 1.f, 0.5f, 1.f), "%s：%zu 个全部成功", what, good);
+        }
+        else
+        {
+            // 必须**同时**报两个数。只说「成功 N 个」的话，
+            // 用户会以为那就是全部 —— 而他点了「追踪全部」。
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                               "%s：成功 %zu 个，【失败 %zu 个】（原因见日志）", what, good, bad);
+        }
+        done.store(false, std::memory_order_relaxed);
+    }
+};
+static BulkResult g_bulkResult;
+
 static double g_watchLastPoll = 0.0;
 
 void ClassesTab::AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
@@ -3286,13 +3356,18 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
             else
             {
                 state = false;
+                g_bulkResult.Begin("取消追踪全部");
                 for (auto &[method, paramsInfo] : methodMap[klass])
                 {
                     if (!method->methodPointer && !Il2cpp::GetIsMethodInflated(method))
                         continue;
 
-                    Tool::ToggleHooker(method, 0);
+                    // 逐个成败**要记下来**（第 121 轮）：以前失败的那些悄悄消失，
+                    // 而 state 照样被置成 false —— 界面上显示「已全部取消追踪」，
+                    // 实际上有几个还挂着钩子。
+                    g_bulkResult.Add(Tool::ToggleHooker(method, 0));
                 }
+                g_bulkResult.Finish();
             }
         }
         if (ImGui::BeginPopup("ConfirmPopup"))
@@ -3301,7 +3376,7 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
             if (ImGui::Button("Continue?"))
             {
                 state = true;
-                SpawnDetached(
+                g_bulkResult.Begin("追踪全部");                SpawnDetached(
                     [this, klass]
                     {
                         for (auto &[method, paramsInfo] : methodMap[klass])
@@ -3309,8 +3384,9 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
                             if (!method->methodPointer && !Il2cpp::GetIsMethodInflated(method))
                                 continue;
 
-                            Tool::ToggleHooker(method, 1);
+                            g_bulkResult.Add(Tool::ToggleHooker(method, 1));
                         }
+                        g_bulkResult.Finish();
                     },
                     "TraceAll",
                     [this, klass]()
@@ -3319,12 +3395,19 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
                         // 这里必须退回去，否则按钮会一直显示「Restore」，
                         // 而实际上一个方法都没 hook 上。
                         states[klass] = false;
+                        g_bulkResult.Finish(); // 0 个成功 -> 界面上会说「全部失败」
                         LOGE("Trace all: 无法创建后台线程，state 已回滚");
                     });
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
         }
+        // 上一批「追踪全部」的成败，在这里说清楚（第 121 轮）。
+        //
+        // 必须放在**按钮外面**：它在按钮的下一帧、下一个按钮的下一帧
+        // 才可能有结果，而 Report() 读过之后会自己清掉 `done`，
+        // 所以同一个结果**只会被说一次**。
+        g_bulkResult.Report();
     }
     // ImGui::SameLine();
     // if (ImGui::Button("Add to Tracer"))
@@ -3538,17 +3621,35 @@ void ClassesTab::Draw(int index, bool closeable)
                     else
                     {
                         traceState = false;
+                        g_bulkResult.Begin("恢复全部");
                         SpawnDetached(
                             [this]
                             {
                                 LOGD("Restoring all methods...");
                                 processing = true;
                                 maxProgress = tracedMethods.size();
+                                size_t restored = 0;
                                 for (auto method : tracedMethods)
                                 {
-                                    Tool::ToggleHooker(method);
+                                    // **只能调一次** —— 一参形式是「切换」，
+                                    // 调两次等于没切，而中间那一轮会把钩子拆了又装。
+                                    // 所以结果先存下来（第 121 轮）。
+                                    const bool ok = Tool::ToggleHooker(method);
+                                    if (ok)
+                                    {
+                                        restored++;
+                                    }
+                                    g_bulkResult.Add(ok);
                                 }
-                                LOGD("Restored %zu methods", tracedMethods.size());
+                                g_bulkResult.Finish();
+                                // 旧代码打的是 tracedMethods.size()，也就是**尝试**的个数 ——
+                                // 日志自己就在撒谎（第 121 轮）。
+                                LOGD("Restored %zu of %zu methods", restored, tracedMethods.size());
+                                if (restored != tracedMethods.size())
+                                {
+                                    LOGE("恢复全部：%zu/%zu 失败",
+                                         tracedMethods.size() - restored, tracedMethods.size());
+                                }
                                 tracedMethods.clear();
                                 processing = false;
                                 maxProgress = 0;
