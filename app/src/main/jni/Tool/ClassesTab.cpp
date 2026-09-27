@@ -388,12 +388,50 @@ void ClassesTab::DrawWatches()
     }
     ImGui::Separator();
     // 右键复制是隐藏操作，得在表头说一句 —— 否则用户根本不会去试。
-    ImGui::Text("关注值（每 200ms 自动刷新，右键某一行的值可复制）");
-    ImGui::SameLine();
+    // 「复制全部」也在表头说，因为按钮不带解释时没人会想到它的用处。
+    ImGui::Text("关注值（每 200ms 自动刷新；右键某一行的值可复制）");
     if (ImGui::SmallButton("全部清除"))
     {
         ClearWatches();
         return;
+    }
+    ImGui::SameLine();
+    // 「复制全部」——和改动记录页、日志页保持一致（第 116 轮）。
+    //
+    // 逐行右键复制适合「我就要这一个数」。而更常见的用法是
+    // 「把当前这批值整份拿走」：记到笔记里、两次读数做对比、贴到 issue。
+    // 那种情况下逐个点 8 次太蠢，而且**漏一条根本看不出来** ——
+    // 8 行里少了 1 行，粘过去对比时只会得出「变了」的结论。
+    if (ImGui::SmallButton("复制全部"))
+    {
+        std::string text;
+        for (const auto &w : g_watches)
+        {
+            if (!text.empty())
+            {
+                text += '\n';
+            }
+            text += w.label;
+            text += " = ";
+            if (w.invalid)
+            {
+                // 失效的**不能**静默输出旧值：那看起来就是一个当前的数，
+                // 而用户会拿它做对比。逐行复制那边已经这么处理了，
+                // 这里必须一致。
+                text += "<对象已失效，上次读到 ";
+                text += w.lastValue.empty() ? "?" : w.lastValue;
+                text += ">";
+            }
+            else
+            {
+                text += w.lastValue;
+            }
+        }
+        ImGui::SetClipboardText(text.c_str());
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("把 %zu 条关注值整份复制成「标签 = 值」", g_watches.size());
     }
 
 
