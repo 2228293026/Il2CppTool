@@ -934,6 +934,47 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 T：`savedSet.insert` 之前**必须**先加根成功 ----
+#
+# 第 122 轮。`ClassesTab.cpp` 的「Save」按钮原来长这样：
+#
+#     savedSet[currentObj->klass].insert(currentObj);   // 先躺进去
+#     SaveObjectWithRoot(currentObj);                    // 再加根，结果丢弃
+#
+# 加根失败时 savedSet 里就多了一个**没有根的裸指针**：
+# 检视器照样列得出来，ResolveSaved 原样返回它，而它随时可能被 GC 回收 ——
+# 界面上看得见的每个字都正常，然后解引用它的时候崩游戏。
+#
+# 这是第 99 轮在**另一个**调用点修掉的同一个 bug，一直留在这里。
+# 规则 J 抓不到它：J 盯的是「退回裸指针」的**形状**（三元 / return），
+# 而这里是**顺序**。
+#
+# 形状：同一个块里 `savedSet[...].insert(...)` 出现在
+# `SaveObjectWithRoot(...)` 之前。
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch 'savedSet\[.+\]\.insert\(') { continue }
+        # 往后 6 行内必须出现加根；出现得比 insert 晚 = 顺序错了
+        for ($k = $i + 1; $k -le [Math]::Min($i + 6, $lines.Count - 1); $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -match '^(//|\*|/\*)') { continue }
+            if ($u -match 'SaveObjectWithRoot\(') {
+                $hits += [pscustomobject]@{
+                    File = $f.Name
+                    Line = $i + 1
+                    Rule = 'T: 先 insert 再加根 —— 加根失败时 savedSet 里会留下一个没有根的裸指针（解引用它 = 崩游戏）'
+                    Text = $t
+                }
+                break
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

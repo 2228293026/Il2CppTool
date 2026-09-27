@@ -1742,7 +1742,14 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                     // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
                     if (object)
                     {
-                        SaveObjectWithRoot(object);
+                        if (!SaveObjectWithRoot(object))
+                            {
+                                // 加根失败必须**说出来**（第 122 轮）：
+                                // `arrayParams 里存的就是这个裸指针，用户按下「调用」时它会被
+                                // 当成参数类型交给 VM —— 加根没成功的话，那是一个**可能被回收的**
+                                // 指针，而解引用它的是游戏的代码，不是我们能兜住的地方。
+                                ReportFieldError("参数对象加根失败：调用它可能让游戏崩溃（详见日志）");
+                            }
                     }
                     ImGui::CloseCurrentPopup();
                 },
@@ -1835,7 +1842,14 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                                 // 交给 VM。加根保活。
                                 if (param.object)
                                 {
-                                    SaveObjectWithRoot(param.object);
+                        if (!SaveObjectWithRoot(param.object))
+                                        {
+                                            // 加根失败必须**说出来**（第 122 轮）：
+                                            // `arrayParams 里存的就是这个裸指针，用户按下「调用」时它会被
+                                            // 当成参数类型交给 VM —— 加根没成功的话，那是一个**可能被回收的**
+                                            // 指针，而解引用它的是游戏的代码，不是我们能兜住的地方。
+                                            ReportFieldError("参数对象加根失败：调用它可能让游戏崩溃（详见日志）");
+                                        }
                                 }
                             }
                             param.value = text;
@@ -1895,7 +1909,14 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
                                     // 期间随时会被 GC 回收 → arrayParams[k] 变成野指针。
                                     if (object)
                                     {
-                                        SaveObjectWithRoot(object);
+                        if (!SaveObjectWithRoot(object))
+                                            {
+                                                // 加根失败必须**说出来**（第 122 轮）：
+                                                // `arrayParams 里存的就是这个裸指针，用户按下「调用」时它会被
+                                                // 当成参数类型交给 VM —— 加根没成功的话，那是一个**可能被回收的**
+                                                // 指针，而解引用它的是游戏的代码，不是我们能兜住的地方。
+                                                ReportFieldError("参数对象加根失败：调用它可能让游戏崩溃（详见日志）");
+                                            }
                                     }
                                     ImGui::CloseCurrentPopup();
                                 });
@@ -4532,9 +4553,27 @@ void ClassesTab::ImGuiJson(Il2CppObject *rootObj)
             sprintf(buttonLabel, "Save");
             if (ImGui::Button(buttonLabel, ImVec2(wSave, 0)))
             {
-                savedSet[currentObj->klass].insert(currentObj);
-                SaveObjectWithRoot(currentObj);
-                RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", {}, "");
+                // **先加根，成功了才进 savedSet**（第 122 轮）。
+                //
+                // 旧顺序是反的：
+                //     savedSet[...].insert(currentObj);   // 先躺进去
+                //     SaveObjectWithRoot(currentObj);      // 再加根，结果丢弃
+                // 加根失败时 savedSet 里就多了一个**没有根的裸指针** ——
+                // 检视器照样列得出来，ResolveSaved 原样返回它，
+                // 而它随时可能被回收。这正是第 99 轮在另一个调用点修掉的
+                // 同一个 bug，**这里一直没修**。
+                if (SaveObjectWithRoot(currentObj))
+                {
+                    savedSet[currentObj->klass].insert(currentObj);
+                    RecordFieldChange(currentObj, "(整个对象)", "保存", "已加入 GC 强根", {}, "");
+                }
+                else
+                {
+                    // 失败要说出来。静默的话用户会以为保存成功了，
+                    // 而列表里压根没有它。
+                    ReportFieldError(
+                        "保存对象失败：加根没成功，这个对象随时可能被回收，已不加入列表");
+                }
             }
             if (ImGui::IsItemHovered())
             {

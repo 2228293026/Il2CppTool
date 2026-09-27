@@ -440,6 +440,27 @@ Test-Rule 'S 写盘必须看 ok()' {
     return $true
 } $sCheck 'app/src/main/jni/Main.cpp'
 
+# ---- 25. 规则 T：把「先 insert 再加根」复现出来（第 122 轮）----
+$tCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'T 必须先加根再 insert' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(SaveObjectWithRoot\(currentObj\)\)$') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $j = $i + 2
+    $ins = $ls[$j]
+    $ls[$j] = $ls[$i]
+    $ls[$i] = $ins
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $tCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
