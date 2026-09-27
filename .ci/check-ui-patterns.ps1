@@ -996,12 +996,20 @@ foreach ($f in $files) {
     # 必须**真的**是一个判定分支，不能是 `false && GcHandleApiResolved()`
     # 这种「调用还在、判定没了」的写法 —— 只查「文本里出现过这个名字」的话，
     # 那个注入正好能骗过它（第 124 轮自己踩了一次）。
-    if ($text -match 'if\s*\(\s*Il2cpp::GcHandleApiResolved\(\)\s*\)') { continue }
+    # 两项**各自**判定，不能是「有其中一项就放过」。
+    #
+    # 第一版写成了两个连续的 `if (...match...) { continue }`，那是**或**：
+    # 只要 gchandle 那项在位，浏览那项被架空也照样放过 —— 我注入
+    # `if (false && Il2cpp::BrowserApiResolved())` 验证时它没红（第 125 轮）。
+    # 和第 115/124 轮同一个错：把「存在」当成了「每一项都成立」。
+    $gcOk = $text -match 'if\s*\(\s*Il2cpp::GcHandleApiResolved\(\)\s*\)'
+    $browserOk = $text -match 'if\s*\(\s*Il2cpp::BrowserApiResolved\(\)\s*\)'
+    if ($gcOk -and $browserOk) { continue }
     $hits += [pscustomobject]@{
         File = $f.Name
         Line = 0
-        Rule = 'U: 自检用 ApiResolved() 判「核心能力可用」，但 GC 句柄那几个符号没人单独判定（缺了它照样一片绿，而对象一个都留不住）'
-        Text = 'ApiResolved() 不含 il2cpp_gchandle_*'
+        Rule = 'U: 自检用 ApiResolved() 判「核心能力可用」，但 GC 句柄 / 浏览路径那些符号没人单独判定（缺了照样一片绿：一个留不住对象，一个打开类就崩）'
+        Text = 'ApiResolved() 不含 il2cpp_gchandle_* / 浏览路径符号'
     }
 }
 

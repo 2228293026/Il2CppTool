@@ -876,6 +876,31 @@ namespace Il2cpp
                il2cpp_gchandle_free != nullptr;
     }
 
+    bool BrowserApiResolved()
+    {
+        // 「打开一个类、看到它的方法列表」这条路径**实际用到**的符号。
+        //
+        // 逐个查过方法列表的渲染过程（第 125 轮）：
+        //     getMethods        il2cpp_class_get_methods
+        //     getFields         il2cpp_class_get_fields
+        //     每一行的名字       il2cpp_method_get_name
+        //     返回类型           il2cpp_method_get_return_type
+        //     参数个数/参数      il2cpp_method_get_param_count / _get_param
+        //     static 判定        il2cpp_method_is_instance
+        //     泛型实例化判定     il2cpp_method_is_inflated
+        //     类型名             il2cpp_type_get_name
+        // 这几个的包装函数都是**裸调**符号的，缺任何一个都是空指针调用。
+        //
+        // 不去查其余 234 个：那 238 个符号里绝大多数这条工具根本不碰，
+        // 挨个查只会把自检变成一份没人读的符号表。
+        // 判据是「**用户能看见的那条路径**上缺了会怎样」，不是「一共有多少个」。
+        return il2cpp_class_get_methods != nullptr && il2cpp_class_get_fields != nullptr &&
+               il2cpp_method_get_name != nullptr && il2cpp_method_get_return_type != nullptr &&
+               il2cpp_method_get_param_count != nullptr && il2cpp_method_get_param != nullptr &&
+               il2cpp_method_is_instance != nullptr && il2cpp_method_is_inflated != nullptr &&
+               il2cpp_type_get_name != nullptr;
+    }
+
     void Dump(JNIEnv *env)
     {
         jclass clazz = env->FindClass("com/android/support/Preferences");

@@ -480,6 +480,28 @@ Test-Rule 'U 自检要真的判定 GC 句柄' {
     return $true
 } $uCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
 
+# ---- 27. 规则 U（第二半）：把「浏览路径判定被架空」复现出来（第 125 轮）----
+#
+# 上一条只验了 gchandle 那一半，而规则 U 第一版是**或**：
+# 只要 gchandle 在位，浏览那半被架空也照样放过。
+# 所以这里单独验第二半 —— 两个半必须**各自**成立。
+$uCheck2 = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'U 浏览路径判定也要在位' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(Il2cpp::BrowserApiResolved\(\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = '    if (false && Il2cpp::BrowserApiResolved())'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/SelfCheck.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $uCheck2 'app/src/main/jni/Tool/SelfCheck.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

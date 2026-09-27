@@ -49,6 +49,15 @@ namespace Il2cpp
     // 而 il2cpp_gchandle_new 是老版本 il2cpp 上就可能缺的符号，
     // 也就是说这不是理论问题。
     bool GcHandleApiResolved();
+    // 「浏览类和方法」这条主路径需要的符号是否都解析出来了（第 125 轮）。
+    //
+    // 这一项和 GcHandleApiResolved 的**危险程度不同**：
+    // gchandle 缺了是「静默少东西」，而这里缺了是**直接崩游戏** ——
+    // `GetIsMethodInflated()` 之类的包装函数是**裸调**符号的，
+    // 符号为空就是空指针调用，方法列表一画就 SIGSEGV。
+    //
+    // 那边是「错了但你不知道」，这边是「当场崩」，所以必须提前查出来。
+    bool BrowserApiResolved();
     // void Dump(JavaVM *jvm);
     void Dump(JNIEnv *env);
     bool EnsureAttached();
