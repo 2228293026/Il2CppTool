@@ -502,6 +502,29 @@ Test-Rule 'U 浏览路径判定也要在位' {
     return $true
 } $uCheck2 'app/src/main/jni/Tool/SelfCheck.cpp'
 
+# ---- 28. 规则 V：把「界面没挡」复现出来（三个要求各自验，第 126 轮）----
+#
+# 规则 V 第一版把「已转义」的 Pattern 又套了一层 [regex]::Escape，
+# 一条都匹配不上而规则报「通过」—— 第 15 次「规则没在跑」。
+# 下面是修好之后的三个独立要求：每一个都要能单独红。
+$vCheck1 = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+ 'app/src/main/jni/Tool/PopUpSelector.cpp'
+Test-Rule 'V 枚举下拉要挡' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(!Il2cpp::BrowserApiResolved\(\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = $ls[$i] -replace 'if \(!Il2cpp::', 'if (false && Il2cpp::'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/PopUpSelector.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $vCheck1 'app/src/main/jni/Tool/PopUpSelector.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

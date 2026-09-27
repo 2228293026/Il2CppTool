@@ -1013,6 +1013,50 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 V：说「缺符号会崩」的能力，界面上必须真的挡一下 ----
+#
+# 第 126 轮。`BrowserApiResolved()` 那几个符号的包装函数是**裸调**的
+# （`GetIsMethodInflated` -> `il2cpp_method_is_inflated`），
+# 而它在方法列表的渲染循环里每一行都要走：符号为空 = 空指针调用 = SIGSEGV。
+#
+# 只在自检里报出来是不够的 —— 用户得先打开一个类才会踩到。
+# 所以**凡是**用 BrowserApiResolved 判定过的能力，
+# 依赖它的那个界面就得先挡一下，给一句能看懂的话。
+#
+# 三处必须挡：类页面的方法列表、getMethodList、枚举下拉。
+# Pattern 是**字面量**，不在这里写正则转义。
+#
+# 第一版我把 `klass->getFields\(\)` 这样的「已转义」串又套了一层
+# `[regex]::Escape`，于是模式变成 `klass\->getFields\\\(\\\)` ——
+# **一条都匹配不上**，而规则还报「通过」。
+# 这就是第 15 次「规则看着对、其实没在跑」。
+$needBrowserGuard = @(
+    @{ File = 'ClassesTab.cpp'; Pattern = 'MethodViewer(klass, method, paramsInfo);'; Why = '方法列表每个方法都要走一遍裸调用' },
+    @{ File = 'ClassesTab.cpp'; Pattern = 'klass->getMethods()'; Why = '类一打开就走的建缓存路径' },
+    @{ File = 'PopUpSelector.cpp'; Pattern = 'klass->getFields()'; Why = '枚举下拉，点一下就崩' }
+)
+foreach ($g in $needBrowserGuard) {
+    $file = $files | Where-Object { $_.Name -eq $g.File }
+    if (-not $file) { continue }
+    $text = Get-Content -Encoding UTF8 $file.FullName -Raw
+    if ($text -notmatch [regex]::Escape($g.Pattern)) { continue }
+    # 那个调用**之前** 60 行内必须出现过 BrowserApiResolved 的判定
+    $lines = Get-Content -Encoding UTF8 $file.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch [regex]::Escape($g.Pattern)) { continue }
+        $from = [Math]::Max(0, $i - 60)
+        $seg = ($lines[$from..$i] -join "`n")
+        if ($seg -match '!Il2cpp::BrowserApiResolved\(\)') { break }
+        $hits += [pscustomobject]@{
+            File = $g.File
+            Line = $i + 1
+            Rule = "V: 自检说这类能力缺符号会崩，但界面上没挡（$($g.Why)）"
+            Text = $lines[$i].Trim()
+        }
+        break
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

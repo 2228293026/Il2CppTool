@@ -60,6 +60,16 @@ void PopUpSelector::Update()
                 auto klass = type->getClass();
                 if (klass)
                 {
+                    // getFields 是**不判空**的裸调用，符号为空就是空指针调用
+                    // （第 126 轮）。这个下拉是在字段编辑里点出来的，
+                    // 用户不会预期「点一下就崩」。
+                    if (!Il2cpp::BrowserApiResolved())
+                    {
+                        ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                                           "这个 Unity 版本缺一部分符号，枚举列表画不出来");
+                        ImGui::EndPopup();
+                        return;
+                    }
                     for (auto field : klass->getFields())
                     {
                         if (field == nullptr)

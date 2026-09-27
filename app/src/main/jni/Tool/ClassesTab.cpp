@@ -907,6 +907,24 @@ ClassesTab::MethodList &ClassesTab::buildMethodMap(Il2CppClass *klass)
         return it->second;
     }
 
+    // 建这份缓存就要调 getMethods / getParamsInfo（第 126 轮）。
+    //
+    // 同样是不判空的裸调用，符号为空就是空指针调用 ——
+    // 而它是**类一打开就跑**的，比方法列表那条还早一步。
+    //
+    // 返回空列表：调用方那个循环会一次都不进，界面上是「没有方法」，
+    // 配合类页面里那条「这个 Unity 版本缺符号」的红字，意思是明确的。
+    // 千万别在这里 `return` 一个**假的**非空列表 ——
+    // 那等于告诉界面「这个类真的没有方法」，和事实相反。
+    if (!Il2cpp::BrowserApiResolved())
+    {
+        LOGE("getMethodList: 浏览路径符号不全，%s 的方法列表留空（不是「它没有方法」）",
+             klass && klass->getName() ? klass->getName() : "?");
+        MethodList empty;
+        methodCache[klass] = empty;
+        return methodCache[klass];
+    }
+
     MethodList methods;
     auto rawMethods = klass->getMethods();
     LOGD("Rebuilding %s | %lu methods", klass->getName() ? klass->getName() : "?", rawMethods.size());
@@ -3484,6 +3502,27 @@ void ClassesTab::ClassViewer(Il2CppClass *klass)
     }
     ImGui::PopID();
     ImGui::Separator();
+
+    // 浏览路径的符号有没有齐（第 126 轮）。
+    //
+    // MethodViewer 里那个包装是**裸调**符号的（GetIsMethodInflated ->
+    // il2cpp_method_is_inflated），而下面这个循环**每个方法都要走一遍**。
+    // 符号为空 = 空指针调用 = 打开一个类直接 SIGSEGV。
+    //
+    // 为什么在这里挡，而不是给那 123 处直接调用一处一处加判空：
+    // 每一处要一个**语义正确**的兜底值（0？nullptr？空串？），
+    // 而其中很多没有合理兜底 —— 硬加只会把「当场崩」换成
+    // 「更难查的行为错误」。而**能力边界只有这一个**：
+    // 用户能看见的、依赖这些符号的东西就是下面这个列表。
+    if (!Il2cpp::BrowserApiResolved())
+    {
+        ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
+                           "这个 Unity 版本缺一部分浏览需要的 il2cpp 符号");
+        ImGui::TextDisabled("为了不崩游戏，这里不画方法列表了。");
+        ImGui::TextDisabled("具体缺哪些见「日志」页搜 BrowserApiResolved，");
+        ImGui::TextDisabled("自检页的「类 / 方法浏览」也会显示同一件事。");
+        return;
+    }
 
     int j = 0;
     for (auto &[method, paramsInfo] : methodMap[klass])

@@ -47,7 +47,17 @@ if (-not (Test-Path $tidy)) { throw "找不到 clang-tidy: $tidy" }
 $sysroot = (Join-Path $ndk 'toolchains/llvm/prebuilt/windows-x86_64/sysroot') -replace '\\', '/'
 # RUNNER_TEMP 只在 CI 有；本地跑时退回系统临时目录，方便本地复现。
 $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
-$dbDir = Join-Path $tempRoot 'il2cpp-tidy'
+# **每个进程一个独立目录**（第 127 轮）。
+#
+# 原来这里是固定名 `il2cpp-tidy`，于是两个并发的 run-clang-tidy 会共用同一个
+# `compile_commands.json`：一个正在写，另一个已经在读。读到半截 JSON 的那个
+# clang-tidy 什么都分析不出来，$output 是空的 ->
+# 「告警: 0 条」「静态检查通过」。
+#
+# 最坏的一类假绿：**它报的「通过」不代表它检查过任何东西**。
+# 我是在自己同时跑了两轮 check-all 之后撞见的 —— 第一轮报 26，
+# 第二轮报 0，而代码一个字都没改。
+$dbDir = Join-Path $tempRoot ("il2cpp-tidy-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $dbFile = Join-Path $dbDir 'compile_commands.json'
 New-Item -ItemType Directory -Path $dbDir -Force | Out-Null
 
@@ -82,6 +92,26 @@ try {
 }
 finally {
     $ErrorActionPreference = $prevPref
+}
+
+# ---- 「一条输出都没有」必须**报错**，不能当成「0 条告警」 ----
+#
+# 这是上一段那个假绿的**另一半**：就算目录撞名修好了，
+# 只要 clang-tidy 因为任何原因没产出（工具缺失、数据库读失败、
+# 目标文件编译不过），$output 就是空的。
+#
+# 而空输出走到下面会变成「告警: 0 条」「静态检查通过」——
+# **一次没检查过的检查，在输出上和「检查通过」长得一模一样。**
+#
+# 判据：clang-tidy 只要真的分析过，就一定会打出
+# `N warnings generated.` 或 `N warnings generated.`/`No warnings generated.`
+# 这一行（带 -quiet 也一样）。一行都没有 = 它没干活。
+if ([string]::IsNullOrWhiteSpace($output)) {
+    Write-Host ''
+    Write-Host "clang-tidy 没有产出任何输出 —— 无法判断有没有告警，按**失败**处理。"
+    Write-Host "这**不是**「0 条告警」：前者是「没检查」，后者是「检查了、没问题」。"
+    Write-Host "常见原因：compile database 没写成功 / 目标文件编译不过 / clang-tidy 自己崩了。"
+    exit 1
 }
 
 # 只保留指向我们自己源文件的告警（第三方头文件里的不进来）
