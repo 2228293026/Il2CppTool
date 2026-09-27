@@ -125,6 +125,14 @@ struct ClassesTab
         bool invalid;                     // 对象已被 GC 或路径失效
         bool frozen = false;              // 冻结中：每帧把 frozenValue 写回去
         std::string frozenValue;          // 冻结时钉住的那个值（文本形式）
+
+        // 最近若干次轮询读到的**数值**，给行内那条迷你趋势图用（第 114 轮）。
+        //
+        // 只在**读成功且值是数字**时才追加。读失败绝不能追加 ——
+        // 追加一个 0 会让图上出现一段凭空的下坠，而用户会以为
+        // 「正在掉血」。图表比文字更容易骗人：文字是「0」，
+        // 图是「刚刚还好好的，现在突然归零」。
+        std::vector<float> history;
     };
     static void AddWatch(Il2CppObject *object, const std::vector<std::string> &paths,
                          const std::string &label);

@@ -431,11 +431,47 @@ void ClassesTab::DrawWatches()
                     w.changed = !w.lastValue.empty();
                     w.lastValue = text;
                 }
+                // 趋势图取样（第 114 轮）。
+                //
+                // 三个条件都必须满足，缺一个都不取：
+                //   1. 读**成功**了（走到这里说明没抛）
+                //   2. 值是纯数字（`<非标量>` / `<读取失败: …>` 不取）
+                //   3. 能解析成 float
+                //
+                // 读失败时**绝不能**补一个 0 —— 那会在图上画出一段
+                // 凭空的下坠，而用户会以为「正在掉血」。
+                // 图表比文字更容易骗人：文字是一个孤零零的「0」，
+                // 图是「刚刚还好好的，现在突然归零」。
+                if (text != "<非标量>" && !text.empty() && text[0] != '<')
+                {
+                    char *endp = nullptr;
+                    const double v = strtod(text.c_str(), &endp);
+                    // 三道门：
+                    //   *endp == '\0'   整串都得是数字。strtod 对 "123abc"
+                    //                   会**成功**解析出 123 并把 endp 指到 'a'；
+                    //                   不看 endp 就会把 "123abc" 当成 123 画进曲线。
+                    //   isfinite(v)     "inf" / "nan" 会被 strtod 完整接受。
+                    //                   而一个 inf 就会把 PlotLines 的 min/max
+                    //                   一起污染 —— 和 Util.cpp 里 FPS 那段
+                    //                   注释说的是同一件事：整张图可能直接画不出来。
+                    if (endp != nullptr && endp != text.c_str() && *endp == '\0' &&
+                        std::isfinite(v))
+                    {
+                        constexpr size_t kHistoryMax = 40; // 40 × 200ms ≈ 8 秒
+                        w.history.push_back(static_cast<float>(v));
+                        if (w.history.size() > kHistoryMax)
+                        {
+                            w.history.erase(w.history.begin());
+                        }
+                    }
+                }
             }
             catch (const std::exception &e)
             {
                 w.invalid = true;
                 w.lastValue = std::string("<读取失败: ") + e.what() + ">";
+                // 这里**不**清空 history：曲线停在最后一个成功读到的点上，
+                // 配上下面那行「已失效」，用户能看到它是从哪里停的。
             }
         }
     }
@@ -485,6 +521,26 @@ void ClassesTab::DrawWatches()
             else
             {
                 ImGui::TextUnformatted(w.lastValue.c_str());
+            }
+            // 迷你趋势图（第 114 轮）。
+            //
+            // 放在值**右边**同一行，而不是新起一行 —— 这一页是表格，
+            // 行高要一致（上面「恢复」那格用 Dummy 就是为了这个）。
+            // 宽度固定 64px，不按内容伸缩，免得每帧列宽都在跳。
+            //
+            // 只在**有足够样本**时才画：两三个点的「趋势」什么也说明不了，
+            // 反而像是在承诺什么。曲线本身是诚实的前提是取样诚实 ——
+            // 取样那侧已经在读失败时明确不取（见轮询处）。
+            if (w.history.size() >= 4)
+            {
+                ImGui::SameLine();
+                ImGui::PlotLines("##spark", w.history.data(), static_cast<int>(w.history.size()), 0,
+                          nullptr, FLT_MAX, FLT_MAX, ImVec2(64.0f, 0.0f));
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetTooltip("最近 %zu 次轮询（约 %.1f 秒）的走势",
+                                      w.history.size(), w.history.size() * 0.2);
+                }
             }
             // 右键复制。
             //

@@ -793,6 +793,44 @@ foreach ($name in $hookNames.Keys) {
         }
     }
 }
+# ---- 模式 P：往趋势/曲线里取样时，不许把**读失败**当成 0 ----
+#
+# 第 114 轮给关注值加了行内迷你趋势图之后想到的。
+#
+# 取样那一侧最容易犯的错是「读不到就填个 0」。而图表比文字更容易骗人：
+# 文字是一个孤零零的「0」，图是「刚刚还好好的，现在突然归零」——
+# 用户看到的是**正在掉血**。
+#
+# 形状：history.push_back(...) / push_back(...) 紧跟在一次可能失败的
+# 读取之后，而**中间没有**任何判空/判定成功的分支。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch '^\w+\.history\.push_back\(') { continue }
+        # 往上找这段取样的起点：必须是「读取成功之后」而不是 catch/失败分支
+        $hasGuard = $false
+        for ($k = $i; $k -ge 0; $k--) {
+            $u = $lines[$k].Trim()
+            # **注释不能算守卫**。第 114 轮就栽在这：我把 `isfinite(v)` 去掉之后，
+            # 规则还是绿的 —— 因为上面那行说明文字里有 `//   isfinite(v)`。
+            # 第 90 轮的教训：匹配之前先把注释剥掉。
+            if ($u -match '^(//|\*|/\*)') { continue }
+            if ($u -match 'catch\s*\(|<读取失败|<非标量|isfinite|\*endp ==') { $hasGuard = $true; break }
+            if ($u -match '^\}\s*$' -or $u -match '^(try|for|while)\b') { break }
+        }
+        if (-not $hasGuard) {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'P: 取样进趋势图之前没有排除「读取失败」（图上会出现凭空的下坠）'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

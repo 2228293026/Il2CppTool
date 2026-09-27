@@ -361,6 +361,31 @@ Test-Rule 'O 日志函数不许往外抛' {
     return $true
 } $oCheck 'app/src/main/jni/Includes/Logger.cpp'
 
+# ---- 21. 规则 P：把「读取失败也取样」复现出来（第 114 轮）----
+#
+# 这条规则第一版把**注释**当成了守卫 —— 我把 isfinite(v) 去掉之后它还是绿的，
+# 因为上面那行说明文字里写着 `//   isfinite(v)`。
+# 第 90 轮的教训：匹配之前先把注释剥掉。
+$pCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'P 取样不许把读取失败当 0' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $n = 0
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'if \(text != "<非标量>"') { $ls[$k] = '                if (true)'; $n++ }
+        if ($ls[$k] -match 'if \(endp != nullptr && endp != text\.c_str\(\) && \*endp ==') { $ls[$k] = '                    if (true)'; $n++ }
+        # std::isfinite(v))) 也要去掉 —— 它本身就是 $hasGuard 认得的守卫之一，
+        # 只去掉两个 if 的条件，规则仍会从 isfinite 那行判定「有守卫」。
+        if ($ls[$k] -match '^\s*std::isfinite\(v\)\)\s*$') { $ls[$k] = '                        0);'; $n++ }
+    }
+    if ($n -lt 2) { return $false }
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $pCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
