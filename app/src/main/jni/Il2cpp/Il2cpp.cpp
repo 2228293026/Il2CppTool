@@ -866,6 +866,16 @@ namespace Il2cpp
                il2cpp_thread_current != nullptr && il2cpp_is_vm_thread != nullptr;
     }
 
+    bool GcHandleApiResolved()
+    {
+        // NewHandle 用三个符号，少任何一个都会**静默地**返回 0（第 124 轮）。
+        //
+        // GetHandleTarget / FreeHandle 缺了也一样：liveObjects() 会因为
+        // 解析不出地址而把条目全跳过，removeAt() 会漏释放句柄。
+        return il2cpp_gchandle_new != nullptr && il2cpp_gchandle_get_target != nullptr &&
+               il2cpp_gchandle_free != nullptr;
+    }
+
     void Dump(JNIEnv *env)
     {
         jclass clazz = env->FindClass("com/android/support/Preferences");

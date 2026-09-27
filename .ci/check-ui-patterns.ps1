@@ -975,6 +975,36 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 U：自检说「可用」之前，那个能力得**真的**可判定 ----
+#
+# 第 124 轮。`ApiResolved()` 查了 domain / class / thread / is_vm_thread
+# 四个符号，自检据此说「il2cpp API 已解析 ✓」。
+#
+# 但 `NewHandle` 用的是另外三个（gchandle_new / get_target / free），
+# 一个都没查。三个全缺时 ApiResolved() 照样 true、自检照样绿，
+# 而 NewHandle 对**每一个**对象返回 0，liveObjects() 把它们全跳过 ——
+# 用户看到「Find Objects 秒完成，一个都没找到」。
+#
+# il2cpp_gchandle_new 在老版本 il2cpp 上就可能缺，这不是理论问题。
+#
+# 形状：自检里用 ApiResolved() 判「核心能力可用」，
+# 而 GC::NewHandle 依赖的符号没有任何一项单独判定。
+foreach ($f in $files) {
+    if ($f.Name -ne 'SelfCheck.cpp') { continue }
+    $text = Get-Content -Encoding UTF8 $f.FullName -Raw
+    if ($text -notmatch 'ApiResolved\(\)') { continue }
+    # 必须**真的**是一个判定分支，不能是 `false && GcHandleApiResolved()`
+    # 这种「调用还在、判定没了」的写法 —— 只查「文本里出现过这个名字」的话，
+    # 那个注入正好能骗过它（第 124 轮自己踩了一次）。
+    if ($text -match 'if\s*\(\s*Il2cpp::GcHandleApiResolved\(\)\s*\)') { continue }
+    $hits += [pscustomobject]@{
+        File = $f.Name
+        Line = 0
+        Rule = 'U: 自检用 ApiResolved() 判「核心能力可用」，但 GC 句柄那几个符号没人单独判定（缺了它照样一片绿，而对象一个都留不住）'
+        Text = 'ApiResolved() 不含 il2cpp_gchandle_*'
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

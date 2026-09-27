@@ -55,6 +55,18 @@ static std::unordered_map<Il2CppClass *, std::vector<Il2CppObject *>> g_pendingS
 // —— 而不是「根本没扫成功」。界面上没有任何提示。
 static std::unordered_map<Il2CppClass *, std::string> g_pendingScanErrors;
 
+// 「这一批里有几个对象没能加根」（第 124 轮）。
+//
+// 和 g_pendingScanErrors 是同一个问题的两种形态：
+//     扫描失败   -> 整个列表是上一次的
+//     加根失败   -> 列表是这次的，但**少了一批**
+// 后者更隐蔽：用户点了一次 Find Objects，看到少了几个对象，
+// 而界面上没有任何一个字说明「本来有 N 个，有 M 个留不住」。
+//
+// 而且丢掉的那些**不是随机的**：gchandle 表快满时最后分配的那几个会失败，
+// 也就是说最可能是他刚要用的那几个。
+static std::unordered_map<Il2CppClass *, size_t> g_pendingRootFailures;
+
 // savedSet 里是「用户手动保存、要长期留着」的对象，同样必须保活：
 // 它们在列表里可能挂很久，游戏侧随时可能销毁对应实体。
 // 因为是 set（按指针去重），用一个并行的句柄表来管 GC 根。
@@ -1089,6 +1101,7 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
 
     // 把后台线程的结果并进来（objectMap 只在 UI 线程被改动）
     std::string scanError;
+    size_t rootFailures = 0;
     {
         std::lock_guard<NeverDestroyedMutex> lock(g_scanResultMutex);
         if (!g_pendingScanResults.empty())
@@ -1098,6 +1111,17 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
                 // 旧条目（及其句柄）在这里被 RootedObjectList 的赋值运算符释放，
                 // 新的一批同时加根。
                 objectMap[pendingKlass].reset(std::move(pending));
+                // 加根失败的那些会被 liveObjects() **静默跳过** ——
+                // 用户点了一次 Find Objects，看到少了一批对象，
+                // 而界面上没有任何一个字说明「本来找到了 N 个，有 M 个留不住」。
+                //
+                // 少了就是少了，而少掉的那批**很可能正是他正要找的那个**
+                // （gchandle 表快满时，分配失败不是随机的）。
+                const size_t lost = objectMap[pendingKlass].rootFailures();
+                if (lost)
+                {
+                    g_pendingRootFailures[pendingKlass] += lost;
+                }
             }
             g_pendingScanResults.clear();
         }
@@ -1109,6 +1133,23 @@ void ClassesTab::ImGuiObjectSelector(int id, Il2CppClass *klass, const char *pre
             }
             g_pendingScanErrors.clear();
         }
+        if (!g_pendingRootFailures.empty())
+        {
+            if (auto it = g_pendingRootFailures.find(klass); it != g_pendingRootFailures.end())
+            {
+                rootFailures = it->second;
+            }
+            g_pendingRootFailures.clear();
+        }
+    }
+    if (rootFailures > 0)
+    {
+        // 这行**必须**和列表一起出现。少了就是少了，而「少掉的那批很可能
+        // 正是他要找的」——不给这句话，他会以为这个类就只有这几个对象。
+        ImGui::TextColored(ImVec4(1.f, 0.7f, 0.35f, 1.f),
+                           "有 %zu 个对象没能留住（GC 句柄分配失败）——它们不会出现在下面的列表里",
+                           rootFailures);
+        ImGui::TextDisabled("这是 gchandle 表满了，不是「这个类只有这么多个对象」。");
     }
     if (!scanError.empty())
     {

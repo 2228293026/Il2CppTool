@@ -461,6 +461,25 @@ Test-Rule 'T 必须先加根再 insert' {
     return $true
 } $tCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 26. 规则 U：把「GC 句柄判定被架空」复现出来（第 124 轮）----
+$uCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'U 自检要真的判定 GC 句柄' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(Il2cpp::GcHandleApiResolved\(\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # 关键：注入成「调用还在、判定没了」。只查名字出现过的规则会被骗过。
+    $ls[$i] = '    if (false && Il2cpp::GcHandleApiResolved())'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/SelfCheck.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $uCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

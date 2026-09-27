@@ -38,6 +38,17 @@ namespace Il2cpp
     // - true  = API 表已经解析出来了，只是运行时尚未就绪 → 值得稍后重试
     // - false = 连符号都没解析出来（版本不匹配等）→ 重试也没用
     bool ApiResolved();
+    // GC 句柄那三个符号是否都解析出来了（第 124 轮）。
+    //
+    // **必须**和 ApiResolved() 分开报，因为后果完全不同：
+    // ApiResolved() 少了 gchandle 符号，而别的符号都在时，它照样返回 true，
+    // 自检会说「il2cpp API 已解析」。而这时 NewHandle 对**每一个**对象
+    // 都返回 0，liveObjects() 把它们全跳过 —— 表现是
+    // 「Find Objects 秒完成，一个都没找到」。
+    //
+    // 而 il2cpp_gchandle_new 是老版本 il2cpp 上就可能缺的符号，
+    // 也就是说这不是理论问题。
+    bool GcHandleApiResolved();
     // void Dump(JavaVM *jvm);
     void Dump(JNIEnv *env);
     bool EnsureAttached();
@@ -345,6 +356,29 @@ namespace Il2cpp
             {
                 m_objects.push_back(object);
                 m_handles.push_back(object ? NewHandle(object) : 0);
+            }
+
+            // 这一批里有几个**没能加根**（第 124 轮）。
+            //
+            // 加根失败的对象会被 liveObjects() 静默跳过 —— 从「不崩」的角度
+            // 那是对的，可从「用户知道发生了什么」的角度是错的：
+            // 列表凭空少了一批，而没有任何一个字说明少了。
+            // 所以把这个数记下来，由调用方报给用户。
+            //
+            // 注意它是**累计值**而不是「本批失败数」：liveObjects() 每帧
+            // 都会剔除已失效的条目，而 add() 之后的失败只发生在新增那一刻，
+            // 混在一起会越滚越大。要「本批」的数就在 reset() 前后各取一次差值。
+            size_t rootFailures() const
+            {
+                size_t bad = 0;
+                for (auto handle : m_handles)
+                {
+                    if (!handle)
+                    {
+                        bad++;
+                    }
+                }
+                return bad;
             }
 
             // 删除第 index 个对象并释放其句柄。

@@ -67,6 +67,26 @@ std::vector<Result> Collect()
         out.push_back(Fail("il2cpp API", "未解析 —— 工具的核心功能都不可用"));
     }
 
+    // ---- GC 句柄（对象能被「留住」的前提）----
+    // 单独列一项，因为它和上面那个「il2cpp API」**不是一回事**。
+    //
+    // `ApiResolved()` 只查 domain/class/thread/is_vm_thread 四个符号，
+    // 不含 gchandle。三个全在时它照样返回 true、自检说「已解析」——
+    // 而这时 NewHandle 对**每一个**对象都返回 0，liveObjects() 把它们
+    // 全跳过。用户看到的是「Find Objects 秒完成，一个都没找到」，
+    // 而自检页一片绿。第 124 轮。
+    if (Il2cpp::GcHandleApiResolved())
+    {
+        out.push_back(Ok("GC 句柄", "il2cpp_gchandle_* 已解析 —— 对象可以被留住"));
+    }
+    else
+    {
+        out.push_back(
+            Fail("GC 句柄",
+                 "il2cpp_gchandle_* 符号缺失 —— 【对象全都留不住】：「Find Objects」会一个都找不到、"
+                 "保存对象和关注值会静默失败。这是老版本 il2cpp 上就可能缺的符号"));
+    }
+
     // ---- 程序集 / 类 ----
     {
         char buf[160]{0};
