@@ -1,4 +1,5 @@
 #include "ChangeLog.h"
+#include "Includes/Utils.h"
 
 #include "imgui/imgui.h"
 
@@ -430,8 +431,15 @@ void DrawUI()
     // 除了看列表之外唯一能做的事。
     if (ImGui::SmallButton("复制全部"))
     {
-        const std::string text = ExportText(list);
-        ImGui::SetClipboardText(text.c_str());
+        // 拼接在 CopyToClipboard 的边界里面（第 118 轮）——
+        // 导出几百条记录的字符串是会抛 bad_alloc 的，而这里在渲染线程上。
+        std::string err;
+        if (!CopyToClipboard([&list]() { return ExportText(list); }, &err))
+        {
+            // 失败必须说出来：静默的话用户会以为复制成功了，
+            // 然后拿着没更新的剪贴板去粘。
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", err.c_str());
+        }
     }
     ImGui::SameLine();
     // 「全部恢复」：把这一轮做过的改动**一次性退回去**。

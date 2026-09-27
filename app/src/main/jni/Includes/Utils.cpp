@@ -3,9 +3,53 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include "imgui/imgui.h"
 #include "obfuscate.h"
 #include "Logger.h"
 #include "KittyMemory/MemoryPatch.h"
+
+bool CopyToClipboard(const std::function<std::string()> &textFn, std::string *error)
+{
+    if (error)
+    {
+        error->clear();
+    }
+    if (!textFn)
+    {
+        if (error)
+        {
+            *error = "没有可复制的内容";
+        }
+        return false;
+    }
+    // 拼接和 SetClipboardText 都在边界里（第 118 轮）。
+    //
+    // 这两个都会抛：前者是 std::bad_alloc，后者是 ImGui 自己的断言
+    // 路径。任何一个漏出去，这一帧的菜单就整个不画了。
+    try
+    {
+        const std::string text = textFn();
+        ImGui::SetClipboardText(text.c_str());
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        if (error)
+        {
+            *error = std::string("复制失败：") + e.what();
+        }
+        LOGE("CopyToClipboard: 复制时抛出异常: %s", e.what());
+    }
+    catch (...)
+    {
+        if (error)
+        {
+            *error = "复制失败：未知异常";
+        }
+        LOGE("CopyToClipboard: 复制时抛出未知异常");
+    }
+    return false;
+}
 
 uintptr_t libBase;
 

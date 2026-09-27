@@ -831,6 +831,33 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 Q：复制到剪贴板必须走那个**不抛**的助手 ----
+#
+# 第 118 轮。现在全项目有 6 处「复制」，其中 4 处要在渲染线程上
+# 拼一整份几百行的字符串（导出改动记录、关注值整份、自检报告、日志全文）。
+# 那个 `+=` 循环会抛 std::bad_alloc，而异常一路逃出渲染路径的后果
+# 不是「这次复制没成功」，而是**这一整帧的菜单都不画** ——
+# 用户看到的是界面闪一下、剪贴板没变，完全无从判断原因。
+#
+# 所以统一走 `CopyToClipboard(fn, &err)`，它保证不抛，失败时如实上报。
+# 直接调 `ImGui::SetClipboardText` 的只允许出现在 Includes/Utils.cpp 里
+# （就是那个助手本身）。
+foreach ($f in $files) {
+    if ($f.Name -eq 'Utils.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch 'ImGui::SetClipboardText\s*\(') { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'Q: 直接调 SetClipboardText（这一帧在渲染线程上，异常逃出去 = 整帧菜单不画）。请走 CopyToClipboard'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

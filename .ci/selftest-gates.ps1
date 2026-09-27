@@ -386,6 +386,24 @@ Test-Rule 'P 取样不许把读取失败当 0' {
     return $true
 } $pCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 22. 规则 Q：把「直接调 SetClipboardText」复现出来（第 118 轮）----
+$qCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'Q 复制必须走不抛的助手' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*std::string err;$') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls.Insert($i, '        ImGui::SetClipboardText("x");')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/SelfCheck.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $qCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

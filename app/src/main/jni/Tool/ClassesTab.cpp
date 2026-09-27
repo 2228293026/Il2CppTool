@@ -1,4 +1,5 @@
 #include "ClassesTab.h"
+#include "Includes/Utils.h"
 #include "ChangeLog.h"
 #include "Includes/NeverDestroyedMutex.h"
 #include "Il2cpp/Il2cpp.h"
@@ -160,6 +161,10 @@ void ensureIfValueType(Il2CppObject *currentObj, const std::vector<std::string> 
 // 前向声明：冻结的每帧写回要调它，而它的定义在文件更靠后（字段编辑那段）。
 static bool WriteWatchValue(Il2CppObject *root, const std::vector<std::string> &paths,
                             std::string value, Il2CppObject **lastObject);
+
+// 前向声明：关注值的右键复制要报告「复制失败」，而它的定义在文件更靠后
+// （第 118 轮加 CopyToClipboard 时才用上）。
+static void ReportFieldError(const std::string &msg);
 
 static double g_watchLastPoll = 0.0;
 
@@ -404,30 +409,43 @@ void ClassesTab::DrawWatches()
     // 8 行里少了 1 行，粘过去对比时只会得出「变了」的结论。
     if (ImGui::SmallButton("复制全部"))
     {
-        std::string text;
-        for (const auto &w : g_watches)
+        // 拼接在 CopyToClipboard 的边界里面（第 118 轮）：
+        // 最多 64 条 × 每条上百字符，内存不够时会抛；
+        // 而这里在渲染线程上，抛出去 = 这一帧整个菜单不画。
+        std::string err;
+        const bool ok = CopyToClipboard(
+            []()
+            {
+                std::string text;
+                for (const auto &w : g_watches)
+                {
+                    if (!text.empty())
+                    {
+                        text += '\n';
+                    }
+                    text += w.label;
+                    text += " = ";
+                    if (w.invalid)
+                    {
+                        // 失效的**不能**静默输出旧值：那看起来就是一个当前的数，
+                        // 而用户会拿它做对比。逐行复制那边已经这么处理了，
+                        // 这里必须一致。
+                        text += "<对象已失效，上次读到 ";
+                        text += w.lastValue.empty() ? "?" : w.lastValue;
+                        text += ">";
+                    }
+                    else
+                    {
+                        text += w.lastValue;
+                    }
+                }
+                return text;
+            },
+            &err);
+        if (!ok)
         {
-            if (!text.empty())
-            {
-                text += '\n';
-            }
-            text += w.label;
-            text += " = ";
-            if (w.invalid)
-            {
-                // 失效的**不能**静默输出旧值：那看起来就是一个当前的数，
-                // 而用户会拿它做对比。逐行复制那边已经这么处理了，
-                // 这里必须一致。
-                text += "<对象已失效，上次读到 ";
-                text += w.lastValue.empty() ? "?" : w.lastValue;
-                text += ">";
-            }
-            else
-            {
-                text += w.lastValue;
-            }
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", err.c_str());
         }
-        ImGui::SetClipboardText(text.c_str());
     }
     if (ImGui::IsItemHovered())
     {
@@ -616,11 +634,23 @@ void ClassesTab::DrawWatches()
                     w.invalid ? ("<对象已失效，上次读到 " + w.lastValue + ">") : w.lastValue;
                 if (ImGui::MenuItem("复制值", nullptr, false, !w.lastValue.empty()))
                 {
-                    ImGui::SetClipboardText(copyValue.c_str());
+                    // copyValue 在上面已经拼好了，但 `w.label + " = " + copyValue`
+                    // 那一条还是会在渲染线程上分配 —— 同样走边界（第 118 轮）。
+                    std::string err;
+                    if (!CopyToClipboard([&copyValue]() { return copyValue; }, &err))
+                    {
+                        ReportFieldError(err);
+                    }
                 }
                 if (ImGui::MenuItem("复制 标签 = 值", nullptr, false, !w.lastValue.empty()))
                 {
-                    ImGui::SetClipboardText((w.label + " = " + copyValue).c_str());
+                    std::string err;
+                    const std::string &label = w.label;
+                    if (!CopyToClipboard([&label, &copyValue]() { return label + " = " + copyValue; },
+                                         &err))
+                    {
+                        ReportFieldError(err);
+                    }
                 }
                 ImGui::EndPopup();
             }

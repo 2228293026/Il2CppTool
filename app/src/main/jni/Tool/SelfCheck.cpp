@@ -1,4 +1,5 @@
 #include "SelfCheck.h"
+#include "Includes/Utils.h"
 #include "ChangeLog.h"
 #include "Il2cpp/Il2cpp.h"
 #include "Includes/Logger.h"
@@ -527,20 +528,36 @@ void DrawUI()
     // 也不加 Markdown（ImGui 不解析，而粘到 issue 里 Markdown 才有意义）。
     if (ImGui::SmallButton("复制自检报告"))
     {
-        std::string text;
-        for (const auto &r : cached)
-        {
-            if (!text.empty())
+        // 拼接在 CopyToClipboard 的边界**里面**（第 118 轮）：
+        // 这段 += 十几行，内存不够时会抛，而抛出去会让这一帧
+        // 的**整个菜单**不画 —— 用户看到的是界面闪一下，
+        // 根本不知道是自己操作的问题还是工具崩了。
+        std::string err;
+        const bool ok = CopyToClipboard(
+            []()
             {
-                text += '\n';
-            }
-            text += r.name;
-            text += '\t';
-            text += StatusLabel(r.status);
-            text += '\t';
-            text += r.detail;
+                std::string text;
+                for (const auto &r : cached)
+                {
+                    if (!text.empty())
+                    {
+                        text += '\n';
+                    }
+                    text += r.name;
+                    text += '\t';
+                    text += StatusLabel(r.status);
+                    text += '\t';
+                    text += r.detail;
+                }
+                return text;
+            },
+            &err);
+        // 失败要**说出来**。静默失败的话，用户会以为复制成功了，
+        // 然后拿着一个没更新的剪贴板去粘。
+        if (!ok)
+        {
+            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", err.c_str());
         }
-        ImGui::SetClipboardText(text.c_str());
     }
     if (ImGui::IsItemHovered())
     {

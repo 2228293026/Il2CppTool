@@ -1,4 +1,5 @@
 #include "Logger.h"
+#include "Utils.h"
 
 #include "imgui/imgui.h"
 #include <atomic>
@@ -319,7 +320,15 @@ namespace logger
         {
             // 贴到剪贴板方便直接发 issue —— 手机上没有 adb logcat 时，
             // 这是把诊断信息带出去的主要途径。
-            ImGui::SetClipboardText(CopyText().c_str());
+            //
+            // 走 CopyToClipboard（第 118 轮）：CopyText() 本身已经有边界，
+            // 但 SetClipboardText 和「把 512KB 日志拷进剪贴板」这一步
+            // 仍然在渲染线程上，不能让异常漏到外面去。
+            std::string err;
+            if (!CopyToClipboard([]() { return CopyText(); }, &err))
+            {
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "%s", err.c_str());
+            }
         }
         if (ImGui::IsItemHovered())
         {
