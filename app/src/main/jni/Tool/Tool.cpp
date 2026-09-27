@@ -103,10 +103,20 @@ std::string g_hookError;
                 LOGW("保留损坏配置副本时发生未知异常");
             }
             g_configLoadFailed = true;
-            ConfigSave();
+            // 这里**必须**判返回值（第 119 轮）。
+            //
+            // 「重置了配置」和「重置了、但没写回去」是两件事：后者下次启动
+            // 照样解析失败，而 `g_configLoadFailed` 只在**这一次**进程里有效。
+            // 静默忽略的话，用户会看到自检页说「已重置」，重开游戏后发现
+            // 还是坏的，而中间没有任何一步提到过写盘失败。
+            if (!ConfigSave())
+            {
+                LOGE("ConfigLoad: 坏配置已标记为重置，但覆盖写入也失败了 —— "
+                     "下次启动可能还是解析不了");
+            }
         }
     }
-    void ConfigSave()
+    bool ConfigSave()
     {
         LOGD(__FUNCTION__);
         // 原子写在 FileWriter 里（第 89/90 轮）：所有内容先写进
@@ -120,9 +130,38 @@ std::string g_hookError;
         // 这里第 89 轮曾经手写了一份原子写，第 90 轮发现 `tool_conf.json`
         // 有同样的问题 —— 与其在每个调用点各写一遍（两份实现迟早会不一致），
         // 不如把它放进 FileWriter：**所有写入必经的入口**。
-        nlohmann::ordered_json j = classesTabs;
-        Util::FileWriter configFile("class_tabs.json");
-        configFile.write(j.dump(2, ' ').c_str());
+        //
+        // ---- 第 119 轮：返回成败，而且**不许抛** ----
+        //
+        // 三个调用点全都在**渲染线程**上（保存参数预设、认领筛选结果、
+        // 新建标签页），而 `j.dump(2, ' ')` 要把整棵 tabs 树序列化成字符串 ——
+        // 内存不够就抛。抛出去的后果是**这一整帧的菜单不画**。
+        //
+        // 比那一帧更要紧的是**静默丢数据**：`classesTabs` 在调用 ConfigSave
+        // **之前**已经被改了（预设加进去了、标签页建好了）。保存失败的话，
+        // 界面上它还在、用户以为存上了，而下次启动**没了**。
+        // 所以必须把成败带回去，由调用方如实报出来。
+        try
+        {
+            nlohmann::ordered_json j = classesTabs;
+            Util::FileWriter configFile("class_tabs.json");
+            configFile.write(j.dump(2, ' ').c_str());
+            const bool ok = configFile.ok();
+            if (!ok)
+            {
+                LOGE("ConfigSave: class_tabs.json 写入失败（临时文件已丢弃，原文件保持不变）");
+            }
+            return ok;
+        }
+        catch (const std::exception &e)
+        {
+            LOGE("ConfigSave: 序列化/写入抛出异常: %s", e.what());
+        }
+        catch (...)
+        {
+            LOGE("ConfigSave: 序列化/写入抛出未知异常");
+        }
+        return false;
     }
     void ConfigInit()
     {
@@ -459,7 +498,10 @@ std::string g_hookError;
                         tab.FilterClasses(tab.filter);
                         break;
                     }
-                    ConfigSave();
+                    if (!ConfigSave())
+                    {
+                        LOGE("新建标签页后配置未能落盘：下次启动这个标签页会消失");
+                    }
                 }
                 else
                 {

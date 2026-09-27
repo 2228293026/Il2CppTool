@@ -2366,7 +2366,12 @@ void ClassesTab::CallerView(Il2CppClass *klass, MethodInfo *method, const Method
             }
             selectedPreset[method] = name;
             newPresetName.clear();
-            Tool::ConfigSave();
+            // 保存失败要**说出来**（第 119 轮）：预设已经在 list 里、
+            // 用户看得见，而没落盘 = 下次启动就没了。
+            if (!Tool::ConfigSave())
+            {
+                ReportFieldError("预设没能保存到磁盘：下次启动会丢失（详见日志）");
+            }
         }
     }
     if (!callResults.at(method).empty())
@@ -5415,7 +5420,11 @@ bool ClassesTab::PollFilterResult()
     methodMap = std::move(newMethodMap);
     // 持久化放在「认领结果」这里而不是每次按键：
     // 旧实现每敲一个字符就写一次配置文件，纯属无谓的 IO。
-    Tool::ConfigSave();
+    // 认领结果已改内存，保存失败要如实报出来（第 119 轮）。
+    if (!Tool::ConfigSave())
+    {
+        ReportFieldError("筛选结果没能保存到磁盘：下次启动会丢失（详见日志）");
+    }
     return true;
 }
 

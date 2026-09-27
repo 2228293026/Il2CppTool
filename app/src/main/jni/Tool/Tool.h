@@ -47,7 +47,10 @@ struct HookerData
 };
 namespace Tool
 {
-    void ConfigSave();
+    // 返回**是否真的写成功了**（第 119 轮）。
+    // 失败时调用方要如实告诉用户 —— 内存里已经改了，
+    // 而配置没落盘 = 下次启动就没了，界面上却看不出来。
+    bool ConfigSave();
     void ConfigLoad();
 
     // 本次启动读配置失败过（那份坏文件已被覆盖成默认，副本在 .corrupt）。

@@ -858,6 +858,37 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 R：UI 层的「保存」必须看返回值 ----
+#
+# 第 119 轮。ConfigSave 以前是 void，调用方无从知道写盘有没有成功。
+# 而三个调用点都在**渲染线程**上，且 `classesTabs` 在调用它**之前**
+# 就已经被改了（预设加进去了、筛选结果认领了、标签页建好了）。
+#
+# 于是保存失败时的表现是：
+#     界面上它还在  +  用户以为存上了  +  下次启动没了
+# 也就是**静默丢数据**，而且丢得很彻底。
+#
+# 所以：保存类函数一律返回 bool，UI 层的调用点一律包在 if 里。
+# 本规则只查 UI 那个文件 —— Tool.cpp 里 ConfigInit 的首次创建
+# 忽略返回值是合理的（还没有东西可丢）。
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch '^Tool::ConfigSave\(\);') { continue }
+        $prev = if ($i -gt 0) { $lines[$i - 1].Trim() } else { '' }
+        if ($prev -match 'if\s*\(\s*!Tool::ConfigSave\(\)\s*\)') { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'R: UI 层的保存忽略了返回值（内存已改而没落盘 = 静默丢数据）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

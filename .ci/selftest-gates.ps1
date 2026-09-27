@@ -404,6 +404,24 @@ Test-Rule 'Q 复制必须走不抛的助手' {
     return $true
 } $qCheck 'app/src/main/jni/Tool/SelfCheck.cpp'
 
+# ---- 23. 规则 R：把「保存忽略返回值」复现出来（第 119 轮）----
+$rCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'R UI 层的保存要看返回值' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*if \(!Tool::ConfigSave\(\)\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = '            Tool::ConfigSave(); if (false)'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $rCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
