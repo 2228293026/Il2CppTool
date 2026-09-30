@@ -85,7 +85,43 @@ if ($unscanned) {
     $script:gateCoverageFailed = $true
 }
 
+# ---- 没人 include 的头文件 = 死代码（第 132 轮）----
+#
+# 一个 `.h` 如果**没有任何**文件 include 它，那么：
+#   · 它从来没被编译过 —— 里面的错误、笔误、过期 API 一次都没被检查
+#   · 它不在 clang-tidy 的受检范围里（那边只列 .cpp）
+#   · 但它**看起来**是代码，所以读代码的人会以为它在起作用
+#
+# 本项目有 3 个这样的文件，合计 **14309 行**：
+#   Includes/Roboto-Regular.h   14026 行  旧的字体资源；现役字体是 OPPOSans
+#   OpenGL.h                       243 行  被 ObjectDrawManager 取代的旧 ESP 实现
+#   Menu/get_device_api_level_inlines.h  40 行  NDK 头文件的内联片段
+#
+# 其中 `OpenGL.h` 是第 131 轮刚发现的：它连「有没有人 include」这件事
+# 都没人查过，所以它那 243 行 wallhack / 彩虹着色器代码，
+# 在 130 轮里**一次都没被看过**。
+#
+# 这里不删它们（删不删是产品决定，不是门禁该做的），
+# 但要**记下来**并且挡住新增 —— 否则「没人看」这件事永远没人知道。
+$knownDeadHeaders = @('Roboto-Regular.h', 'OpenGL.h', 'get_device_api_level_inlines.h')
+$ownHeaders = $ownSource | Where-Object { $_ -like '*.h' } | ForEach-Object { Split-Path $_ -Leaf }
+$allIncludeText = ($files | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+$deadHeaders = $ownHeaders | Where-Object {
+    $name = $_
+    $knownDeadHeaders -notcontains $name -and
+    $allIncludeText -notmatch ('#\s*include\s*[<"][^>"]*' + [regex]::Escape($name) + '[>"]')
+}
+
 $hits = @()
+
+if ($deadHeaders) {
+    $hits += [pscustomobject]@{
+        File = '(死代码)'
+        Line = 0
+        Rule = 'X: 这个头文件**没有任何文件 include** —— 它从没被编译过，也不在 clang-tidy 范围内。删掉，或确认它确实是现役的'
+        Text = ($deadHeaders -join ', ')
+    }
+}
 
 foreach ($f in $files) {
     $lines = Get-Content -Encoding UTF8 $f.FullName

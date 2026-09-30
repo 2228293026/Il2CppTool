@@ -546,6 +546,43 @@ Test-Rule 'W 扫描范围要含 jni 根目录的 .h' {
     return $true
 } $covAll '.ci/check-ui-patterns.ps1'
 
+# ---- 30. 规则 X：把「新增的孤儿头文件」复现出来（第 132 轮）----
+#
+# 这一条不能走 `Test-Rule`：那个函数的注入方式是**改一个已存在的文件**，
+# 而规则 X 的违规形态是**多出一个没人 include 的新文件** ——
+# 还原要删掉它，`Test-Rule` 的「写回原始字节」管不到新文件。
+#
+# 所以这里手写，但**按同样的契约**报进 $script:results：
+# 注入成功 / 注入后变红 / 还原后变绿，三条都要验。
+# 只跑「造个文件看看红不红」是不够的 ——
+# 那样的话，规则 X 完全可以一直在报红，而没人发现。
+$xCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+$probePath = Join-Path $root 'app/src/main/jni/Tool/ZZOrphan.h'
+Write-Host "[自检] 临时造一个孤儿头文件: $probePath"
+$injectedX = $false
+$rcBadX = 0
+$rcGoodX = 0
+try {
+    [IO.File]::WriteAllText($probePath, "#pragma once`r`nint zzOrphan();`r`n",
+        (New-Object Text.UTF8Encoding($false)))
+    $injectedX = $true
+    $rcBadX = & $xCheck
+}
+finally {
+    Remove-Item $probePath -Force -ErrorAction SilentlyContinue
+}
+$rcGoodX = & $xCheck
+$script:results += [pscustomobject]@{
+    Name        = 'X 没人 include 的头文件要报出来'
+    Injected    = $injectedX
+    RedOnBad    = ($rcBadX -ne 0)
+    ExpectRed   = $true
+    GreenAfter  = ($rcGoodX -eq 0)
+    Ok          = ($injectedX -and ($rcBadX -ne 0) -and ($rcGoodX -eq 0))
+}
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
