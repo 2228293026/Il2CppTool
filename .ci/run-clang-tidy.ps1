@@ -23,6 +23,19 @@ $ndk = $env:NDK_PATH
 if (-not $ndk) { throw 'NDK_PATH 未设置，请先解析 NDK' }
 
 # 受检文件：只含我们自己写的 .cpp
+#
+# 第 129 轮把剩下 6 个补上了。这个列表**曾经只覆盖 44.9%** 的代码：
+# `Tool/ClassesTab.cpp`（5683 行，全项目最大的文件）、
+# `Main.cpp`（整个渲染循环 + 配置读写）都不在里面 ——
+# 而 clang-tidy 是**唯一**能发现 bugprone/cert 类问题
+# （空指针解引用、读了没初始化的值…）的检查。
+#
+# 也就是说：我在前十几轮里往 ClassesTab.cpp 写的那些代码，
+# 一直**没人看着**。这和第 101 轮（UI 门禁漏了整个 Il2cpp 目录）
+# 是同一个形状，只是这次漏的是最大的那个文件。
+#
+# `KittyMemory/*` 故意**不加**：那是 vendored 的第三方代码，
+# 和 imgui/asmjit/frida-gum/xdl/nlohmann 一样，不归我们修。
 $targets = @(
     'Includes/Logger.cpp',
     'Includes/Utils.cpp',
@@ -32,9 +45,28 @@ $targets = @(
     'Tool/Unity.cpp',
     'Tool/Util.cpp',
     'Tool/Tool.cpp',
+    'Tool/ChangeLog.cpp',
+    'Tool/ClassesTab.cpp',
+    'Tool/Patcher.cpp',
+    'Tool/PopUpSelector.cpp',
+    'Tool/SelfCheck.cpp',
     'Il2cpp/il2cpp-class.cpp',
-    'Il2cpp/Il2cpp.cpp'
+    'Il2cpp/Il2cpp.cpp',
+    'Main.cpp'
 ) | ForEach-Object { Join-Path $jni $_ }
+
+# 列表是**手写**的，所以它一定会漂移：新建一个 .cpp 而忘了加进来，
+# 那个文件就又静默地不被检查了。直接对着磁盘核一遍。
+$ownDir = Join-Path $jni 'KittyMemory'
+$ownCpp = Get-ChildItem $jni -Recurse -Include *.cpp -File |
+    Where-Object { $_.FullName -notmatch 'imgui|asmjit|Frida|Dobby|xdl|nlohmann|KittyMemory' } |
+    ForEach-Object { $_.FullName.Substring($jni.Length + 1) -replace '\\', '/' } |
+    Sort-Object
+$listed = $targets | ForEach-Object { $_.Substring($jni.Length + 1) -replace '\\', '/' }
+$uncovered = $ownCpp | Where-Object { $listed -notcontains $_ }
+if ($uncovered) {
+    throw "这些项目自己的 .cpp 没进受检列表（clang-tidy 看不到它们）: $($uncovered -join ', ')"
+}
 
 $missing = $targets | Where-Object { -not (Test-Path $_) }
 if ($missing) { throw "找不到源文件: $($missing -join ', ')" }
@@ -115,15 +147,31 @@ if ([string]::IsNullOrWhiteSpace($output)) {
 }
 
 # 只保留指向我们自己源文件的告警（第三方头文件里的不进来）
-$projectPattern = '(Includes|Menu|Tool|Il2cpp)[/\\][A-Za-z0-9_.-]*\.(cpp|h):\d+:\d+: warning:'
+#
+# `Main\.cpp` 必须在里面（第 129 轮）：它在 **jni 根目录**下，
+# 不带 `Includes/`、`Tool/` 这样的前缀，而旧模式只认那四种 ——
+# 于是 Main.cpp 明明进了受检列表，它的告警却被这条模式**整个丢掉**。
+# 那种「分析了半天、结果没人看」比不分析更糟：门禁显示覆盖率上去了，
+# 实际没人在看。
+$projectPattern = '(?:[A-Za-z0-9_./\\-]*[/\\])?(?:Includes|Menu|Tool|Il2cpp)[/\\][A-Za-z0-9_.-]*\.(cpp|h):\d+:\d+: warning:|^Main\.cpp:\d+:\d+: warning:'
 $findings = ($output -split "`r?`n") | Where-Object {
-    $_ -match $projectPattern -and $_ -notmatch 'imgui[/\\]|asmjit[/\\]|frida-gum|xdl[/\\]|nlohmann[/\\]'
+    $_ -match $projectPattern -and $_ -notmatch 'imgui[/\\]|asmjit[/\\]|frida-gum|xdl[/\\]|nlohmann[/\\]|KittyMemory'
 }
 
 $baselineFile = Join-Path $PSScriptRoot 'clang-tidy-baseline.txt'
 $known = @()
 if (Test-Path $baselineFile) {
-    $known = Get-Content -Encoding UTF8 $baselineFile | Where-Object { $_.Trim() }
+    # **必须**跳过 `#` 开头的行（第 129 轮）。
+    #
+    # baseline 文件带了一段说明「这 45 条是怎么分类、为什么抑制」的注释。
+    # 而这里原来只按「非空」过滤，于是 37 行注释被当成 37 条已知告警 ——
+    # 报出来是「baseline 82 条（45+37），新增 0 条」。
+    #
+    # 那是**假绿**：注释不可能匹配任何告警，于是「新增」永远算 0。
+    # 一份带注释的 baseline 会把「新增 = 失败」这条门禁整个废掉，
+    # 而且没有任何人会发现 —— 除非真的去数那个 82。
+    $known = Get-Content -Encoding UTF8 $baselineFile |
+        Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }
 }
 
 $keys = $findings | ForEach-Object {

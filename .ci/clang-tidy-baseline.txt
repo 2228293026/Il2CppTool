@@ -1,12 +1,50 @@
-Il2cpp/il2cpp-class.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
-Il2cpp/il2cpp-class.cpp|warning: narrowing conversion from 'uintptr_t' (aka 'unsigned long') to signed type 'mapped_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
+# clang-tidy 存量告警
+#
+# 门禁策略：**新增告警 = 失败**。这个文件是「已确认无害的存量」。
+#
+# 注意：**以 # 开头的行是注释，不算已知告警**（加载时会被跳过）。
+# 之前这里只按「非空」过滤，于是注释被当成了已知告警 ——
+# 报出来「baseline 82 条（45+37），新增 0 条」，那是**假绿**：
+# 注释不可能匹配任何告警，于是「新增 = 失败」这条门禁整个被废掉。
+#
+# ---- 第 129 轮：从 29 条涨到 50 条，这是**抑制增加**，不是修复 ----
+#
+# 涨上去的原因只有一个：受检文件从 10 个加到 16 个，而新增的 6 个
+# （ClassesTab.cpp / Main.cpp / ChangeLog.cpp / Patcher.cpp /
+#   PopUpSelector.cpp / SelfCheck.cpp）**从来没被分析过**。
+# 这不是「新代码有 bug」，是「老代码第一次被看见」。
+#
+# 逐类说明（为什么是抑制而不是修）：
+#
+#   cert-err33-c（约 55 处）
+#       基本都是 `if (ImGui::BeginTabItem(...))` 这类 —— 界面控件的返回值
+#       故意不用。逐个改成 `(void)` 或包一层纯属噪音。
+#   bugprone-assignment-in-if-condition
+#       `if ((currentlyOpened = ImGui::BeginTabItem(...)))` —— 记下这个
+#       页签是不是开着，同时当条件用。这是本项目一贯的写法，**故意的**。
+#   bugprone-narrowing-conversions
+#       `size_t` -> `double`（printf 的 %zu/%.1f）、`ImGuiID` -> `int`。
+#       全项目成片出现，改一遍是一次和本问题无关的大重构。
+#   bugprone-empty-catch
+#       两个都是**刻意的最后一道边界**，而且都在渲染路径上：
+#         ChangeLog.cpp    记一条流水；注释写明「丢一条远比把渲染线程带崩好」
+#         ClassesTab.cpp   FreeHandle 的兜底
+#       把 catch 删掉会让这里**更容易**崩，不是更好。
+#   cert-err58-cpp（poper 静态存储期初始化）
+#       构造只存一个默认值、不分配 —— 现实里不会抛。
+#       要动它得改这个全局对象的用法，是一次单独的改造。
+#
+# 换句话说：**抑制增加 21 条，换来覆盖率从 44.9% 到 88%**。
+# 那是划算的 ——「没被看过的代码」比「已知的存量」危险得多。
+
 Il2cpp/Il2cpp.cpp|warning: declaration uses identifier '_il2cpp_type_is_byref', which is reserved in the global namespace [bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp]
 Il2cpp/Il2cpp.cpp|warning: empty catch statements hide issues; to handle exceptions appropriately, consider re-throwing, handling, or avoiding catch altogether [bugprone-empty-catch]
 Il2cpp/Il2cpp.cpp|warning: initialization of 'pattern' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
 Il2cpp/Il2cpp.cpp|warning: macro argument should be enclosed in parentheses [bugprone-macro-parentheses]
 Il2cpp/Il2cpp.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
-Il2cpp/Il2cpp.cpp|warning: potentially unintended semicolon [bugprone-suspicious-semicolon]
 Il2cpp/Il2cpp.cpp|warning: switching on non-enum value without default case may not cover all cases [bugprone-switch-missing-default-case]
+Il2cpp/il2cpp-class.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
+Il2cpp/il2cpp-class.cpp|warning: narrowing conversion from 'uintptr_t' (aka 'unsigned long') to signed type 'mapped_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
 Includes/Logger.cpp|warning: do not define a C-style variadic function; consider using a function parameter pack or currying instead [cert-dcl50-cpp]
 Includes/Logger.cpp|warning: initialization of 'Buf' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
 Includes/Logger.cpp|warning: initialization of 'Filter' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
@@ -14,16 +52,38 @@ Includes/Logger.cpp|warning: initialization of 'LineOffsets' with static storage
 Includes/Logger.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
 Includes/Logger.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
 Includes/Utils.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
+Main.cpp|warning: initialization of 'initialStyle' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
+Main.cpp|warning: initialization of 'title' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
+Main.cpp|warning: iteration of pointers is nondeterministic [bugprone-nondeterministic-pointer-iteration-order]
+Main.cpp|warning: narrowing conversion from 'int' to 'float' [bugprone-narrowing-conversions]
+Main.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
 Menu/ImGui.cpp|warning: initialization of 'initialScreenSize' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
 Menu/ImGui.cpp|warning: narrowing conversion from 'EGLint' (aka 'int') to 'float' [bugprone-narrowing-conversions]
+Tool/ChangeLog.cpp|warning: empty catch statements hide issues; to handle exceptions appropriately, consider re-throwing, handling, or avoiding catch altogether [bugprone-empty-catch]
+Tool/ChangeLog.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'difference_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
+Tool/ChangeLog.cpp|warning: narrowing conversion from 'unsigned long' to signed type 'difference_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
+Tool/ChangeLog.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
+Tool/ClassesTab.cpp|warning: an assignment within an 'if' condition is bug-prone [bugprone-assignment-in-if-condition]
+Tool/ClassesTab.cpp|warning: empty catch statements hide issues; to handle exceptions appropriately, consider re-throwing, handling, or avoiding catch altogether [bugprone-empty-catch]
+Tool/ClassesTab.cpp|warning: initialization of 'poper' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
+Tool/ClassesTab.cpp|warning: iteration of pointers is nondeterministic [bugprone-nondeterministic-pointer-iteration-order]
+Tool/ClassesTab.cpp|warning: multilevel pointer conversion from 'Il2CppString **' to 'void *', please use explicit cast [bugprone-multi-level-implicit-pointer-conversion]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'double' to 'float' [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'ImGuiID' (aka 'unsigned int') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'int' to 'float' [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'difference_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'size_type' (aka 'unsigned long') to 'double' [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'size_type' (aka 'unsigned long') to signed type 'difference_type' (aka 'long') is implementation-defined [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: narrowing conversion from 'size_type' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
+Tool/ClassesTab.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
 Tool/ObjectDrawManager.cpp|warning: empty catch statements hide issues; to handle exceptions appropriately, consider re-throwing, handling, or avoiding catch altogether [bugprone-empty-catch]
 Tool/ObjectDrawManager.cpp|warning: initialization of 'screenCenter' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
 Tool/ObjectDrawManager.cpp|warning: narrowing conversion from 'double' to 'float' [bugprone-narrowing-conversions]
 Tool/ObjectDrawManager.cpp|warning: narrowing conversion from 'size_t' (aka 'unsigned long') to signed type 'int' is implementation-defined [bugprone-narrowing-conversions]
 Tool/ObjectDrawManager.cpp|warning: rand() has limited randomness; use C++11 random library instead [cert-msc30-c,cert-msc50-cpp]
-Tool/Tool.cpp|warning: if with identical then and else branches [bugprone-branch-clone]
+Tool/Patcher.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
+Tool/SelfCheck.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
 Tool/Tool.cpp|warning: initialization of 'visited' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
 Tool/Tool.cpp|warning: narrowing conversion from 'int' to 'float' [bugprone-narrowing-conversions]
 Tool/Tool.cpp|warning: sorting pointers is nondeterministic [bugprone-nondeterministic-pointer-iteration-order]
 Tool/Tool.cpp|warning: the value returned by this function should not be disregarded; neglecting it may lead to errors [cert-err33-c]
-Tool/Util.cpp|warning: initialization of 'fpsTracker' with static storage duration may throw an exception that cannot be caught [cert-err58-cpp]
