@@ -56,6 +56,34 @@ $files = foreach ($d in $dirs) {
 # 注入的缺陷正好在被漏掉的那个文件里。
 $rootCpp = Join-Path $root 'app/src/main/jni'
 $files += Get-ChildItem $rootCpp -Filter *.cpp -File
+# 根目录下的 **.h** 也要扫（第 131 轮）。
+#
+# 上面那行只取 `*.cpp`，于是根目录的 `OpenGL.h`（243 行，ESP / wallhack
+# 那套着色器和开关都在里面）对下面每一条规则都是**不可见**的。
+# 同一个根目录、同一个理由，只补一半 —— 这就是「补了 A 路径没补 B 路径」
+# （第 58 轮）换了个方向又出现一次。
+$files += Get-ChildItem $rootCpp -Filter *.h -File
+
+# ---- 受检范围必须**覆盖全部**项目源文件（第 131 轮）----
+#
+# `$dirs` 是手写的，所以它一定会漂移：新建一个目录、或在 jni 根目录放一个
+# 文件而忘了改这里，那一片代码就静默地不被检查了 ——
+# 而门禁照样全绿。
+#
+# 第 90/101/129 轮都是同一类：漏掉的是**一整个目录 / 整个最大文件**，
+# 三次都是靠「反向验证注入的缺陷正好在被漏掉的文件里」才发现的。
+# 那说明它不能靠人记得，所以这里直接对着磁盘核一遍。
+$skipPattern = 'imgui|asmjit|Frida|Dobby|xdl|nlohmann|KittyMemory'
+$ownSource = Get-ChildItem (Join-Path $root 'app/src/main/jni') -Recurse -Include *.cpp, *.h -File |
+    Where-Object { $_.FullName -notmatch $skipPattern } |
+    ForEach-Object { $_.FullName.ToLower() }
+$scanned = $files | ForEach-Object { $_.FullName.ToLower() }
+$unscanned = $ownSource | Where-Object { $scanned -notcontains $_ }
+if ($unscanned) {
+    Write-Host '门禁扫描范围不完整：这些项目源文件没被任何规则看到：'
+    $unscanned | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    $script:gateCoverageFailed = $true
+}
 
 $hits = @()
 
@@ -1090,9 +1118,19 @@ if (Test-Path $workflow) {
     }
 }
 
-if ($hits.Count -eq 0) {
+if ($hits.Count -eq 0 -and -not $script:gateCoverageFailed) {
     if (-not $Quiet) { Write-Host "界面模式检查通过（SameLine 宽度 / 每帧深拷贝 / workflow 缩进）" -ForegroundColor Green }
     exit 0
+}
+
+# 扫描范围不完整**必须**让门禁红（第 131 轮）。
+#
+# 这一点专门写出来，是因为它先被漏掉过一次：我加了这个检查、
+# 设了 `$script:gateCoverageFailed`，却没接进上面的判定 ——
+# 于是它「跑过了」，而门禁照样绿。又一次「存在 ≠ 生效」。
+if ($script:gateCoverageFailed -and $hits.Count -eq 0) {
+    Write-Host "界面模式检查失败：扫描范围不完整（见上面的红字）" -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "界面模式检查发现 $($hits.Count) 处：" -ForegroundColor Red

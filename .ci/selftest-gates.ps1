@@ -525,6 +525,27 @@ Test-Rule 'V 枚举下拉要挡' {
     return $true
 } $vCheck1 'app/src/main/jni/Tool/PopUpSelector.cpp'
 
+# ---- 29. 门禁扫描范围必须覆盖全部项目源文件（第 131 轮）----
+#
+# 这是第 90 / 101 / 129 轮同一个形状的第四次：门禁绿着，
+# 但有一片代码它从来没看过（这次是 jni 根目录的 OpenGL.h）。
+$covAll = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'W 扫描范围要含 jni 根目录的 .h' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'Get-ChildItem \$rootCpp -Filter \*\.h -File') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = $ls[$i] -replace '\*\.h', '*.nomatch'
+    [IO.File]::WriteAllText((Join-Path $root '.ci/check-ui-patterns.ps1'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+    return $true
+} $covAll '.ci/check-ui-patterns.ps1'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
