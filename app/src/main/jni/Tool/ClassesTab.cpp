@@ -219,13 +219,28 @@ struct BulkResult
     }
     void Finish()
     {
-        done.store(true, std::memory_order_relaxed);
+        // **release**，不是 relaxed（第 133 轮）。
+        //
+        // 这一行是「工作线程 -> 界面线程」的交接点：界面线程看到
+        // done==true 之后，就会去读 ok / failed。
+        //
+        // 而 relaxed **不建立 happens-before**：不同原子对象的操作之间
+        // 没有顺序保证，arm64 这种弱内存序平台上完全允许界面线程
+        // 先看见 done==true、却读到还没更新的 ok/failed。
+        //
+        // 后果不是崩溃，是**给用户看一个假数**——
+        // 「成功 0 个，失败 0 个」，而实际上有 12 个成功。
+        // 讽刺的是这正是第 121 轮要消灭的那类问题：
+        // 界面上一个看起来很权威、实际不对的数字。
+        done.store(true, std::memory_order_release);
     }
     // 界面线程把结果说清楚。**一次说完**，之后就淡出，
     // 免得一条过期消息一直挂在界面上。
     void Report()
     {
-        if (!done.load(std::memory_order_relaxed))
+        // **acquire**：和上面的 release 配成一对。
+        // 读到 done==true 之后，ok / failed 一定已经是最终值。
+        if (!done.load(std::memory_order_acquire))
         {
             return;
         }

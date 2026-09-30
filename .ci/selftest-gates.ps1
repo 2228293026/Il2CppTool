@@ -583,6 +583,40 @@ $script:results += [pscustomobject]@{
     Ok          = ($injectedX -and ($rcBadX -ne 0) -and ($rcGoodX -eq 0))
 }
 
+# ---- 31. 规则 Y：把「交接标志退回 relaxed」复现出来（第 133 轮）----
+#
+# 还要验**不误报**：Dump().cancelRequested 也是 relaxed，
+# 但它只是个「请停下」的单向信号，别的数据不靠它发布 -> 那是**对的**。
+# 只验「能红」的门禁会把正确的写法也一起改掉。
+$yCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'Y 交接标志不许 relaxed' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match 'done\.store\(true, std::memory_order_release\)') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = $ls[$i] -replace 'memory_order_release', 'memory_order_relaxed'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $yCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+Test-Rule 'Y 请求标志 relaxed 不误报' {
+    param($t)
+    # 往 Tool.cpp 里塞一个**请求**风格的 relaxed 标志。
+    # `Dump().cancelRequested` 一直是 relaxed 而没人去改它，就是这一类。
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $ls.Add('void zzCancelProbe(std::atomic<bool> &cancelProbe) {')
+    $ls.Add('    cancelProbe.store(true, std::memory_order_relaxed);')
+    $ls.Add('}')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/Tool.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $yCheck 'app/src/main/jni/Tool/Tool.cpp' -ExpectRed $false
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

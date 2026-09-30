@@ -1121,6 +1121,42 @@ foreach ($g in $needBrowserGuard) {
     }
 }
 
+# ---- 模式 Y：跨线程「交接标志」不许用 relaxed ----
+#
+# 第 133 轮。`BulkResult` 里
+#     done.store(true, relaxed)     工作线程
+#     done.load(relaxed)            界面线程 -> 接着读 ok / failed
+# relaxed **不建立 happens-before**：不同原子对象之间没有顺序保证，
+# arm64 这种弱内存序平台上完全允许界面线程先看见 done==true、
+# 却读到还没更新的 ok/failed -> 界面上显示「成功 0 个，失败 0 个」。
+#
+# 这不是崩溃，是**给用户看一个假数** —— 讽刺的是正是第 121 轮
+# 想消灭的那类问题（「界面上一个看起来权威、实际不对的数字」）。
+#
+# 判据（按名字区分，因为「这个标志到底盖着哪些数据」没法静态推出来）：
+#   交接标志 done / ready / finished / completed  -> 必须 release / acquire
+#   请求标志 cancel / stop / quit / request       -> relaxed 是对的
+#
+# 请求标志为什么对：它只是个「请停下」的单向信号，别的数据**不靠它发布**，
+# 工作线程轮询它、最终会看到就够了。而 relaxed 原子量按标准保证
+# 每个对象自身的修改顺序和最终可见 —— 对这种用法正是最省的选择。
+# （Dump().cancelRequested 就是这一类，别把它一起改掉。）
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        $m = [regex]::Match($t, '\b(done|ready|finished|completed)\.store\(\s*true\s*,\s*std::memory_order_relaxed')
+        if (-not $m.Success) { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'Y: 交接标志用 relaxed —— 读到这个标志之后的那些数据可能还是旧值（界面上会显示假数）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
