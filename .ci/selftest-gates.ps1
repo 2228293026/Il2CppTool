@@ -703,6 +703,29 @@ Test-Rule 'AC 跨线程消息不许指向临时缓冲' {
     return $true
 } $acCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 36. 规则 AC 第二面：公开返回值不许退回裸指针（第 138 轮）----
+#
+# 这是**独立**的一条要求，不能靠第一条顺带抓到：
+#   一条管「字段赋值」，一条管「公开 API 的返回类型」。
+# 第 111/125 轮那条「每个要求都要能单独红」在这里又用上了。
+#
+# 注意我第一次写这行时**漏了变量名的 `$`**（写成了 `= {`），
+# 于是它变成了给上一行的值重新赋值 —— 而 `$acCheck2` 从来没被定义过，
+# 于是 721 行那一句调用的是**别的变量**。
+# 报错倒不会立刻出现（PowerShell 对未定义变量当 null），
+# 只是这条检查从来没真正跑过 —— 而自检列表里它显示「通过」。
+$acCheck2 = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AC 公开 API 不许返回裸指针' {
+    param($t)
+    if ($t.IndexOf('std::string GetFilterFailure();') -lt 0) { return $false }
+    $out = $t.Replace('std::string GetFilterFailure();', 'const char *GetFilterFailure();')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.h'), $out,
+        (New-Object Text.UTF8Encoding($true)))
+    return $true
+} $acCheck2 'app/src/main/jni/Tool/ClassesTab.h'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

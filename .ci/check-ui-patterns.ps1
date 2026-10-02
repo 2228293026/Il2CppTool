@@ -1350,8 +1350,30 @@ foreach ($fn in ($functionsWithBegin | Sort-Object -Unique)) {
 #
 # 形状：`const char *`（或 `char *`）类型的状态字段被赋值，
 # 且右值不是字面量 / nullptr / 别的裸指针转发。
+$acRaw = ($files | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+
+# 第 138 轮：`GetFilterFailure()` 已经改成返回 std::string，
+# 那个裸指针字段现在**只在 FilterState 内部**流通。
+# 如果哪天它又变成了某个**公开**返回值，说明有人把指针又递出去了 ——
+# 那正是第 137 轮要根治的东西，不该悄悄回来。
+#
+# 这一段**必须在循环外面**：第一版把它塞进了赋值扫描的循环体里，
+# 于是它前面任何一句 continue 都能让它整段跳过 —— 规则「看着在跑、
+# 其实从没执行过」。同样的错第 15 次：存在 ≠ 生效。
+if ($acRaw -match 'const\s+char\s*\*\s*\w*Get\w*Failure\s*\(\s*\)\s*;') {
+    $hits += [pscustomobject]@{
+        File = 'ClassesTab.h'
+        Line = 0
+        Rule = 'AC: 又把失败原因以裸指针返回了 —— 调用方拿到的是「出了锁就没人管」的指针，第 138 轮已改成 std::string'
+        Text = 'const char *Get...Failure()'
+    }
+}
+
 foreach ($f in $files) {
-    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    # **头文件也要扫**（第 138 轮）。
+    # 第一版只扫 .cpp，于是「公开返回值改回裸指针」这种注入**抓不到** ——
+    # 因为那行声明在 .h 里。而「公开 API 递出裸指针」恰恰是最该抓的一处。
+    if ($f.Name -notin @('ClassesTab.cpp', 'ClassesTab.h')) { continue }
     $rawTextCache = Get-Content -Encoding UTF8 $f.FullName -Raw
     $lines = Get-Content -Encoding UTF8 $f.FullName
     for ($i = 0; $i -lt $lines.Count; $i++) {

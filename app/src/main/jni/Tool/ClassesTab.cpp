@@ -3699,17 +3699,22 @@ void ClassesTab::Draw(int index, bool closeable)
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.f, 0.9f, 0.4f, 1.f), "筛选中…");
         }
-        else if (const char *filterFailure = GetFilterFailure(); filterFailure != nullptr)
+        else
         {
-            // 上一轮筛选失败了。明确说出来，而不是让用户对着一个
-            // 空列表 + 一句「没有匹配」怀疑是自己关键字打错了。
-            //
-            // 「重试」另起一行：跟在失败原因后面的话，原因一长按钮就被
-            // 顶出屏幕 —— 而它恰恰是用户此刻最想按的那个。
-            ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "筛选失败: %s", filterFailure);
-            if (ImGui::SmallButton("重试"))
+            // 取**副本**（第 137/138 轮），不是后台线程那块内存的指针。
+            const std::string filterFailure = GetFilterFailure();
+            if (!filterFailure.empty())
             {
-                FilterClasses(filter);
+                // 上一轮筛选失败了。明确说出来，而不是让用户对着一个
+                // 空列表 + 一句「没有匹配」怀疑是自己关键字打错了。
+                //
+                // 「重试」另起一行：跟在失败原因后面的话，原因一长按钮就被
+                // 顶出屏幕 —— 而它恰恰是用户此刻最想按的那个。
+                ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f), "筛选失败: %s", filterFailure.c_str());
+                if (ImGui::SmallButton("重试"))
+                {
+                    FilterClasses(filter);
+                }
             }
         }
         if (ImGui::Button(filterBuffer, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)) && !Keyboard::IsOpen())
@@ -5680,14 +5685,17 @@ bool ClassesTab::IsFilterPending()
     return !filterState->hasResult && filterState->resultGen != filterState->requestGen;
 }
 
-const char *ClassesTab::GetFilterFailure()
+std::string ClassesTab::GetFilterFailure()
 {
     if (!filterState)
     {
-        return nullptr;
+        return {};
     }
     std::lock_guard guard(filterState->mutex);
-    return filterState->failure;
+    // 返回**副本**，指针所指的内容不在锁的保护范围内。
+    // 底层字段只能是字面量（规则 AC 守着），所以复制是安全的，
+    // 而调用方拿到的是一个和后台线程彻底无关的值。
+    return filterState->failure ? filterState->failure : "";
 }
 
 bool ClassesTab::PollFilterResult()

@@ -262,9 +262,19 @@ struct ClassesTab
     bool PollFilterResult();
     // 是否还有未完成的筛选请求。UI 用它显示「筛选中…」。
     bool IsFilterPending();
-    // 上一轮筛选的失败原因；nullptr = 成功/未跑过。
+    // 上一轮筛选的失败原因；空 = 成功/未跑过。
     // UI 用它把「空列表」和「筛选失败」区分开。
-    const char *GetFilterFailure();
+    //
+    // **返回 std::string 而不是 const char***（第 137/138 轮）。
+    // 原来返回裸指针：函数在锁内把指针取出来就放锁了，调用方拿到的
+    // 是一根「指向别人的东西」的针，安全性完全取决于每个调用方都在
+    // 同一句表达式里用掉它 —— 现在只有一个调用方符合这个前提，
+    // 下一个就不一定了。
+    //
+    // 而且底层那个字段本来就只能是字符串**字面量**（静态存储期），
+    // 才使它**恰好**没出事。把这个约定直接编码进类型里，
+    // 就不需要「记得别改」了。
+    std::string GetFilterFailure();
     // 后台筛选用的共享状态。用 shared_ptr 是为了让工作线程即使在 tab
     // 被销毁之后才跑完，也仍然持有一份有效内存 —— 否则就是 use-after-free。
     struct FilterState;
