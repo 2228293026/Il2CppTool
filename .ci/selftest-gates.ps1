@@ -662,6 +662,29 @@ Test-Rule 'AA 早退不许绕过状态清理' {
     return $true
 } $aaCheck 'app/src/main/jni/Tool/PopUpSelector.cpp'
 
+# ---- 34. 规则 AB：把「记了没人读」复现出来（第 136 轮）----
+#
+# 注意删的是**最后一个** Report（Draw 里的那个）。
+# 删 ClassViewer 里的那个不会变红 —— 因为 Begin 就在同一个函数里，
+# 而那一个 Report 每帧读一次，两个 Begin 天然共用它。
+# 所以这条规则只能按**函数**统计，不能比全文件总数（第 136 轮踩过）。
+$abCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AB 记了结果必须有地方读' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $idx = -1
+    for ($k = $ls.Count - 1; $k -ge 0; $k--) {
+        if ($ls[$k] -match '^\s*g_bulkResult\.Report\(\);\s*$') { $idx = $k; break }
+    }
+    if ($idx -lt 0) { return $false }
+    $ls.RemoveAt($idx)
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $abCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

@@ -1277,6 +1277,59 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AB：记一次结果的 Begin 必须有地方读出来（第 136 轮）----
+#
+# 第 121 轮我加了 `g_bulkResult`（Begin / Add / Finish / Report），
+# 给三个批量操作各记一次：取消追踪全部 / 追踪全部 / 恢复全部。
+# 但 `Report()` **只在一处**调过。
+#
+# 后果比「少报一个数」更阴：没被读出来的结果**积在 done 标志里**，
+# 等下次点别的按钮时和别的操作的结果**一起报出来**，
+# 而且贴在完全不相干的界面上 —— 用户会以为那是刚才那次操作的果。
+#
+# 也就是说「记了但没人读」不会消失，只会**攒着一次在错误的时机冒出来**。
+#
+# 形状：`Begin(` 的个数 > `Report()` 的个数。
+$bulkBegin = 0
+$bulkReport = 0
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $text = Get-Content -Encoding UTF8 $f.FullName -Raw
+    $bulkBegin  = ([regex]::Matches($text, 'g_bulkResult\.Begin\s*\(')).Count
+    $bulkReport = ([regex]::Matches($text, 'g_bulkResult\.Report\s*\(')).Count
+}
+# 注意：**不能**简单比 Begin 的个数和 Report 的个数。
+# 第一版就是这么写的，然后它把「修复」判成了违规 ——
+# 因为「取消追踪全部」和「追踪全部」的 Begin 在**同一个函数**里，
+# 而那个函数里只有**一个** Report()：它是每帧读一次「当前挂着的那一条」，
+# 两个 Begin 天然共用它。3 Begin / 2 Report 是对的。
+#
+# 真正要抓的是更窄的一种：**某个函数里有 Begin，却没有 Report** ——
+# 那才是「记了没人读」。所以下面按函数统计。
+$functionsWithBegin = @()
+$functionsWithReport = @()
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $cur = '<文件作用域>'
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(?:[\w:<>*&]+\s+)+([A-Za-z_]\w*(?:::\w+)*)\s*\([^;]*$') { $cur = $Matches[1] }
+        if ($t -match '^\s*g_bulkResult\.Begin\s*\(') { $functionsWithBegin += $cur }
+        if ($t -match '^\s*g_bulkResult\.Report\s*\(\s*\)\s*;') { $functionsWithReport += $cur }
+    }
+}
+foreach ($fn in ($functionsWithBegin | Sort-Object -Unique)) {
+    if ($functionsWithReport -notcontains $fn) {
+        $hits += [pscustomobject]@{
+            File = 'ClassesTab.cpp'
+            Line = 0
+            Rule = "AB: 函数 ``$fn`` 里记了批量结果却没有 Report —— 它会一直积着，在下一次别的操作之后贴错地方报出来"
+            Text = $fn
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

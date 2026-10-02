@@ -3812,6 +3812,21 @@ void ClassesTab::Draw(int index, bool closeable)
             if (disabled)
                 ImGui::EndDisabled();
 
+            // 「恢复全部」的结果也要说出来（第 136 轮）。
+            //
+            // 第 121 轮我给三个批量操作都加了 g_bulkResult，
+            // 但**只在一处**调了 Report()（第 3533 行那个「追踪全部」）。
+            // 于是「恢复全部」和「取消追踪全部」的结果永远积在 done 标志里
+            // 没人读 —— 而这三个恰恰是同一件事的三个入口。
+            //
+            // 后果很难发现：下次点别的按钮、或者再点一次「追踪全部」，
+            // 那条过期的「恢复全部：成功 N 个」会被**一起报出来**，
+            // 而且贴在完全不相干的界面上。用户会以为那是刚才那次操作的果。
+            //
+            // 放在按钮外面：结果在下一帧才可能有，
+            // 而 Report() 读过之后会清掉 done，同一个结果只会被说一次。
+            g_bulkResult.Report();
+
             if (ImGui::BeginPopup("ConfirmPopup"))
             {
                 ImGui::TextColored(ImVec4(0.8, 0.8, 0, 1), "WARNING: There's a high-risk of crash");
