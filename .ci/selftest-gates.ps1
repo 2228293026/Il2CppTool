@@ -642,6 +642,26 @@ Test-Rule 'Z 能力判定失败不许写缓存' {
     return $true
 } $zCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 33. 规则 AA：把「早退绕过状态清理」复现出来（第 135 轮）----
+$aaCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AA 早退不许绕过状态清理' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*auto callback = std::move\(lastCallback\);') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls.RemoveAt($i)
+    $ls.RemoveAt($i)      # lastCallback = nullptr;
+    $ls.RemoveAt($i)      # userData = nullptr;
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/PopUpSelector.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $aaCheck 'app/src/main/jni/Tool/PopUpSelector.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

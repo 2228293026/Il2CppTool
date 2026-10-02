@@ -1220,6 +1220,63 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AA：能力判定失败**不许**用早退绕过状态清理 ----
+#
+# 第 135 轮。第 126 轮在 `PopUpSelector::Update()` 里加的挡是这样的：
+#
+#     if (!Il2cpp::BrowserApiResolved()) {
+#         ImGui::TextColored(...);       "枚举列表画不出来"
+#         ImGui::EndPopup();
+#         return;                        // <-- 直接走人
+#     }
+#
+# 但 `lastCallback` 平时**只在 `Do()` 里清空**，而这条路径跳过了 `Do()`。
+# 后果不是这个弹窗关不掉（EndPopup 已经调了），而是：
+#     `Update()` 每帧都跑 -> `if (lastCallback)` 一直成立
+#     -> `Do()` 再也不会被调用 -> 那个「正在选值」的交互状态永远退不出来
+#     -> 用户以为界面卡住了
+#
+# 早退本身没错（它挡住了崩溃）。错的是**早退绕过了它负责的状态清理**。
+#
+# 形状：`if (!<能力判定>)` 的块里出现 `return;`，而该块**没有**任何
+# 对 `lastCallback` / `needOpen` / `userData` 的清理。
+foreach ($f in $files) {
+    if ($f.Name -ne 'PopUpSelector.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch '^if\s*\(\s*!\s*\w+(::\w+)*\s*\(\s*\)\s*\)') { continue }
+        $name = [regex]::Match($t, '!\s*(\w+(::\w+)*)').Groups[1].Value
+        if ($name -match '^(Empty|empty)$') { continue }
+        $depth = 0
+        $entered = $false
+        $hasReturn = $false
+        $hasCleanup = $false
+        for ($k = $i + 1; $k -lt $lines.Count; $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -notmatch '^(//|\*|/\*)') {
+                $depth += ([regex]::Matches($u, '\{')).Count - ([regex]::Matches($u, '\}')).Count
+            }
+            if (-not $entered -and $depth -gt 0) { $entered = $true }
+            if ($entered -and $depth -le 0) { break }
+            if (-not $entered -or $u -match '^(//|\*|/\*)') { continue }
+            if ($u -match '^\s*return\s*;') { $hasReturn = $true }
+            if ($u -match '\b(lastCallback|needOpen|userData)\s*=\s*(nullptr|""|\"\")') {
+                $hasCleanup = $true
+            }
+        }
+        if ($hasReturn -and -not $hasCleanup) {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'AA: 能力判定失败用早退绕过状态清理 —— lastCallback 一直是「已设置」，Update() 每帧走这条分支，交互状态永远退不出来'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

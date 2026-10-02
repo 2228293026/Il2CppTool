@@ -67,7 +67,25 @@ void PopUpSelector::Update()
                     {
                         ImGui::TextColored(ImVec4(1.f, 0.45f, 0.4f, 1.f),
                                            "这个 Unity 版本缺一部分符号，枚举列表画不出来");
+                        // **必须**把状态清掉（第 135 轮）。
+                        //
+                        // `lastCallback` 平时只在 `Do()` 里清空，而这里我直接
+                        // return 了 —— 于是它一直是「已设置」状态。
+                        // 后果不是这个弹窗关不掉（EndPopup 已经调了），
+                        // 而是**下一次点任何字段都会先走进这个分支**：
+                        // `Update()` 每帧都跑，`if (lastCallback)` 一直成立，
+                        // 而 `Do()` 再也不会被调用 —— 那个「正在选值」的
+                        // 交互状态永远退不出来，用户会以为界面卡住了。
+                        //
+                        // 顺序照抄 `Do()`（见头文件里那段注释）：
+                        // 先把回调摘出来再清空，免得链式选择被抹掉。
+                        auto callback = std::move(lastCallback);
+                        lastCallback = nullptr;
+                        userData = nullptr;
+                        ImGui::CloseCurrentPopup();
                         ImGui::EndPopup();
+                        LOGE("EnumSelector: 浏览路径符号不全，已取消这次选择");
+                        (void)callback;
                         return;
                     }
                     for (auto field : klass->getFields())
