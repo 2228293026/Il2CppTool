@@ -3806,9 +3806,26 @@ void ClassesTab::Draw(int index, bool closeable)
                                 LOGD("Done");
                             },
                             "RestoreAll",
-                            [processingFlag]()
+                            [this, processingFlag]()
                             {
+                                // 线程没起来：状态要退回去，**而且必须说出来**（第 139 轮）。
+                                //
+                                // 原来这里只有 `*processingFlag = false;`，
+                                // 于是界面上「恢复全部」的按钮恢复正常、
+                                // 进度条消失、**什么异常都没有** ——
+                                // 而实际效果是「一个方法都没恢复」。
+                                //
+                                // 用户会以为是自己点的时机不对，或者以为
+                                // 「本来就没有要恢复的东西」，于是**再点一次**。
+                                // 这种「静默什么都没发生」比报错更难查：
+                                // 报错至少有个人会去看日志。
                                 *processingFlag = false;
+                                processing = false;
+                                maxProgress = 0;
+                                progress = 0;
+                                g_bulkResult.Begin("恢复全部");
+                                g_bulkResult.Finish(); // 0 个成功 -> 「成功 0 个，失败 0 个」
+                                LOGE("RestoreAll: 无法创建后台线程，一个方法都没恢复");
                             });
                     }
                 }
@@ -3876,9 +3893,16 @@ void ClassesTab::Draw(int index, bool closeable)
                             LOGD("Done");
                         },
                         "HookToggle",
-                        [processingFlag]()
+                        [this, processingFlag]()
                         {
+                            // 同上（第 139 轮）：静默失败比报错更难查。
                             *processingFlag = false;
+                            processing = false;
+                            maxProgress = 0;
+                            progress = 0;
+                            g_bulkResult.Begin("追踪全部");
+                            g_bulkResult.Finish(); // 0 个成功 -> 「成功 0 个，失败 0 个」
+                            LOGE("HookToggle: 无法创建后台线程，一个方法都没追踪");
                         });
                     ImGui::CloseCurrentPopup();
                 }

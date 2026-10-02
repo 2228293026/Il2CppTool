@@ -24,6 +24,63 @@ $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# 备份目录必须在仓库外（否则备份文件本身会被门禁扫到），
+# 也不能放在系统 TEMP 里 —— CI 上多份并发跑会互相覆盖。
+#
+# 后缀用**路径本身**而不是哈希：
+#   · `[IO.Path]::GetHashCode` 在 PowerShell 里返回**空**（它不是静态属性，
+#     拿到的是方法组），于是目录名变成 `...stash-`，空尾巴；
+#   · `String.GetHashCode()` 在 .NET Core 里**每个进程都不一样**
+#     （随机化，为了防哈希碰撞攻击），跨进程就找不到上一次留下的备份了
+#     —— 而「跨进程」恰恰是这个机制的全部意义。
+# 把非法字符替掉就行，稳定、可读、还能一眼看出是哪份仓库。
+$stashRoot = Join-Path ([IO.Path]::GetTempPath()) ("il2cpp-selftest-stash-" + ($root -replace '[\\/:*?"<>|]', '_'))
+if (-not (Test-Path $stashRoot)) { [void](New-Item -ItemType Directory -Path $stashRoot -Force) }
+
+# ---- 上一次运行被打断过？先把被改坏的文件还原（第 139 轮）----
+#
+# 这个还原必须在**任何检查之前**跑：门禁要在被改坏的树上给出
+# 「这里有个真 bug」的结论，而不是对着自己上次留下的垃圾报错。
+function Repair-InjectedFiles {
+    if (-not (Test-Path $stashRoot)) { return 0 }
+    $n = 0
+    foreach ($p in Get-ChildItem $stashRoot -Filter *.path -File) {
+        $rel = [IO.File]::ReadAllText($p.FullName).Trim()
+        $bak = $p.FullName.Substring(0, $p.FullName.Length - 5)   # 去掉 '.path'
+        $target = Join-Path $root $rel
+        if (-not (Test-Path $bak)) { continue }
+        $bakBytes = [IO.File]::ReadAllBytes($bak)
+        $cur = if (Test-Path $target) { [IO.File]::ReadAllBytes($target) } else { @() }
+        # 长度不同就一定要写回去。
+        #
+        # 第一版这里写的是「长度不同就 skip」—— 想省掉逐字节比较，
+        # 结果**注入几乎总是会改行长**，于是这一条 skip 把整个机制废掉了：
+        # 反向验证时它一个文件都没还原，而我还在看别的地方。
+        # （和第 111/125 轮同一个形状：一条为了省事加的守卫，
+        #   恰好把「本该走的那条路」关上了。）
+        if ($cur.Length -ne $bakBytes.Length) {
+            [IO.File]::WriteAllBytes($target, $bakBytes)
+            Write-Host "  已还原本次之前被打断留下的注入：$rel"
+            $n++
+            continue
+        }
+        # 长度一样再比字节 —— 免得每次都白白碰一遍 mtime。
+        $same = $true
+        for ($i = 0; $i -lt $bakBytes.Length; $i++) {
+            if ($cur[$i] -ne $bakBytes[$i]) { $same = $false; break }
+        }
+        if ($same) { continue }
+        [IO.File]::WriteAllBytes($target, $bakBytes)
+        Write-Host "  已还原本次之前被打断留下的注入：$rel"
+        $n++
+    }
+    return $n
+}
+$repaired = Repair-InjectedFiles
+if ($repaired -gt 0) {
+    Write-Host "门禁自检：上一次运行被中断，已先还原 $repaired 个文件（否则检查的是自己留下的垃圾）"
+}
+
 $results = @()
 
 function Run-Command {
@@ -50,6 +107,18 @@ function Test-Rule {
     # UTF-8 BOM 弄丢 —— 而那正是第 4 条检查要防的东西：
     # 自检脚本自己会制造它要检出的故障。
     $beforeBytes = [IO.File]::ReadAllBytes($path)
+    # try/finally 只在**进程还活着**的时候有用。进程被杀掉（Ctrl+C、
+    # 任务管理器、CI 超时）时 finally 一次都不跑，文件就留在被改坏的
+    # 状态 —— 第 139 轮真的中了一次：`check-all.ps1` 被中断时正停在
+    # 规则 N 的注入阶段，`try` 被换成注释留在了 ClassesTab.cpp 里，
+    # 下一轮我还以为那是自己写的 bug，查了半天才发现是上一次跑的残留。
+    #
+    # 所以在**注入之前**把原始字节另存一份到磁盘。进程死了，
+    # 下一次运行时 `Repair-InjectedFiles` 会把它原样写回去。
+    # 备份目录必须在仓库外 —— 否则备份本身也会被门禁扫到。
+    $stash = Join-Path $stashRoot ($Target -replace '[\\/]', '__')
+    [IO.File]::WriteAllBytes($stash, $beforeBytes)
+    [IO.File]::WriteAllText($stash + '.path', $Target, (New-Object Text.UTF8Encoding($false)))
     $injected = $false
     $rcBad = 0
     $rcGood = 0
@@ -64,6 +133,13 @@ function Test-Rule {
     }
     finally {
         [IO.File]::WriteAllBytes($path, $beforeBytes)
+        # 这条已经还原完了，备份就没用了，留着只会让下次运行
+        # 以为「上一次被中断过」。
+        # 括号不能省：`Remove-Item $stash, $stash + '.path'` 会被
+        # PowerShell 解析成**三个**参数，于是每次都报
+        # 「A positional parameter cannot be found that accepts argument '+'」，
+        # 备份永远删不掉 —— 也就是「每次运行都以为上一次被中断过」。
+        Remove-Item $stash, ($stash + '.path') -Force -ErrorAction SilentlyContinue
     }
 
     $ok = $injected -and (($rcBad -ne 0) -eq $ExpectRed) -and ($rcGood -eq 0)
@@ -147,7 +223,7 @@ Test-Rule '源码编码（U+FFFD）' {
     $needle = 'constexpr int MAX_CLASSES = 500;'
     if (-not $t.Contains($needle)) { return $false }
     [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
-        $t.Replace($needle, $needle + " // �"), (New-Object Text.UTF8Encoding($false)))
+        $t.Replace($needle, $needle + " // `u{FFFD}"), (New-Object Text.UTF8Encoding($false)))
     return $true
 } $encCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
@@ -725,6 +801,34 @@ Test-Rule 'AC 公开 API 不许返回裸指针' {
         (New-Object Text.UTF8Encoding($true)))
     return $true
 } $acCheck2 'app/src/main/jni/Tool/ClassesTab.h'
+
+# ---- 37. 规则 AD：把「静默失败」复现出来（第 139 轮）----
+#
+# 这条规则自己第一版是**完全静默**的：我把捕获列表写成 `^\[\w+\]`，
+# 而那两处的真身是 `[this, processingFlag]()` —— 一个都匹配不上。
+# 手工注入时立刻发现「删干净了却不红」。
+$adCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AD 线程没起来必须留痕迹' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $hit = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*g_bulkResult\.Begin\("恢复全部"\);\s*$') { $hit = $k; break }
+    }
+    if ($hit -lt 0) { return $false }
+    # 删掉 Begin / Finish / LOGE 三行（后面两行 + 可能夹着的注释行）
+    $ls.RemoveAt($hit)
+    for ($g = 0; $g -lt 3 -and $hit -lt $ls.Count; $g++) {
+        if ($ls[$hit] -match '^\s*(g_bulkResult\.Finish|LOGE\()' -or $ls[$hit] -match '^\s*//' -or $ls[$hit].Trim() -eq '') {
+            $ls.RemoveAt($hit)
+        } else { break }
+    }
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $adCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {

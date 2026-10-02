@@ -1409,6 +1409,68 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AD：「线程没起来」的回调必须留下可见痕迹 ----
+#
+# 第 139 轮。`SpawnDetached(body, name, onFail)` 的第三个参数
+# 是在 `std::thread` 构造抛异常时才会被调用的。
+#
+# 四处调用点里，有两处只做了「状态退回去」：
+#
+#     [processingFlag]() { *processingFlag = false; }
+#
+# 于是界面上按钮恢复正常、进度条消失、**什么异常都没有**，
+# 而实际效果是「一个方法都没恢复 / 一个方法都没追踪」。
+# 用户会以为是自己点的时机不对，或者以为「本来就没有要恢复的东西」，
+# 于是**再点一次**。
+#
+# > 「静默什么都没发生」比报错更难查：报错至少有个人会去看日志。
+#
+# 形状：`SpawnDetached` 的第三个参数（无参 lambda）体里，
+# 除了 `*processingFlag = false;` 这类状态复位之外，
+# 没有任何一处会**被界面读到**（写 bulkResult / pendingXxx / LOGE）。
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        # 形如  [processingFlag]()     <- 无参的失败回调
+        # 捕获列表里可能有多个东西（[this, processingFlag]()），\w+ 只吃一个，+ 也不够 ——
+        # 第一版写的是 ^\[\w+\]，[this, processingFlag]() 一个都匹配不上，于是规则静默。
+        if ($t -notmatch '^\[[\w\s,*&]+\]\s*\(\s*\)\s*$') { continue }
+        # 往下找到它的函数体（第一行就是 { 的紧邻行）
+        $j = $i + 1
+        while ($j -lt $lines.Count -and $lines[$j].Trim() -ne '{') {
+            if ($lines[$j].Trim() -match '^\}') { break }
+            $j++
+        }
+        if ($j -ge $lines.Count -or $lines[$j].Trim() -ne '{') { continue }
+        # 扫函数体
+        $depth = 0
+        $entered = $false
+        $body = @()
+        for ($k = $j; $k -lt $lines.Count; $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -notmatch '^(//|\*|/\*)') {
+                $depth += ([regex]::Matches($u, '\{')).Count - ([regex]::Matches($u, '\}')).Count
+            }
+            if (-not $entered -and $depth -gt 0) { $entered = $true }
+            if ($entered -and $depth -le 0) { break }
+            if ($entered -and $u -notmatch '^(//|\*|/\*)$') { $body += $u }
+        }
+        $text = $body -join "`n"
+        # 「可见」= 界面能读到的状态，或者至少一条日志
+        $visible = $text -match 'g_bulkResult|g_pending\w+|LOGE\('
+        if (-not $visible) {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'AD: 「线程没起来」的回调什么痕迹都不留 —— 界面看起来一切正常，用户只会以为「本来就没有要做的事」然后再点一次'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
