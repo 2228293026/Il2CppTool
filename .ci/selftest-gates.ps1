@@ -617,6 +617,31 @@ Test-Rule 'Y 请求标志 relaxed 不误报' {
     return $true
 } $yCheck 'app/src/main/jni/Tool/Tool.cpp' -ExpectRed $false
 
+# ---- 32. 规则 Z：把「能力判定失败写进缓存」复现出来（第 134 轮）----
+#
+# 这条规则的第一版**两次都没抓到**，两次都是注入验证抓出来的：
+#   1) 见 } 就 break  ->  被嵌套 if 的 } 截断，扫不到目标行
+#   2) depth 预设 1 又数了那个 {  -> 深度回不到 0，扫进整个函数（误报）
+$zCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'Z 能力判定失败不许写缓存' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $anchor = -1
+    $ins = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($anchor -lt 0 -and $ls[$k] -match '^\s*if \(!Il2cpp::BrowserApiResolved\(\)\)') { $anchor = $k; continue }
+        if ($anchor -ge 0 -and $ls[$k] -match '^\s*static MethodList empty;\s*$') { $ins = $k; break }
+    }
+    if ($ins -lt 0) { return $false }
+    $ls.Insert($ins + 1, '            methodCache[klass] = empty;')
+    $ls[$ins + 2] = '            return methodCache[klass];'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $zCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

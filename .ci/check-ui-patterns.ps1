@@ -1157,6 +1157,69 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 Z：能力判定失败**不许**写进缓存 ----
+#
+# 第 134 轮。第 126 轮给浏览路径加挡的时候，我在 `buildMethodMap` 里写成：
+#
+#     if (!Il2cpp::BrowserApiResolved()) {
+#         methodCache[klass] = empty;     <-- 把一次暂时的状态缓存成了永久结果
+#         return methodCache[klass];
+#     }
+#
+# 只要在那一次调用时符号还没解析出来，这个类的方法列表就**永远是空的**，
+# 即使符号后来解析好了也不会重建 —— 而「没有方法」和「看不了」在界面上
+# 长得几乎一样（都画 0 个方法），用户不会知道差在哪。
+#
+# 「符号不会晚点才解析出来」听起来成立（dlsym 不会二次成功），
+# 但「菜单会不会在 API 解析完成之前被画出来」是**时序**，
+# 而时序是最不靠得住的一类假设。
+#
+# 形状：`if (!<某个能力判定>)` 的分支体里出现 `<某个缓存容器>[...] =`。
+foreach ($f in $files) {
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        if ($t -notmatch '^if\s*\(\s*!\s*\w+(::\w+)*\s*\(\s*\)\s*\)') { continue }
+        $name = [regex]::Match($t, '!\s*(\w+(::\w+)*)').Groups[1].Value
+        # 跳过「不该缓存」的那些（不是能力判定）
+        if ($name -match '^(Empty|empty)$') { continue }
+        # **必须按花括号深度扫，不能见 } 就 break**（第 134 轮）。
+        #
+        # 第一版就是见 } 就 break，于是被保护块里**嵌套**的
+        #     if (!g_warnedAboutBrowserApi) { ... }   <-- 它的 } 把扫描截断了
+        # 真正要抓的那行在它后面，于是规则永远是绿的。
+        # 注入真缺陷验证时才发现 —— 又一次「规则看着对、其实没在跑」。
+        # 深度从 0 起、**进块之后**才算 —— 因为这个 `if` 的 `{` 通常在**下一行**，
+        # 而我在第一版里既预设了 1 又数了那个 `{`，等于数了两次，
+        # 于是深度永远回不到 0，扫描一路冲进整个函数（第一版误报了
+        # 下面那个 `methodCache.size() >= kMethodCacheLimit` 的清空逻辑）。
+        $depth = 0
+        $entered = $false
+        for ($k = $i + 1; $k -lt $lines.Count; $k++) {
+            $u = $lines[$k].Trim()
+            if ($u -notmatch '^(//|\*|/\*)') {
+                $depth += ([regex]::Matches($u, '\{')).Count - ([regex]::Matches($u, '\}')).Count
+            }
+            if (-not $entered -and $depth -gt 0) { $entered = $true }
+            if ($entered -and $depth -le 0) { break }
+            if (-not $entered) { continue }
+            if ($u -match '^(//|\*|/\*)') { continue }
+            # 写进任何「缓存」容器
+            if ($u -match '\b(methodCache|objectCache|newObjectMap|collectCache)\b.*=' -and
+                $u -notmatch '^\s*(==|!=)') {
+                $hits += [pscustomobject]@{
+                    File = $f.Name
+                    Line = $k + 1
+                    Rule = 'Z: 能力判定失败时写进缓存 —— 一次暂时的状态会变成**永久**结果（符号补齐后也不重建）'
+                    Text = $u
+                }
+                break
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

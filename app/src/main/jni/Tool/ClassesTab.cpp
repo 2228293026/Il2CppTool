@@ -909,6 +909,12 @@ void hookerHandler(void *address, DobbyRegisterContext *ctx)
 // 只在渲染线程调用（MethodPopup 展开时），所以不需要额外加锁。
 ClassesTab::MethodList &ClassesTab::buildMethodMap(Il2CppClass *klass)
 {
+    // 「已经报过一次符号不全」这个状态（第 134 轮）。
+    // 必须在**函数作用域**上只有一份：我在上一版里把它声明了两次
+    // （一次在 if 块内、一次在块外），那是**两个不同的对象**，
+    // 于是「重置」重置错了那个 —— 而这种错编译器不会报。
+    static bool g_warnedAboutBrowserApi = false;
+
     if (klass == nullptr)
     {
         // 返回一个空的静态列表而不是崩掉。调用方会走 "No methods" 分支。
@@ -931,14 +937,36 @@ ClassesTab::MethodList &ClassesTab::buildMethodMap(Il2CppClass *klass)
     // 配合类页面里那条「这个 Unity 版本缺符号」的红字，意思是明确的。
     // 千万别在这里 `return` 一个**假的**非空列表 ——
     // 那等于告诉界面「这个类真的没有方法」，和事实相反。
+    //
+    // **但不写进缓存**（第 134 轮修正）。
+    //
+    // 我第一版是 `methodCache[klass] = empty;` —— 那是**把一次暂时的状态
+    // 缓存成了永久结果**：只要在那一次调用时符号还没解析出来，
+    // 这个类的方法列表就永远是空的，**即使符号后来解析好了也不会重建**。
+    //
+    // 「符号不会晚点才解析出来」听起来成立（dlsym 不会二次成功），
+    // 但「菜单会不会在 API 解析完成之前被画出来」是另一回事 ——
+    // 那是**时序**，而时序是最不靠得住的一类假设。
+    // 第 90 轮整个 Il2cpp 目录漏扫、127 轮 clang-tidy 报假绿，
+    // 都是同一种「靠一个说不清的时序成立」换来的安心。
     if (!Il2cpp::BrowserApiResolved())
     {
-        LOGE("getMethodList: 浏览路径符号不全，%s 的方法列表留空（不是「它没有方法」）",
-             klass && klass->getName() ? klass->getName() : "?");
-        MethodList empty;
-        methodCache[klass] = empty;
-        return methodCache[klass];
+        // 只报一次。返回的是**同一个**静态空列表，且不写缓存，
+        // 所以这个分支每帧都可能走到 —— 每帧一条 LOGE 会把日志冲爆，
+        // 而日志刷屏和界面报错一样，是把真正该看的那条埋掉。
+        if (!g_warnedAboutBrowserApi)
+        {
+            g_warnedAboutBrowserApi = true;
+            LOGE("浏览路径符号不全，%s 的方法列表留空（不是「它没有方法」，"
+                 "而且符号补齐后会自动重建）",
+                 klass && klass->getName() ? klass->getName() : "?");
+        }
+        static MethodList empty;
+        return empty;
     }
+    // 符号补齐之后要把「已经报过」这个状态清掉，
+    // 不然真问题只会被报一次，之后再也不响。
+    g_warnedAboutBrowserApi = false;
 
     MethodList methods;
     auto rawMethods = klass->getMethods();
