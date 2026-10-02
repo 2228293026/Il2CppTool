@@ -1330,6 +1330,63 @@ foreach ($fn in ($functionsWithBegin | Sort-Object -Unique)) {
     }
 }
 
+# ---- 模式 AC：跨线程发布「消息」不许用会被释放的缓冲 ----
+#
+# 第 137 轮。`GetFilterFailure()` 是这样把失败原因交出去的：
+#
+#     std::lock_guard guard(filterState->mutex);
+#     return filterState->failure;        // const char *
+#
+# 加锁只保护了**读指针**这一步；调用方拿到指针之后锁就放了，
+# 而工作线程随时可能在同一把锁下改写它。
+#
+# 现在**恰好**没问题，因为三处赋值全是**字符串字面量**（静态存储期），
+# 指针的值永远有效 —— 所以这是「**结论正确、理由没写下来**」：
+# 下一个人把某处改成 `failure = someStdString.c_str()` 就静默变成野指针，
+# 而且编译器一句都不会说。
+#
+# 这正是第 134 轮那个教训的另一半：
+# 那里是「靠一个说不清的时序成立」，这里是「靠一个没写下来的约定成立」。
+#
+# 形状：`const char *`（或 `char *`）类型的状态字段被赋值，
+# 且右值不是字面量 / nullptr / 别的裸指针转发。
+foreach ($f in $files) {
+    if ($f.Name -ne 'ClassesTab.cpp') { continue }
+    $rawTextCache = Get-Content -Encoding UTF8 $f.FullName -Raw
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 形如  st->failure = <expr>;   或   failure = <expr>;（局部变量）
+        # 第二种也是要查的：它在 DoFilterWork 里，第 137 轮注入验证时
+        # 我只写了第一种，于是规则「看着有、其实没在跑」——
+        # 而真正会被改坏的是那个局部变量。
+        $m = [regex]::Match($t, '^(?:st->)?(\w+)\s*=\s*([^;]+);\s*$')
+        if (-not $m.Success) { continue }
+        $field = $m.Groups[1].Value
+        $rhs   = $m.Groups[2].Value.Trim()
+        if ($field -notmatch 'failure|reason|errorText') { continue }
+        if ($rhs -match '^"|^nullptr$') { continue }
+        # 转发一个局部变量是允许的（那个局部变量的所有赋值处都要是字面量）
+        if ($rhs -match '^[A-Za-z_]\w*$') { continue }
+        # **只查 char\* 类型的字段**（第 137 轮）。
+        # 第一版只按名字匹配，于是 `rootFailures = it->second;`（一个 size_t）
+        # 也被报了 —— 那不是消息，是个计数。
+        #
+        # 所以先扫出全文所有 `const char *name` / `char *name` 的声明，
+        # 只对**这些名字**生效。名字匹配用来定位，类型匹配用来定性。
+        if ($rawTextCache -notmatch ('\b(?:const\s+)?char\s*\*\s*(?:[\w:>]+\s*,\s*)*' + [regex]::Escape($field) + '\b')) {
+            continue
+        }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'AC: 跨线程发布的失败原因赋了非字面量 —— 调用方在锁外用它，一旦右边指向会被释放的缓冲就是野指针'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

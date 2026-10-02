@@ -5281,6 +5281,14 @@ struct ClassesTab::FilterState
     uint64_t resultGen = 0;
     // 本轮失败的原因；空 = 成功。
     //
+    // **只能赋字符串字面量**（第 137 轮，规则 AC 守着这条）。
+    // 因为 `GetFilterFailure()` 是这样交出去的：
+    //     lock_guard guard(mutex);
+    //     return filterState->failure;      // 出了这把锁，界面线程才去用
+    // 加锁只保护了「读指针」这一步，指针所指的内容**不在保护范围内**。
+    // 字面量在静态存储期，永远有效，所以现在**恰好**没问题；
+    // 但换成 `someStdString.c_str()` 就静默变成野指针，编译器一句都不说。
+    //
     // 存在的意义是**失败也必须有出口**：attach 失败或抛异常时，
     // 如果直接 return 而不走到统一发布结果那段，hasResult 永远是 false、
     // resultGen 永远对不上 requestGen → IsFilterPending() 恒为 true

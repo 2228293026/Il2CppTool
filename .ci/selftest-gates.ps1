@@ -685,6 +685,24 @@ Test-Rule 'AB 记了结果必须有地方读' {
     return $true
 } $abCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
+# ---- 35. 规则 AC：把「失败原因指向临时缓冲」复现出来（第 137 轮）----
+#
+# 注意替换的是**局部变量**那一处（`failure = "..."`），
+# 不是 `st->failure = failure;` —— 后者转发局部变量，是允许的写法。
+# 第一版规则只查 `st->` 前缀，注入验证时立刻发现「规则没在跑」。
+$acCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AC 跨线程消息不许指向临时缓冲' {
+    param($t)
+    $marker = 'failure = "筛选时发生异常";'
+    if ($t.IndexOf($marker) -lt 0) { return $false }
+    $out = $t.Replace($marker, 'failure = std::string("筛选时发生异常").c_str();')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'), $out,
+        (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $acCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
