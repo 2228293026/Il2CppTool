@@ -222,8 +222,13 @@ Test-Rule '源码编码（U+FFFD）' {
     param($t)
     $needle = 'constexpr int MAX_CLASSES = 500;'
     if (-not $t.Contains($needle)) { return $false }
+    # 注入**真** U+FFFD，不能用 "`u{FFFD}" 那种字面转义 ——
+    # 那是六个普通字符，编码检查当然不会红。
+    # 这条自检第一版就是这么错的：注入成功=True，变红=False，CI 上白跑一趟。
+    # 用 [char]0xFFFD 构造，脚本本身保持纯 ASCII，不再依赖源文件编码。
+    $bad = [string][char]0xFFFD
     [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
-        $t.Replace($needle, $needle + " // `u{FFFD}"), (New-Object Text.UTF8Encoding($false)))
+        $t.Replace($needle, $needle + ' // ' + $bad), (New-Object Text.UTF8Encoding($false)))
     return $true
 } $encCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
 
@@ -807,24 +812,57 @@ Test-Rule 'AC 公开 API 不许返回裸指针' {
 # 这条规则自己第一版是**完全静默**的：我把捕获列表写成 `^\[\w+\]`，
 # 而那两处的真身是 `[this, processingFlag]()` —— 一个都匹配不上。
 # 手工注入时立刻发现「删干净了却不红」。
+#
+# 然后自检这一条也**自己不行**，而且错了两版：
+#
+# 第一版只删 `Begin` 后面**紧挨着**的那几行。可真实顺序是
+#     g_bulkResult.Begin("恢复全部");
+#     g_bulkResult.Finish(); // 0 个成功 -> ...
+#     LOGE("RestoreAll: 无法创建后台线程，一个方法都没恢复");
+# 三行紧挨着，它应该能删干净 —— 但它只删掉了一行就停，
+# 因为下一行是注释 `// 0 个成功 -> ...`，而循环上限是 3，
+# 删完注释就 `break` 了。Finish 和 LOGE 都还在，
+# 「可见痕迹」照样成立，门禁报绿。
+#
+# 第二版改成「Begin 到 SpawnDetached( 之间整段删」，结果 end=begin+1，
+# 只删掉 Begin 一行 —— 因为那个 Begin 是**正常路径**的（工作线程里
+# 的那次 Begin），不是失败回调里的。我找错了目标。
+#
+# 正确做法：**按缩进找回调体**。失败回调的特征是它自己那层大括号
+# —— `[this, processingFlag]()` 后面紧跟的 `{`，
+# 而工作线程是 `SpawnDetached(` 后面换行才 `{`。
 $adCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
 }
 Test-Rule 'AD 线程没起来必须留痕迹' {
     param($t)
     $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
-    $hit = -1
-    for ($k = 0; $k -lt $ls.Count; $k++) {
-        if ($ls[$k] -match '^\s*g_bulkResult\.Begin\("恢复全部"\);\s*$') { $hit = $k; break }
+    # 找失败回调：`[... ]()` 单独一行，紧跟的下一行是 `{`
+    $open = -1
+    for ($k = 0; $k -lt $ls.Count - 1; $k++) {
+        if ($ls[$k].Trim() -notmatch '^\[[\w\s,*&]+\]\s*\(\s*\)\s*$') { continue }
+        if ($ls[$k + 1].Trim() -ne '{') { continue }
+        $open = $k + 1
+        break
     }
-    if ($hit -lt 0) { return $false }
-    # 删掉 Begin / Finish / LOGE 三行（后面两行 + 可能夹着的注释行）
-    $ls.RemoveAt($hit)
-    for ($g = 0; $g -lt 3 -and $hit -lt $ls.Count; $g++) {
-        if ($ls[$hit] -match '^\s*(g_bulkResult\.Finish|LOGE\()' -or $ls[$hit] -match '^\s*//' -or $ls[$hit].Trim() -eq '') {
-            $ls.RemoveAt($hit)
-        } else { break }
+    if ($open -lt 0) { return $false }
+    # 从 `{` 走到配对的 `}`，整段替换成只复位状态 —— 静默失败的真身。
+    $depth = 0
+    $close = -1
+    for ($k = $open; $k -lt $ls.Count; $k++) {
+        $u = $ls[$k]
+        if ($u.Trim() -notmatch '^(//|\*|/\*)') {
+            $depth += ([regex]::Matches($u, '\{')).Count - ([regex]::Matches($u, '\}')).Count
+        }
+        if ($depth -le 0 -and $k -gt $open) { $close = $k; break }
     }
+    if ($close -lt 0) { return $false }
+    $ls.RemoveAt($close)
+    for ($k = $close - 1; $k -ge $open; $k--) { $ls.RemoveAt($k) }
+    $indent = ([regex]::Match($ls[$open - 1], '^\s*')).Value
+    $ls.Insert($open, $indent + '    {')
+    $ls.Insert($open + 1, $indent + '        *processingFlag = false;')
+    $ls.Insert($open + 2, $indent + '    }')
     [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
         ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
     return $true
