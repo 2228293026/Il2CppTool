@@ -64,6 +64,28 @@ $files += Get-ChildItem $rootCpp -Filter *.cpp -File
 # （第 58 轮）换了个方向又出现一次。
 $files += Get-ChildItem $rootCpp -Filter *.h -File
 
+# ---- 文件内容**只读一次**（第 143 轮加）----
+#
+# 下面 30 条规则里原本有 33 处 `Get-Content -Encoding UTF8 $f.FullName`，
+# 也就是说每条规则都把 53 个文件重读一遍 —— 1590 次读取 + 解析。
+# 结果：单次跑 11-12 秒。而 selftest-gates.ps1 要跑 45 次检查，
+# 12 x 45 ~= 9 分钟，CI 的 static-analysis 从 17 分钟涨到 30 分钟以上。
+#
+# 我一开始怀疑是第 143 轮新加的规则 AH 慢（它确实有一段 O(n^2)），
+# 但把它优化掉只省了 0.8 秒；二分禁用 30 条规则也定位不到任何单条 ——
+# 因为开销**不在任何一条规则里，而在它们共享的那 33 次读取上**。
+#
+# 读一遍全部文件只要 262 ms（实测），所以这是纯浪费。
+$fileLines = @{}
+foreach ($f in $files) {
+    $fileLines[$f.FullName] = [System.IO.File]::ReadAllLines($f.FullName, [Text.Encoding]::UTF8)
+}
+# -Raw 的那 4 处也一样：整文件读成一个字符串。
+$fileRaw = @{}
+foreach ($f in $files) {
+    $fileRaw[$f.FullName] = [System.IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8)
+}
+
 # ---- 受检范围必须**覆盖全部**项目源文件（第 131 轮）----
 #
 # `$dirs` 是手写的，所以它一定会漂移：新建一个目录、或在 jni 根目录放一个
@@ -124,7 +146,7 @@ if ($deadHeaders) {
 }
 
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^\s*(//|\*|/\*)') { continue }
@@ -184,7 +206,7 @@ foreach ($f in $files) {
 # 只扫 .cpp：字体二进制头（Roboto-Regular.h）里全是重复的十六进制行，
 # 那不是「重复插入」，是**数据**。这条规则对数据文件是纯噪音。
 foreach ($f in ($files | Where-Object { $_.Extension -eq '.cpp' })) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 1; $i -lt $lines.Count; $i++) {
         $a = ($lines[$i - 1] -replace '^\s+', '')
         $b = ($lines[$i] -replace '^\s+', '')
@@ -218,7 +240,7 @@ foreach ($f in ($files | Where-Object { $_.Extension -eq '.cpp' })) {
 # 规则：任何按 paths 逐段走并写字段的函数（WriteWatchValue），
 # 必须在**自己体内**出现 ensureIfValueType。写到别处去不算数。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     $joined = ($lines -join "`n")
     if ($joined -notmatch 'static bool WriteWatchValue') { continue }
     $start = -1
@@ -296,7 +318,7 @@ foreach ($f in $files) {
 #   LOGx(...)   —— 日志是纯文本，`**` 在那里没问题
 #   第三方目录  —— imgui / asmjit 自己就有 `**DebugBreak**`
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -330,7 +352,7 @@ foreach ($f in $files) {
 # CollapsingHeader，就是缺陷。父条件是 Button / Checkbox / MenuItem
 # 这些「用户主动触发」的没问题 —— 那些本来就该在点了之后才执行。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -387,7 +409,7 @@ foreach ($f in $files) {
 #   - 只看实参，不看「附近有什么」（那会误报一堆合法的缓存清理）
 #   - 条件里必须有 `else` 才放过（写成 else 就说明作者想过这件事）
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -notmatch '^if\s*\(!?\s*[\w:.]+\(') { continue }
@@ -441,7 +463,7 @@ foreach ($f in $files) {
 #
 # 所以要拦的是：绕过 FileWriter 直接 ofstream/fopen 写正式文件。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -481,7 +503,7 @@ foreach ($f in $files) {
 # 排除：Util.cpp（那是 FileWriter 的实现本身）。
 # dump 的临时文件在 Il2cpp.cpp（它有自己的进度/取消通道）。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     if ($f.Name -ne 'SelfCheck.cpp') { continue }
     # 允许**一次性的**探测：`static const bool x = []() { ... }();`
     # 这种写法整个进程只执行一次，是「探一下就够」的正确形状。
@@ -523,7 +545,7 @@ foreach ($f in $files) {
 # 形状：NewHandle 的结果被判过、并且失败分支只是记日志，
 # 紧接着却把同一个对象赋给一个「会被解引用」的全局/成员。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -532,19 +554,61 @@ foreach ($f in $files) {
         if (-not $m.Success) { continue }
         $handleVar = $m.Groups[1].Value
         $obj = $m.Groups[2].Value
-        # 往后 8 行：必须有一个 `return`（或 throw）在赋值之前
-        # 窗口要够宽 —— 失败分支里通常有一大段说明加清理调用；
-        # 第一次写 8 行，而赋值在第 28 行，规则**从来没被验证过**。
-        for ($k = $i + 1; $k -le [Math]::Min($i + 30, $lines.Count - 1); $k++) {
+        # 往后找那个赋值。
+        #
+        # 第 143 轮：这里原来写死「往后 30 行」，而我在同一处加了 9 行注释
+        # （说明为什么必须清 openedKeyboard），把 `openedKeyboard = kb;`
+        # 顶到了第 37 行 -> **窗口看不到它 -> 规则静默失效**，
+        # CI 连续两次红（自检报「注入成功=False」）。
+        #
+        # 注释不是代码，却改变了检查的行为 —— 这和同一轮自检 I 的
+        # 「往下 30 行找 return」是**同一个根因**：用相对距离去定位，
+        # 而距离会被任何一次无关的注释改动推着走。
+        #
+        # 试过「按花括号深度扫到下一个 `}`」，**也是错的**：
+        # NewHandle 后面紧跟的是 `if (handle == 0) { ... }`，
+        # 它的闭合括号就是第一个回到 depth 0 的 `}` ——
+        # 而 `openedKeyboard = kb;` 恰好在**这个括号之后一行**，
+        # 于是 limit 正好停在它前一行（实测 limit=133，赋值在 134）。
+        #
+        # 正确做法：**以所属函数的边界**为窗口。
+        # 一次加根操作必然发生在某个函数体内，那个函数就是自然的范围。
+        $depth = 0
+        $fnOpen = $i
+        for ($k = $i; $k -ge 0; $k--) {
+            $depth += ([regex]::Matches($lines[$k], '\}')).Count - ([regex]::Matches($lines[$k], '\{')).Count
+            if ($depth -lt 0) { $fnOpen = $k; break }
+        }
+        $depth = 0
+        $limit = $lines.Count - 1
+        for ($k = $fnOpen; $k -lt $lines.Count; $k++) {
+            $depth += ([regex]::Matches($lines[$k], '\{')).Count - ([regex]::Matches($lines[$k], '\}')).Count
+            if ($depth -eq 0 -and $k -gt $fnOpen) { $limit = $k; break }
+        }
+        for ($k = $i + 1; $k -le [Math]::Min($limit, $lines.Count - 1); $k++) {
             $u = $lines[$k].Trim()
             if ($u -match '^(//|\*|/\*)') { continue }
             # 赋值给了另一个变量（不是同一个 obj）
             if ($u -match "^\s*(?:[\w:]+::)?(\w+)\s*=\s*$obj\s*;") {
                 $dest = $Matches[1]
                 if ($dest -eq $obj) { continue }
-                # 赋值之前出现过 return 就算有出口
-                $before = $lines[$i..($k-1)] -join "`n"
-                $hasExit = $before -match '\breturn\b'
+                # 赋值之前出现过 return 就算有出口。
+                #
+                # **必须先剔除注释行。**（第 143 轮）
+                # 原来直接对整段文本匹配 `\breturn\b`，于是
+                #
+                #     // 第 143 轮：这里原来只 Destroy + return，**没有清 openedKeyboard**。
+                #
+                # 这一行**注释里**出现了 "return" 这个英文单词，就被当成了
+                # 「代码里有出口」—— 于是删掉真正的 return 之后规则**依然绿**。
+                #
+                # 这不是第 143 轮引入的：判据从第 97 轮起就只看字面量。
+                # 暴露它的是我自己写的那行注释 —— 一次**无害的注释**
+                # 让一条检查失去了作用。这就是「注释不是代码」的反面：
+                # 注释**能**改变检查的行为。
+                $codeOnly = @($lines[$i..($k - 1)] |
+                    Where-Object { $_.Trim() -notmatch '^(//|\*|/\*)' }) -join "`n"
+                $hasExit = $codeOnly -match '\breturn\b'
                 if (-not $hasExit) {
                     $hits += [pscustomobject]@{
                         File = $f.Name
@@ -581,7 +645,7 @@ foreach ($f in $files) {
 # 形状：函数体里 `return <裸指针成员>;`（而不是 nullptr），
 # 且该成员是某个 Il2CppObject* / Transform* 类型的裸指针。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -642,7 +706,7 @@ foreach ($f in $files) {
 # 形状：`if (可恢复) { 画按钮 } else { ImGui::Dummy(...) }` ——
 # else 分支只画一个不可见的占位，等于「这一行没有任何状态」。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -716,7 +780,7 @@ $invFamily = @('invoke_static', 'invoke')
 $castNames = @('reinterpret_cast', 'const_cast', 'static_cast', 'dynamic_cast')
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
-    $txt = Get-Content -Encoding UTF8 $f.FullName -Raw
+    $txt = $fileRaw[$f.FullName]
     # Dobby 家族
     foreach ($m in [regex]::Matches($txt, 'Dobby(?:Hook|Instrument)\s*\([^,]*,\s*(?:\(\s*void\s*\*\s*\)|\(\s*[\w:]*callback\w*\s*\))?\s*&?\s*(\w+)')) {
         $n = $m.Groups[1].Value
@@ -758,7 +822,7 @@ foreach ($f in $files) {
 # 所以本规则要求 Includes/Logger.cpp 里每个函数体都有边界。
 foreach ($f in $files) {
     if ($f.Name -ne 'Logger.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -795,7 +859,7 @@ foreach ($f in $files) {
 foreach ($name in $invFamily) {
     foreach ($f in $files) {
         if ($f.Extension -ne '.cpp' -and $f.Extension -ne '.h') { continue }
-        $lines = Get-Content -Encoding UTF8 $f.FullName
+        $lines = $fileLines[$f.FullName]
         for ($i = 0; $i -lt $lines.Count; $i++) {
             $t = $lines[$i].Trim()
             if ($t -match '^(//|\*|/\*)') { continue }
@@ -828,7 +892,7 @@ foreach ($name in $invFamily) {
 
 foreach ($name in $hookNames.Keys) {
     foreach ($f in $files) {
-        $lines = Get-Content -Encoding UTF8 $f.FullName
+        $lines = $fileLines[$f.FullName]
         if ($f.Extension -ne '.cpp') { continue }
         for ($i = 0; $i -lt $lines.Count; $i++) {
             $t = $lines[$i].Trim()
@@ -868,7 +932,7 @@ foreach ($name in $hookNames.Keys) {
 # 形状：history.push_back(...) / push_back(...) 紧跟在一次可能失败的
 # 读取之后，而**中间没有**任何判空/判定成功的分支。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -908,7 +972,7 @@ foreach ($f in $files) {
 # （就是那个助手本身）。
 foreach ($f in $files) {
     if ($f.Name -eq 'Utils.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -937,7 +1001,7 @@ foreach ($f in $files) {
 # 忽略返回值是合理的（还没有东西可丢）。
 foreach ($f in $files) {
     if ($f.Name -ne 'ClassesTab.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -969,7 +1033,7 @@ foreach ($f in $files) {
 # 形状：函数里 `Util::FileWriter X(...)` 出现了，但整个函数里
 # 从头到尾没读过 `X.ok()`。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     # 按函数切块（缩进 4 的定义行，或更粗的）
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
@@ -1017,7 +1081,7 @@ foreach ($f in $files) {
 # `SaveObjectWithRoot(...)` 之前。
 foreach ($f in $files) {
     if ($f.Name -ne 'ClassesTab.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1055,7 +1119,7 @@ foreach ($f in $files) {
 # 而 GC::NewHandle 依赖的符号没有任何一项单独判定。
 foreach ($f in $files) {
     if ($f.Name -ne 'SelfCheck.cpp') { continue }
-    $text = Get-Content -Encoding UTF8 $f.FullName -Raw
+    $text = $fileRaw[$f.FullName]
     if ($text -notmatch 'ApiResolved\(\)') { continue }
     # 必须**真的**是一个判定分支，不能是 `false && GcHandleApiResolved()`
     # 这种「调用还在、判定没了」的写法 —— 只查「文本里出现过这个名字」的话，
@@ -1142,7 +1206,7 @@ foreach ($g in $needBrowserGuard) {
 # 每个对象自身的修改顺序和最终可见 —— 对这种用法正是最省的选择。
 # （Dump().cancelRequested 就是这一类，别把它一起改掉。）
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1176,7 +1240,7 @@ foreach ($f in $files) {
 #
 # 形状：`if (!<某个能力判定>)` 的分支体里出现 `<某个缓存容器>[...] =`。
 foreach ($f in $files) {
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1242,7 +1306,7 @@ foreach ($f in $files) {
 # 对 `lastCallback` / `needOpen` / `userData` 的清理。
 foreach ($f in $files) {
     if ($f.Name -ne 'PopUpSelector.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1294,7 +1358,7 @@ $bulkBegin = 0
 $bulkReport = 0
 foreach ($f in $files) {
     if ($f.Name -ne 'ClassesTab.cpp') { continue }
-    $text = Get-Content -Encoding UTF8 $f.FullName -Raw
+    $text = $fileRaw[$f.FullName]
     $bulkBegin  = ([regex]::Matches($text, 'g_bulkResult\.Begin\s*\(')).Count
     $bulkReport = ([regex]::Matches($text, 'g_bulkResult\.Report\s*\(')).Count
 }
@@ -1310,7 +1374,7 @@ $functionsWithBegin = @()
 $functionsWithReport = @()
 foreach ($f in $files) {
     if ($f.Name -ne 'ClassesTab.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     $cur = '<文件作用域>'
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
@@ -1374,8 +1438,8 @@ foreach ($f in $files) {
     # 第一版只扫 .cpp，于是「公开返回值改回裸指针」这种注入**抓不到** ——
     # 因为那行声明在 .h 里。而「公开 API 递出裸指针」恰恰是最该抓的一处。
     if ($f.Name -notin @('ClassesTab.cpp', 'ClassesTab.h')) { continue }
-    $rawTextCache = Get-Content -Encoding UTF8 $f.FullName -Raw
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $rawTextCache = $fileRaw[$f.FullName]
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1430,7 +1494,7 @@ foreach ($f in $files) {
 # 没有任何一处会**被界面读到**（写 bulkResult / pendingXxx / LOGE）。
 foreach ($f in $files) {
     if ($f.Name -ne 'ClassesTab.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         # 形如  [processingFlag]()     <- 无参的失败回调
@@ -1491,7 +1555,7 @@ foreach ($f in $files) {
 # 形状：`static <指针类型> <名字> = <可能失败的调用>(...)`
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1543,7 +1607,7 @@ foreach ($f in $files) {
 foreach ($f in $files) {
     if ($f.Extension -notin @('.cpp', '.h')) { continue }
     if ($f.Name -eq 'Version.h') { continue }   # 生成物
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
@@ -1607,7 +1671,7 @@ $emptyStateLists = @(
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
     $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
-    $lines = Get-Content -Encoding UTF8 $f.FullName
+    $lines = $fileLines[$f.FullName]
     for ($e = 0; $e -lt $emptyStateLists.Count; $e++) {
         $spec = $emptyStateLists[$e]
         if ($rel -ne $spec.File) { continue }
@@ -1681,37 +1745,48 @@ $semanticGuards = @{
 }
 foreach ($f in $files) {
     if ($f.Extension -ne '.cpp') { continue }
-    $lines = Get-Content -Encoding UTF8 $f.FullName
-    # 本文件里出现过「基名 + Handle」的成对变量
-    $pairs = @{}
-    foreach ($l in $lines) {
-        foreach ($m in [regex]::Matches($l, '\b(\w+)Handle\b')) {
-            $base = $m.Groups[1].Value
-            for ($k = 0; $k -lt $lines.Count; $k++) {
-                if ($lines[$k] -match ('\b' + $base + '\b')) { $pairs[$base] = $true; break }
-            }
+    $lines = $fileLines[$f.FullName]
+    # 只处理白名单里那几个基名，所以**不做「成对变量」扫描**。
+    #
+    # 第 143 轮的第一版在这里有一段：对文件里每一行的每个 `XxxHandle`，
+    # 都全文件扫一遍找它的裸变量名（后面还有个「往上找函数头」的
+    # 200 行回溯）。合起来让 check-ui-patterns.ps1 单次跑到 **12.3 秒**；
+    # 而 selftest-gates.ps1 要跑 45 次检查，12.3 x 45 ~= 9 分钟，
+    # CI 的 static-analysis 从 17 分钟涨到 30 分钟以上。
+    #
+    # 而 $semanticGuards 已经把候选缩到 1 个了，那段扫描**结果上毫无贡献**，
+    # 只有代价 —— 第 22 次「存在 != 生效」的另一种形态：
+    # 一段不产生任何结果的昂贵代码。
+    $semanticBases = @($semanticGuards.Keys)
+    $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
+    if ($rel -notmatch 'Keyboard\.cpp$') { continue }
+    # 函数起点表：一次扫完整文件，之后 O(1) 查「第 i 行属于哪个函数」，
+    # 不用每处都回溯 200 行。
+    $fnStarts = @()
+    for ($k = 0; $k -lt $lines.Count; $k++) {
+        if ($lines[$k] -match '^\s*(void|bool|int|static|std::string)\b.*\b(\w+)\s*\([^;]*\)\s*$') {
+            $fnStarts += ,@($k, $Matches[2])
         }
     }
-    if ($pairs.Count -eq 0) { continue }
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
         if ($t -match '^(//|\*|/\*)') { continue }
         $m = [regex]::Match($t, '^if\s*\(\s*(\w+)Handle\s*!=\s*0\s*\)')
         if (-not $m.Success) { continue }
         $base = $m.Groups[1].Value
-        if (-not $pairs.ContainsKey($base)) { continue }
+        if ($semanticBases -notcontains $base) { continue }
         #
         # 排除**清理函数内部**：Reset() 里 `if (handle != 0) FreeHandle(handle)`
         # 是完全正确的 —— 在那里「有没有根」就等于「要不要放句柄」，
         # 而裸指针正是这个函数自己要清掉的东西。用语义化判断反而多余。
         #
         # 要查的是**别的函数**（生产方）在判断「有没有」时用了哪个变量。
-        # 绗簩鐗堬細鍑芥暟澶存鍒欏啓鎴?^[\w\s*&:]+:: 锛岃€?Reset() 娌℃湁 :: 鍓嶇紑
-        #锛堝畠鏄?namespace 閲岀殑瑁稿嚱鏁板悕锛夛紝鎵€浠ヤ竴鐩村尮閰嶄笉涓婏紝
-        # $inFn 姘歌繙鏄?-1锛屾帓闄ょ瓑浜庢病鍋?鈥斺€?绗?21 娆°€屽瓨鍦?!= 鐢熸晥銆嶏紝
-        # 鍜岃鍒?AG 杩炵画涓夎疆鏄悓涓€涓敊锛氭垜鍦ㄧ寽妯″紡锛岃€屼笉鏄浠ｇ爜銆?        $inFn = -1
-        for ($up = $i; $up -ge 0 -and $up -ge ($i - 200); $up--) {
-            if ($lines[$up] -match '^\s*(void|bool|int|static|std::string)\b.*\b(\w+)\s*\([^;]*\)\s*$') { $inFn = $Matches[2]; break }
+        #
+        # 用上面一次扫好的 $fnStarts，不要每处回溯 200 行 ——
+        # 45 次自检各跑一遍，回溯版的开销就是那 9 分钟。
+        $inFn = ''
+        foreach ($fs in $fnStarts) {
+            if ($fs[0] -le $i) { $inFn = $fs[1] } else { break }
         }
         if ($inFn -eq 'Reset') { continue }
         # 该基名同时以裸指针形式存在（说明有两个变量代表同一件事），

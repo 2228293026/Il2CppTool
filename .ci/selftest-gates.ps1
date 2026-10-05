@@ -990,9 +990,28 @@ Test-Rule 'I 加根失败不许存指针' {
         if ($ls[$k] -match 'NewHandle\(kb\)') { $i = $k; break }
     }
     if ($i -lt 0) { return $false }
+    # 按**花括号深度**找那个 return，不用「往下 N 行」窗口。
+    #
+    # 第 143 轮踩了：这个窗口原来写死 30 行，而我在同一处加了 9 行注释
+    # （说明为什么必须清 openedKeyboard），把 return 顶到了第 36 行 ->
+    # 注入找不到目标 -> 自检报「注入成功=False」-> **CI 连续两次红**。
+    #
+    # 而**在代码里加注释是完全正常的事**，不该让一条自检悄悄失效。
+    # 「相对距离」是个会随无关改动漂移的判据 ——
+    # 和第 143 轮规则 AH 那个「往上找函数头」是同一类脆弱。
+    #
+    # 改成：从 NewHandle(kb) 往后扫，跟踪花括号深度，直到离开
+    # 「加根失败」那个 if 块，取块内**最后一个** return;
+    #（就是它 —— 删掉之后代码会继续往下走，正是规则 I 要抓的形状。）
+    $depth = 0
+    $sawOpen = $false
     $j = -1
-    for ($k = $i; $k -lt $i + 30; $k++) {
-        if ($ls[$k] -match '^\s*return;\s*$') { $j = $k; break }
+    for ($k = $i; $k -lt $ls.Count; $k++) {
+        $tr = $ls[$k].Trim()
+        $depth += ([regex]::Matches($tr, '\{')).Count - ([regex]::Matches($tr, '\}')).Count
+        if ($tr -eq '{') { $sawOpen = $true }
+        if ($tr -match '^return;$') { $j = $k }
+        if ($sawOpen -and $depth -le 0 -and $tr -eq '}') { break }
     }
     if ($j -lt 0) { return $false }
     $ls.RemoveAt($j)
