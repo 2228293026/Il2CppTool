@@ -201,113 +201,113 @@ namespace Keyboard
     {
         void updateImpl()
         {
-        // 方法指针**不许缓存失败**（第 141 轮）。
-        //
-        // 原来是函数级 static，初值 = TouchScreenKeyboard->getMethod(...)。
-        // `static` 只初始化**一次**，所以一旦那一刻 getMethod 返回 nullptr
-        // （元数据还没注册完 / 这个 Unity 版本没这个方法），
-        // 之后**永远**是 nullptr —— 每帧都走下面的「找不到 get_status」
-        // 直接 Reset()。
-        //
-        // 于是键盘永远打不开，而界面上一点提示都没有：
-        // 用户看到的是「点了没反应」。而 `Open()` 里专门写了
-        // 「类解析失败可以重试」（第 50-57 行），
-        // 说明「暂时拿不到」在这份代码里是**会发生的**。
-        //
-        // 同一件事两处处理不同 = 必然有一处是错的。
-        // 缓存**成功**的结果（省一次 getMethod），失败就走慢路径重试。
-        //
-        // 而且这里每次调用都 getMethod 也不贵：只在 status==Done 分支里
-        // 才需要 get_text，而那是一次性事件（用户按完确定）。
-        MethodInfo *get_statusMethod = TouchScreenKeyboard->getMethod("get_status");
-        if (!get_statusMethod)
-        {
-            LOGE("找不到 get_status");
-            return Reset();
-        }
-        TouchScreenKeyboardStatus status = Canceled;
-        if (check)
-        {
-            status = openedKeyboard->invoke_method<TouchScreenKeyboardStatus>("get_status");
-        }
-        else
-        {
-            auto result = Il2cpp::RuntimeInvoke(get_statusMethod, openedKeyboard, nullptr, nullptr);
-            if (!result)
+            // 方法指针**不许缓存失败**（第 141 轮）。
+            //
+            // 原来是函数级 static，初值 = TouchScreenKeyboard->getMethod(...)。
+            // `static` 只初始化**一次**，所以一旦那一刻 getMethod 返回 nullptr
+            // （元数据还没注册完 / 这个 Unity 版本没这个方法），
+            // 之后**永远**是 nullptr —— 每帧都走下面的「找不到 get_status」
+            // 直接 Reset()。
+            //
+            // 于是键盘永远打不开，而界面上一点提示都没有：
+            // 用户看到的是「点了没反应」。而 `Open()` 里专门写了
+            // 「类解析失败可以重试」（第 50-57 行），
+            // 说明「暂时拿不到」在这份代码里是**会发生的**。
+            //
+            // 同一件事两处处理不同 = 必然有一处是错的。
+            // 缓存**成功**的结果（省一次 getMethod），失败就走慢路径重试。
+            //
+            // 而且这里每次调用都 getMethod 也不贵：只在 status==Done 分支里
+            // 才需要 get_text，而那是一次性事件（用户按完确定）。
+            MethodInfo *get_statusMethod = TouchScreenKeyboard->getMethod("get_status");
+            if (!get_statusMethod)
             {
-                LOGE("Failed to get status");
+                LOGE("找不到 get_status");
                 return Reset();
             }
-            status = Il2cpp::GetUnboxedValue<TouchScreenKeyboardStatus>(result);
-        }
-        if (status == Done)
-        {
-            // 同上：不缓存失败。get_text 只在 status==Done 时查一次，
-            // 而那是用户按完确定的一次性事件，慢路径完全够用。
-            MethodInfo *get_textMethod = TouchScreenKeyboard->getMethod("get_text");
-            if (!get_textMethod)
-            {
-                LOGE("找不到 get_text");
-                return Reset();
-            }
-            Il2CppString *text = nullptr;
+            TouchScreenKeyboardStatus status = Canceled;
             if (check)
             {
-                text = openedKeyboard->invoke_method<Il2CppString *>("get_text");
+                status = openedKeyboard->invoke_method<TouchScreenKeyboardStatus>("get_status");
             }
             else
             {
-                auto get_text = (Il2CppString * (*)(void *, MethodInfo *, Il2CppObject *, void *))
+                auto result = Il2cpp::RuntimeInvoke(get_statusMethod, openedKeyboard, nullptr, nullptr);
+                if (!result)
+                {
+                    LOGE("Failed to get status");
+                    return Reset();
+                }
+                status = Il2cpp::GetUnboxedValue<TouchScreenKeyboardStatus>(result);
+            }
+            if (status == Done)
+            {
+                // 同上：不缓存失败。get_text 只在 status==Done 时查一次，
+                // 而那是用户按完确定的一次性事件，慢路径完全够用。
+                MethodInfo *get_textMethod = TouchScreenKeyboard->getMethod("get_text");
+                if (!get_textMethod)
+                {
+                    LOGE("找不到 get_text");
+                    return Reset();
+                }
+                Il2CppString *text = nullptr;
+                if (check)
+                {
+                    text = openedKeyboard->invoke_method<Il2CppString *>("get_text");
+                }
+                else
+                {
+                    auto get_text = (Il2CppString * (*)(void *, MethodInfo *, Il2CppObject *, void *))
                     get_textMethod->invoker_method;
-                if (get_text)
+                    if (get_text)
                     text = get_text(get_textMethod->methodPointer, get_textMethod, openedKeyboard, nullptr);
-            }
+                }
 
-            // get_text 可能返回空（方法缺失 / 调用失败），旧代码直接 ->to_string() 空指针崩
-            std::string resultText;
-            if (text)
-            {
-                resultText = text->to_string();
-            }
-            else
-            {
-                LOGE("get_text 返回空");
-            }
-            if (lastCallback)
-            {
-                // 关键：**先把回调搬走并清空状态，再调用它**。
-                //
-                // 旧顺序是 `lastCallback(resultText); Reset();`，而 Reset() 会
-                // 做 `lastCallback = nullptr` + 销毁键盘对象。问题在于：如果
-                // 回调内部又调了 Keyboard::Open()（链式输入，比如填完一个
-                // 参数接着问下一个），它刚设好的 lastCallback / openedKeyboard
-                // 会被紧随其后的 Reset() 全部抹掉 —— 用户点了确定，界面
-                // 「什么都没发生」。
-                //
-                // 先取走回调（同时清空 lastCallback 表达「本次已消费」），
-                // 再调用。回调里新开的那一轮就不受影响了。
-                auto callback = std::move(lastCallback);
-                lastCallback = nullptr;
-                callback(resultText);
+                // get_text 可能返回空（方法缺失 / 调用失败），旧代码直接 ->to_string() 空指针崩
+                std::string resultText;
+                if (text)
+                {
+                    resultText = text->to_string();
+                }
+                else
+                {
+                    LOGE("get_text 返回空");
+                }
+                if (lastCallback)
+                {
+                    // 关键：**先把回调搬走并清空状态，再调用它**。
+                    //
+                    // 旧顺序是 `lastCallback(resultText); Reset();`，而 Reset() 会
+                    // 做 `lastCallback = nullptr` + 销毁键盘对象。问题在于：如果
+                    // 回调内部又调了 Keyboard::Open()（链式输入，比如填完一个
+                    // 参数接着问下一个），它刚设好的 lastCallback / openedKeyboard
+                    // 会被紧随其后的 Reset() 全部抹掉 —— 用户点了确定，界面
+                    // 「什么都没发生」。
+                    //
+                    // 先取走回调（同时清空 lastCallback 表达「本次已消费」），
+                    // 再调用。回调里新开的那一轮就不受影响了。
+                    auto callback = std::move(lastCallback);
+                    lastCallback = nullptr;
+                    callback(resultText);
 
-                // 只有当回调**没有**重开键盘时才收尾销毁。
-                // 重开了就说明那是一个新的交互周期，把人家的对象留着。
-                if (!IsOpen())
+                    // 只有当回调**没有**重开键盘时才收尾销毁。
+                    // 重开了就说明那是一个新的交互周期，把人家的对象留着。
+                    if (!IsOpen())
+                    {
+                        Reset();
+                        LOGD("Keyboard Done");
+                    }
+                }
+                else
                 {
                     Reset();
-                    LOGD("Keyboard Done");
                 }
             }
-            else
+            else if (status != Visible)
             {
                 Reset();
+                LOGD("Keyboard Canceled");
             }
-        }
-        else if (status != Visible)
-        {
-            Reset();
-            LOGD("Keyboard Canceled");
-        }
         } // namespace detail
     }
 
