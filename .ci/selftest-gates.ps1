@@ -904,6 +904,27 @@ Test-Rule 'wf 孤儿步骤要报出来' {
     return $true
 } $wfCheck '.github/workflows/ci.yml'
 
+# ---- 39. 规则 AE：把「static 缓存失败的解析结果」复现出来（第 141 轮）----
+#
+# 这条规则自己第一版**一条都没匹配上**（只认 A::b()，不认 a->b()），
+# 注入真缺陷后仍然报「通过」——第 16 次「存在 ≠ 生效」。
+$aeCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AE static 不许缓存失败的解析' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k] -match '^\s*MethodInfo \*get_statusMethod = ') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = $ls[$i] -replace '(\s*)MethodInfo \*', '$1static MethodInfo *'
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/Keyboard.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $aeCheck 'app/src/main/jni/Tool/Keyboard.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

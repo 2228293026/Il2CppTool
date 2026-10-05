@@ -1471,6 +1471,58 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AE：函数级 static 不许缓存「可能失败」的解析结果 ----
+#
+# 第 141 轮。`Keyboard.cpp` 的 updateImpl() 里：
+#
+#     static MethodInfo *get_statusMethod = TouchScreenKeyboard->getMethod("get_status");
+#     if (!get_statusMethod) { LOGE(...); return Reset(); }
+#
+# `static` 的初值**只算一次**。所以那一刻如果 getMethod 返回 nullptr
+# （元数据还没注册完 / 这个 Unity 版本没这个方法），
+# 之后**永远**是 nullptr —— 每帧都走失败分支直接 Reset()。
+#
+# 于是键盘永远打不开，而界面上一点提示都没有：用户看到「点了没反应」。
+#
+# 讽刺的是同一个文件的 `Open()` 里专门写了「类解析失败可以重试」，
+# 说明「暂时拿不到」在这份代码里**确实会发生**。
+# 同一件事两处处理不同 —— 必然有一处是错的（第 134 轮同一个形状）。
+#
+# 形状：`static <指针类型> <名字> = <可能失败的调用>(...)`
+foreach ($f in $files) {
+    if ($f.Extension -ne '.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # static 指针 = 一次调用（不是字面量、不是 nullptr、不是别的变量转发）
+        #
+        # 调用方要同时认 `A::b()` 和 `a->b()` 两种写法。
+        # 第一版只写了 `(?:::\w+)*`，而真身是
+        # `TouchScreenKeyboard->getMethod(...)` —— 中间是 `->` 不是 `::`，
+        # 于是**一条都没匹配上**，规则报「通过」。
+        # 第 16 次「规则看着对、其实没在跑」，靠注入真缺陷才发现。
+        $m = [regex]::Match($t, '^static\s+[A-Za-z_][\w:]*\s*\*\s*(\w+)\s*=\s*([A-Za-z_]\w*(?:(?:::|->)[A-Za-z_]\w*)*)\s*\(')
+        if (-not $m.Success) { continue }
+        $name = $m.Groups[1].Value
+        $call = $m.Groups[2].Value
+        # 只查「解析类」的调用：getMethod / FindClass / getField 之类
+        if ($call -notmatch '(?i)get|find|resolve|lookup') { continue }
+        # 紧接着必须有判空 —— 没有的话静态解析器压根不会被检查
+        $guard = ''
+        for ($k = $i + 1; $k -lt [Math]::Min($i + 4, $lines.Count); $k++) {
+            if ($lines[$k].Trim() -match ('if\s*\(\s*!\s*' + [regex]::Escape($name) + '\s*\)')) { $guard = $lines[$k].Trim(); break }
+        }
+        if (-not $guard) { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'AE: 函数级 static 缓存了**可能失败**的解析结果 —— static 只初始化一次，那一刻返回空就永久是空（判空分支会每次都走，功能等于废掉）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

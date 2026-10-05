@@ -70,10 +70,19 @@ namespace Keyboard
         }
         // 上一次还没关就先关掉，否则旧键盘对象会一直挂在触屏上，
         // 而且旧句柄泄漏。
+        //
+        // 第 141 轮发现：原来这里**只有 FreeHandle、没有 Destroy**，
+        // 而上面那句注释说的正是「旧键盘对象会一直挂在触屏上」。
+        // TouchScreenKeyboard 背后是一个 OS 原生输入面板，
+        // 只放 GC 句柄只是让托管侧可以被回收，**面板还在屏幕上** ——
+        // 而 Unity 那边认为它还活着，再开一个就会出现两个键盘。
+        //
+        // 直接调 Reset() 而不是把它的逻辑抄一份：
+        // 抄一份就要同步两处，第 138 轮（GetFilterFailure）就是这么
+        // 漏掉的 —— 同一个语义有两份实现时，一定会只改一处。
         if (openedKeyboardHandle != 0)
         {
-            Il2cpp::GC::FreeHandle(openedKeyboardHandle);
-            openedKeyboardHandle = 0;
+            Reset();   // Destroy() + FreeHandle + openedKeyboard = nullptr
         }
         openedKeyboardHandle = Il2cpp::GC::NewHandle(kb);
         if (openedKeyboardHandle == 0)
@@ -171,7 +180,25 @@ namespace Keyboard
     {
         void updateImpl()
         {
-        static MethodInfo *get_statusMethod = TouchScreenKeyboard->getMethod("get_status");
+        // 方法指针**不许缓存失败**（第 141 轮）。
+        //
+        // 原来是函数级 static，初值 = TouchScreenKeyboard->getMethod(...)。
+        // `static` 只初始化**一次**，所以一旦那一刻 getMethod 返回 nullptr
+        // （元数据还没注册完 / 这个 Unity 版本没这个方法），
+        // 之后**永远**是 nullptr —— 每帧都走下面的「找不到 get_status」
+        // 直接 Reset()。
+        //
+        // 于是键盘永远打不开，而界面上一点提示都没有：
+        // 用户看到的是「点了没反应」。而 `Open()` 里专门写了
+        // 「类解析失败可以重试」（第 50-57 行），
+        // 说明「暂时拿不到」在这份代码里是**会发生的**。
+        //
+        // 同一件事两处处理不同 = 必然有一处是错的。
+        // 缓存**成功**的结果（省一次 getMethod），失败就走慢路径重试。
+        //
+        // 而且这里每次调用都 getMethod 也不贵：只在 status==Done 分支里
+        // 才需要 get_text，而那是一次性事件（用户按完确定）。
+        MethodInfo *get_statusMethod = TouchScreenKeyboard->getMethod("get_status");
         if (!get_statusMethod)
         {
             LOGE("找不到 get_status");
@@ -194,7 +221,9 @@ namespace Keyboard
         }
         if (status == Done)
         {
-            static MethodInfo *get_textMethod = TouchScreenKeyboard->getMethod("get_text");
+            // 同上：不缓存失败。get_text 只在 status==Done 时查一次，
+            // 而那是用户按完确定的一次性事件，慢路径完全够用。
+            MethodInfo *get_textMethod = TouchScreenKeyboard->getMethod("get_text");
             if (!get_textMethod)
             {
                 LOGE("找不到 get_text");
