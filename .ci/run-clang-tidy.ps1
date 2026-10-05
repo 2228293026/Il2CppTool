@@ -12,17 +12,120 @@
   把当前告警集合写入 baseline。确认存量告警无害时用一次。
 #>
 param(
-    [switch]$WriteBaseline
+    [switch]$WriteBaseline,
+    # 用**指定 NDK** 重建 baseline，并把它的版本写进 NDK-TIDY 行。
+    # 只在「确认换版本是刻意的」时用：.\.ci\run-clang-tidy.ps1 -NDKBASE D:\android-ndk-r29
+    [string]$NDKBASE
 )
 
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $jni = Join-Path $repoRoot 'app/src/main/jni'
+if ($NDKBASE) { $env:NDK_PATH = $NDKBASE }
 $ndk = $env:NDK_PATH
 if (-not $ndk) { throw 'NDK_PATH 未设置，请先解析 NDK' }
 
+# baseline 是**某个 clang-tidy 版本的产物**，不是宇宙真理。
+#
+# clang-tidy 的检查集合和措辞都随版本变化，而比对逻辑只看告警文本，
+# 不看是谁产生的。于是换 NDK 之后：
+#   - 版本独有的告警消失 -> 「新增」仍算 0 -> 差额被静默吞掉
+#   - 版本独有的新告警   -> 门禁**看不见**，策略名存实亡
+#
+# 实际撞上的就是它：baseline 是 NDK 29 生成的（50 条），
+# CI 上装的是 NDK 27.3（46 条）。两次跑都报「新增 0 条」，
+# 谁也没注意到两个数字不等。
+#
+# 所以这里把版本钉死：用错版本 = 失败，并说清楚该怎么重建。
+$propsPath = Join-Path $ndk 'source.properties'
+$actualRev = ''
+if (Test-Path $propsPath) {
+    $line = Get-Content $propsPath -Encoding UTF8 | Where-Object { $_ -match '^\s*Pkg\.Revision\s*=' } | Select-Object -First 1
+    if ($line) { $actualRev = ($line -split '=', 2)[1].Trim() }
+}
+if (-not $actualRev) { $actualRev = '(读不到 version)' }
+
+# ---- baseline 加载 + 版本守卫（第 140 轮）。**必须在跑 clang-tidy 之前** ----
+#
+# 放在分析之后的代价是实测过的：失败一次要先白跑一遍 90 秒的全量分析。
+# 放在分析之前，失败成本 = 读两个文件。
+#
+# 读 baseline 有两个坑，都是踩出来的：
+#
+#   (a) **必须**跳过 `#` 开头的行（第 129 轮）。
+#       baseline 带了一段说明「这 50 条是怎么分类、为什么抑制」的注释。
+#       而原来只按「非空」过滤，于是那些注释被当成已知告警 ——
+#       报出来是「baseline 82 条（45+37），新增 0 条」。
+#       那是**假绿**：注释不可能匹配任何告警，于是「新增」永远算 0。
+#       一份带注释的 baseline 会把「新增 = 失败」这条门禁整个废掉，
+#       而且没有任何人会发现 —— 除非真的去数那个 82。
+#
+#   (b) **必须**跳过 `NDK-TIDY:` 声明行（这一轮的顺带发现）。
+#       它不以 `#` 开头，(a) 的过滤器放它过去，于是它被当成
+#       **一条已知告警** —— baseline 凭空多 1 条（50 -> 51），
+#       而且「幽灵条目」提示会把它列出来：
+#       「baseline 里有 1 条已经不触发了：NDK-TIDY: 29.0.14206865」。
+#       看起来像「有条告警被修好了」，实际是元数据混进了告警集合。
+#       声明行是元数据，不是告警。
+$baselineFile = Join-Path $PSScriptRoot 'clang-tidy-baseline.txt'
+$known = @()
+$baselineRev = ''
+$baselineLines = @()
+if (Test-Path $baselineFile) {
+    $baselineLines = Get-Content -Encoding UTF8 $baselineFile
+    $revLine = $baselineLines |
+        Where-Object { $_ -match '^\s*NDK-TIDY\s*:' } |
+        Select-Object -First 1
+    if ($revLine) { $baselineRev = ($revLine -split ':', 2)[1].Trim() }
+    $known = $baselineLines |
+        Where-Object {
+            $_.Trim() -and
+            -not $_.Trim().StartsWith('#') -and
+            -not ($_ -match '^\s*NDK-TIDY\s*:')
+        }
+}
+
+# 版本对不上 = **失败**，不是警告。
+#
+# 三条都要成立才放行，避免「拿一个变量名比另一个」那种自己骗自己的写法：
+#   1. baseline 声明了 NDK-TIDY（没声明 = 这份 baseline 来路不明）
+#   2. 这次真的读到了 NDK 版本（读不到 = 无法判定，按失败）
+#   3. 两者字面相等
+if (-not $NDKBASE -and -not $baselineRev) {
+    Write-Host ''
+    Write-Host 'baseline 没有声明 NDK-TIDY: 版本 —— 这份清单不知道是哪个版本产生的。'
+    Write-Host '按**失败**处理。用当前 NDK 重建一次：'
+    Write-Host "  .\.ci\run-clang-tidy.ps1 -NDKBASE $ndk"
+    exit 1
+}
+if (-not $NDKBASE -and $actualRev -ne '(读不到 version)' -and ($actualRev -ne $baselineRev)) {
+    Write-Host ''
+    Write-Host 'clang-tidy 版本对不上：'
+    Write-Host "  baseline 是用 NDK $baselineRev 生成的"
+    Write-Host "  这一次跑的是 NDK $actualRev  ($ndk)"
+    Write-Host ''
+    Write-Host '按**失败**处理。理由：这份 baseline 是那一个版本的告警清单，'
+    Write-Host '拿别的版本去比，两个数字永远对不上，而「新增」会算成 0 ——'
+    Write-Host '也就是说「新增告警 = 失败」这条策略在换版本之后就不成立了，'
+    Write-Host '却没有任何人会发现。'
+    Write-Host ''
+    Write-Host '如果这是**刻意**换 NDK（确认过新旧告警集合的差异）：'
+    Write-Host '  .\.ci\run-clang-tidy.ps1 -NDKBASE <新 NDK 路径>'
+    exit 1
+}
+
 # 受检文件：只含我们自己写的 .cpp
+#
+# ---- 第 140 轮：版本必须对得上，**而且要在跑 clang-tidy 之前** ----
+#
+# 判据放在分析之前（第 41-47 行读版本，第 185-244 行比对），
+# 是因为这个检查失败时**一行代码都不必分析**：版本不符必然意味着
+# baseline 与现实脱节，而脱节原因只有两种（换了 NDK / 有人手改了
+# baseline），两种都不该靠「再跑一遍 90 秒的分析」去确认。
+#
+# 反过来，如果放在分析之后，每次失败都要先付 90 秒 ——
+# 门禁自检里那两条注入验证就得慢一倍，而自检是要反复跑的。
 #
 # 第 129 轮把剩下 6 个补上了。这个列表**曾经只覆盖 44.9%** 的代码：
 # `Tool/ClassesTab.cpp`（5683 行，全项目最大的文件）、
@@ -158,22 +261,6 @@ $findings = ($output -split "`r?`n") | Where-Object {
     $_ -match $projectPattern -and $_ -notmatch 'imgui[/\\]|asmjit[/\\]|frida-gum|xdl[/\\]|nlohmann[/\\]|KittyMemory'
 }
 
-$baselineFile = Join-Path $PSScriptRoot 'clang-tidy-baseline.txt'
-$known = @()
-if (Test-Path $baselineFile) {
-    # **必须**跳过 `#` 开头的行（第 129 轮）。
-    #
-    # baseline 文件带了一段说明「这 45 条是怎么分类、为什么抑制」的注释。
-    # 而这里原来只按「非空」过滤，于是 37 行注释被当成 37 条已知告警 ——
-    # 报出来是「baseline 82 条（45+37），新增 0 条」。
-    #
-    # 那是**假绿**：注释不可能匹配任何告警，于是「新增」永远算 0。
-    # 一份带注释的 baseline 会把「新增 = 失败」这条门禁整个废掉，
-    # 而且没有任何人会发现 —— 除非真的去数那个 82。
-    $known = Get-Content -Encoding UTF8 $baselineFile |
-        Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }
-}
-
 $keys = $findings | ForEach-Object {
     # 归一化掉行号：代码一动行号就变，不该因此重新报一遍
     ($_ -replace '^(\s*)', '') -replace ':\d+:\d+: warning:', '|warning:'
@@ -181,15 +268,76 @@ $keys = $findings | ForEach-Object {
 
 $new = $keys | Where-Object { $known -notcontains $_ }
 
-# -WriteBaseline：把当前集合写成 baseline。确认存量告警无害时用一次即可。
-if ($WriteBaseline) {
-    $keys | Set-Content -Path $baselineFile -Encoding UTF8
-    Write-Host "已写入 baseline: $baselineFile（$($keys.Count) 条）"
+# -WriteBaseline / -NDKBASE <ndk>：把当前集合写成 baseline，
+# 并把生成它的 clang-tidy 版本一起写进去。确认存量告警无害时用一次即可。
+if ($WriteBaseline -or $NDKBASE) {
+    $header = @(
+        '# clang-tidy 存量告警',
+        '#',
+        '# 门禁策略：**新增告警 = 失败**。这个文件是「已确认无害的存量」。',
+        '#',
+        '# 注意：**以 # 开头的行是注释，不算已知告警**（加载时会被跳过）。',
+        '#',
+        "# 本清单由 NDK $actualRev 的 clang-tidy 生成。换版本 = 必须重建：",
+        "#   .\.ci\run-clang-tidy.ps1 -NDKBASE <新 NDK 路径>",
+        "# 理由见 run-clang-tidy.ps1 里的同名检查（第 140 轮）。",
+        "NDK-TIDY: $actualRev",
+        ''
+    )
+    # 注意：这里**不能**直接覆盖整个文件 —— 上面那段按类说明的注释是
+    # 有人读的东西（第 129 轮写的抑制理由），重生成不该把它抹掉。
+    # 做法：保住所有注释块，把 NDK-TIDY 换成新值，把告警条目整段替换。
+    $kept = @()
+    foreach ($l in $baselineLines) {
+        if ($l -match '^\s*NDK-TIDY\s*:') { continue }
+        $kept += $l
+    }
+    # 去掉旧的告警条目段（第一个非注释、非空行之后直到文件尾）
+    $out = @()
+    $inEntries = $false
+    foreach ($l in $kept) {
+        $isComment = -not $l.Trim() -or $l.Trim().StartsWith('#')
+        if (-not $isComment) { $inEntries = $true }
+        if (-not $inEntries) { $out += $l }
+    }
+    while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out = $out[0..($out.Count - 2)] }
+    ($header + $out + '' + $keys) | Set-Content -Path $baselineFile -Encoding UTF8
+    Write-Host "已写入 baseline: $baselineFile（$($keys.Count) 条，clang-tidy $actualRev）"
     exit 0
 }
 
 Write-Host ''
+Write-Host "clang-tidy: NDK $actualRev"
 Write-Host "clang-tidy 告警: $(($keys).Count) 条（baseline $(($known).Count) 条，新增 $(($new).Count) 条）"
+
+# 两个数字不等**必须说出来**，不能只在括号里躺着。
+#
+# 第 140 轮发现的：CI 报「46 条（baseline 50 条）」，两次都是。
+# 脚本确实判了「新增 0 条」并放行了 —— 从判据上说它没错
+# （没有任何一条不在 baseline 里），但这个**差额本身**说明
+# baseline 里有条目已经不触发了，而那意味着：
+#   - 多出来的告警会顶掉它们的位置，仍然算「已抑制」
+#   - 谁都不知道 baseline 已经和现实脱节了
+#
+# 现在版本不一致会直接失败（上面），但「同版本下条数不等」
+# 仍可能是真的脱节（有人手工改过 baseline，或告警被修复了）。
+# 所以：只要条数不等就明确提示，让它成为**看得见**的事实。
+if ($keys.Count -ne $known.Count) {
+    $ghost = $known | Where-Object { $keys -notcontains $_ }
+    Write-Host ''
+    Write-Host "注意：当前 $(($keys).Count) 条 / baseline $(($known).Count) 条 —— 两个数字不等。"
+    if ($ghost) {
+        Write-Host "baseline 里有 $(($ghost).Count) 条**已经不触发**了："
+        $ghost | ForEach-Object { Write-Host "    $_" }
+        Write-Host '这些条目不拦任何东西，却让 baseline 显得比实际宽松。'
+        Write-Host '确认过之后用 -NDKBASE <ndk> 重建。'
+    }
+    $extra = $keys | Where-Object { $known -notcontains $_ }
+    if ($extra) {
+        Write-Host "有 $(($extra).Count) 条不在 baseline 里（见下方「新增告警」）。"
+    }
+}
+
 if ($keys) {
     Write-Host '--- 当前告警 ---'
     $keys | ForEach-Object { Write-Host "  $_" }
@@ -201,7 +349,7 @@ if ($new) {
     $new | ForEach-Object { Write-Host "  $_" }
     Write-Host ''
     Write-Host '修复它；或确认无害后重新生成 baseline:'
-    Write-Host '  .\.ci\run-clang-tidy.ps1 -WriteBaseline'
+    Write-Host "  .\.ci\run-clang-tidy.ps1 -NDKBASE $ndk"
     exit 1
 }
 

@@ -1,4 +1,4 @@
-﻿# 门禁自检：每一条检查都必须**抓得到**它要防的东西。
+# 门禁自检：每一条检查都必须**抓得到**它要防的东西。
 #
 # 背景
 #
@@ -169,6 +169,11 @@ $cacheFile = Join-Path $root '.ci/.selftest-cache'
 $watch = @(
     '.ci/selftest-gates.ps1', '.ci/check-ui-patterns.ps1',
     '.ci/check-structure.ps1', '.ci/check-hosts.ps1',
+    # 少了它，改了这个脚本自检也会走缓存 —— 而缓存里的「绿」
+    # 是**上一次**的结果（第 140 轮：门禁脚本改了却仍然秒过）。
+    '.ci/check-workflow.ps1',
+    # 这两个是被注入的目标文件，不在 watch 里等于改了它们不会触发重跑。
+    '.github/workflows/ci.yml',
     'app/src/main/jni/Tool/Tool.cpp', 'app/src/main/jni/Tool/ClassesTab.cpp',
     'app/src/main/jni/Main.cpp'
 )
@@ -867,6 +872,37 @@ Test-Rule 'AD 线程没起来必须留痕迹' {
         ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
     return $true
 } $adCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
+# ---- 38. CI workflow 结构：重复 job / 孤儿步骤（第 140 轮）----
+#
+# 两条要求必须**各自**能红，不能只验其中一条：
+#   1. jobs 下 key 重复 —— YAML 里后者覆盖前者，旧 job 静默消失
+#   2. 步骤里出现多余的 run:/uses: —— 上一项的兄弟节点残留
+$wfCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-workflow.ps1')
+}
+Test-Rule 'wf 重复 job 要报出来' {
+    param($t)
+    $needle = '  static-analysis:'
+    if (-not $t.Contains($needle)) { return $false }
+    # 注意注入点：必须在**真正那个** job 之前再插一个完整的，
+    # 不能插在它上面那段注释里 —— 那样 `-replace` 会把注释块切断，
+    # 后面的注释变成顶层裸文本，注入出来的 YAML 本身就不合法。
+    # 我第一次就是这么注入的，检查器没红，我去查检查器才发现是注入错了。
+    $inject = "  static-analysis:`n    runs-on: windows-latest`n    timeout-minutes: 30`n    steps:`n      - uses: actions/checkout@v4`n`n  static-analysis:"
+    [IO.File]::WriteAllText((Join-Path $root '.github/workflows/ci.yml'),
+        $t.Replace($needle, $inject), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $wfCheck '.github/workflows/ci.yml'
+Test-Rule 'wf 孤儿步骤要报出来' {
+    param($t)
+    $needle = "        run: .\.ci\check-all.ps1"
+    if (-not $t.Contains($needle)) { return $false }
+    $out = $t.Replace($needle, $needle + "`n        shell: pwsh`n        run: .\build.ps1")
+    [IO.File]::WriteAllText((Join-Path $root '.github/workflows/ci.yml'), $out,
+        (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $wfCheck '.github/workflows/ci.yml'
 
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {

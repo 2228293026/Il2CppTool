@@ -36,6 +36,32 @@
 #
 # 换句话说：**抑制增加 21 条，换来覆盖率从 44.9% 到 88%**。
 # 那是划算的 ——「没被看过的代码」比「已知的存量」危险得多。
+#
+# ---- 第 140 轮：这份 baseline 只对 NDK 29 成立（第 2 条门禁）----
+#
+# 下面每一行都是 **NDK 29 的 clang-tidy** 产生的。clang-tidy 的输出
+# 随版本会变，而 `run-clang-tidy.ps1` 只比对「告警文本」，
+# 不看版本 —— 于是用另一个 NDK 跑出来的结果照样能判「新增 0 条」：
+#
+#   本地 NDK 29.0  ->  50 条，与本文件逐条对齐
+#   CI   NDK 27.3  ->  46 条，**少 4 条**，仍显示「新增 0 条」
+#
+# 差 4 条本身不致命（27 不报 29 报的某些检查）。致命的是：
+#
+#  - **反向漏检**。在 NDK 27 上**新引入**的告警，如果恰好属于
+#    27 不会报的那一类，门禁永远看不到它。「新增告警 = 失败」
+#    这条策略在两个版本之间**不等价**，而 nobody 会发现。
+#  - **差额被静默吞掉**。原来的脚本只打印
+#    「告警 46 条（baseline 50 条，新增 0 条）」—— 两个数字不等，
+#    却没有任何检查对**这个不等**提出异议。它只是被读者忽略了。
+#
+# 结论：**baseline 必须和 clang-tidy 的版本绑定**，否则它就是一份
+# 不知道在哪个世界成立的清单。现在由 `NDK-TIDY:` 行声明生成它的版本，
+# 脚本会核对，用错版本直接失败。
+#
+# 生成方式：`NDK-BASE <ndk路径>` 跑一次 run-clang-tidy.ps1 会
+# 用当前 NDK 重建本文件并写死 NDK-TIDY 行。
+NDK-TIDY: 29.0.14206865
 
 Il2cpp/Il2cpp.cpp|warning: declaration uses identifier '_il2cpp_type_is_byref', which is reserved in the global namespace [bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp]
 Il2cpp/Il2cpp.cpp|warning: empty catch statements hide issues; to handle exceptions appropriately, consider re-throwing, handling, or avoiding catch altogether [bugprone-empty-catch]

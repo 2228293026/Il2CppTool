@@ -160,6 +160,13 @@ Invoke-Check '结构完整（花括号配平）' {
     powershell -ExecutionPolicy Bypass -File .\.ci\check-structure.ps1
     if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
 }
+Invoke-Check 'CI workflow 结构（重复 job / 孤儿步骤）' {
+    # 第 140 轮：我大段替换 ci.yml 时把边界算错了，留下过一个重复的
+    # `static-analysis:` 和一段没有 `- name` 的孤儿 `run:`。
+    # 重复 job 在 YAML 里是**后者覆盖前者** —— 旧 job 静默消失，CI 照样绿。
+    powershell -ExecutionPolicy Bypass -File .\.ci\check-workflow.ps1
+    if ($LASTEXITCODE -ne 0) { $script:rc = 1 }
+}
 Invoke-Check '跨界面内容的宿主（挂错宿主 = 功能消失）' {
     powershell -ExecutionPolicy Bypass -File .\.ci\check-hosts.ps1
     if ($LASTEXITCODE -ne 0) { $script:rc = 1 }

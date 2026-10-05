@@ -15,42 +15,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 解析 runner 上已有的 NDK，避免依赖第三方 action 和 ~1GB 下载。
-      # 优先环境变量，其次 Android SDK 的 ndk/ 目录（取版本号最大的一个）。
-      - name: Resolve Android NDK
+      # ---- NDK 版本只有一个出处：.ci/clang-tidy-baseline.txt 的 NDK-TIDY 行 ----
+      #
+      # 第 140 轮发现这里原来是「取 SDK ndk/ 目录下版本号最大的一个」，
+      # 于是 runner 上装了什么就用什么 —— 实际拿到的是 **r27.3**，
+      # 而 README 声明 r29、clang-tidy baseline 也是 r29 的产物。
+      # 三处各说各话，代码**从来没在 r29 上编译过**，
+      # baseline 里的 4 条 r29 特有告警也从来没被 CI 判过。
+      #
+      # 后果不是「编译不过」，而是更糟的：
+      # 静态分析在 r27 上跑，拿 r29 的清单去比，于是
+      # 「新增告警 = 失败」这条策略在两个版本之间**不等价**，
+      # 而且两个数字不等这件事没有任何人会发现。
+      #
+      # 规则本体在 .ci/resolve-ndk.ps1（两个 job 共用一份，
+      # 免得改了一处漏了另一处 —— 第 138 轮的教训）。
+      # -Install 让它顺带用 sdkmanager 装上缺的版本；
+      # 不用第三方 action：runner 镜像里本来就有 Android SDK。
+      - name: Install & resolve Android NDK (版本来自 baseline)
         id: ndk
         shell: pwsh
-        run: |
-          $candidates = @()
-          foreach ($envName in 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT') {
-            $value = [Environment]::GetEnvironmentVariable($envName)
-            if ($value) { $candidates += $value }
-          }
-
-          if (-not $candidates) {
-            $sdk = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) |
-              Where-Object { $_ } | Select-Object -First 1
-            if ($sdk) {
-              $ndkRoot = Join-Path $sdk 'ndk'
-              if (Test-Path $ndkRoot) {
-                $candidates += Get-ChildItem $ndkRoot -Directory |
-                  Sort-Object Name -Descending | ForEach-Object { $_.FullName }
-              }
-            }
-          }
-
-          $ndk = $candidates |
-            Where-Object { $_ -and (Test-Path (Join-Path $_ 'ndk-build.cmd')) } |
-            Select-Object -First 1
-
-          if (-not $ndk) {
-            throw "Runner 上没有找到可用的 Android NDK（需要 ndk-build.cmd）。"
-          }
-
-          Write-Host "Using NDK: $ndk"
-          Get-Content (Join-Path $ndk 'source.properties') -ErrorAction SilentlyContinue
-          "ANDROID_NDK_HOME=$ndk" >> $env:GITHUB_ENV
-          "NDK_PATH=$ndk" >> $env:GITHUB_ENV
+        run: .\.ci\resolve-ndk.ps1 -Install
 
       - name: Build arm64-v8a
         shell: pwsh
@@ -85,31 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve Android NDK
+      # 同一个脚本、同一个版本出处。**不带 -Install**：
+      # 静态分析只跑 clang-tidy，装错版本的后果是判据失效，
+      # 那就该立刻失败，而不是多下一个 1GB。
+      - name: Resolve Android NDK (版本来自 baseline)
         id: ndk
         shell: pwsh
-        run: |
-          $candidates = @()
-          foreach ($envName in 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT') {
-            $value = [Environment]::GetEnvironmentVariable($envName)
-            if ($value) { $candidates += $value }
-          }
-          if (-not $candidates) {
-            $sdk = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) |
-              Where-Object { $_ } | Select-Object -First 1
-            if ($sdk) {
-              $ndkRoot = Join-Path $sdk 'ndk'
-              if (Test-Path $ndkRoot) {
-                $candidates += Get-ChildItem $ndkRoot -Directory |
-                  Sort-Object Name -Descending | ForEach-Object { $_.FullName }
-              }
-            }
-          }
-          $ndk = $candidates |
-            Where-Object { $_ -and (Test-Path (Join-Path $_ 'ndk-build.cmd')) } |
-            Select-Object -First 1
-          if (-not $ndk) { throw "没有找到可用的 Android NDK" }
-          "NDK_PATH=$ndk" >> $env:GITHUB_ENV
+        run: .\.ci\resolve-ndk.ps1
 
       - name: Pre-commit checks (single entry point)
         shell: pwsh
