@@ -80,7 +80,18 @@ namespace Keyboard
         // 直接调 Reset() 而不是把它的逻辑抄一份：
         // 抄一份就要同步两处，第 138 轮（GetFilterFailure）就是这么
         // 漏掉的 —— 同一个语义有两份实现时，一定会只改一处。
-        if (openedKeyboardHandle != 0)
+        //
+        // 守卫用 `IsOpen()` 而不是 `openedKeyboardHandle != 0`：
+        // 加根失败那条路径（下面第 112 行）只 Destroy(kb) 就 return 了，
+        // **没有清 openedKeyboard**，所以存在一个真实可达的状态：
+        //
+        //     openedKeyboard != nullptr   而   openedKeyboardHandle == 0
+        //
+        // 原来那个守卫在这里不成立 -> 旧键盘不会被关 ->
+        // **正是这个函数要修的那个问题，在这个状态下依然发生**。
+        //
+        // （而且是我引入的：修复前这里无条件 FreeHandle，句柄至少被处理了。）
+        if (IsOpen())
         {
             Reset();   // Destroy() + FreeHandle + openedKeyboard = nullptr
         }
@@ -109,6 +120,16 @@ namespace Keyboard
                     destroyMethod->invoke_static<void>(kb);
                 }
             }
+            // 第 143 轮：这里原来只 Destroy + return，**没有清 openedKeyboard**。
+            //
+            // 而 Update() 的唯一守卫就是 `if (openedKeyboard)` ——
+            // 留着它就等于「明明放弃了打开，每帧还是去解引用这个
+            // 没有 GC 根的对象」，也就是上面整段注释在防的那件事。
+            //
+            // 这个状态还让 `Open()` 里「关掉上一个键盘」的守卫失效
+            // （如果它写成 `openedKeyboardHandle != 0`），所以两处必须一致。
+            openedKeyboard = nullptr;
+            openedKeyboardHandle = 0;
             lastCallback = nullptr;
             return;
         }

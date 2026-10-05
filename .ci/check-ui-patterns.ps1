@@ -1652,6 +1652,87 @@ foreach ($f in $files) {
         }
     }
 }
+# ---- 模式 AH：同一状态的两个变量，守卫不能各用一个 ----
+#
+# 第 143 轮。`Keyboard.cpp` 的 Open() 里，第 141 轮加的「关掉上一个键盘」
+# 写成：
+#
+#     if (openedKeyboardHandle != 0) { Reset(); }
+#
+# 而 `NewHandle` 失败那条路径只 Destroy(kb) 就 return 了，
+# **没有清 openedKeyboard**，于是存在一个**真实可达**的状态：
+#
+#     openedKeyboard != nullptr   而   openedKeyboardHandle == 0
+#
+# 守卫用句柄，在那个状态下不成立 -> 旧键盘不会被关 ->
+# **正是这个函数要修的那个问题，在这个状态下依然发生**。
+#
+# 更麻烦的是第 141 轮之前这里是**无条件** FreeHandle 的，
+# 所以这还是我自己引入的回归。
+#
+# 形状：一个 if 里用 X != 0 判断「有没有」，而同一组状态里有 Y 代表
+# 同一件事，两处含义相同、变量不同。
+#
+# 这里只查最危险的形状：**「非零检查」用在了应当用语义化判断的地方**，
+# 且同文件里存在同名语义的另一个变量（Xxx / XxxHandle）。
+# 显式声明的「语义化守卫」：变量名 -> 判断函数名
+$semanticGuards = @{
+    'openedKeyboard' = 'IsOpen'
+}
+foreach ($f in $files) {
+    if ($f.Extension -ne '.cpp') { continue }
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    # 本文件里出现过「基名 + Handle」的成对变量
+    $pairs = @{}
+    foreach ($l in $lines) {
+        foreach ($m in [regex]::Matches($l, '\b(\w+)Handle\b')) {
+            $base = $m.Groups[1].Value
+            for ($k = 0; $k -lt $lines.Count; $k++) {
+                if ($lines[$k] -match ('\b' + $base + '\b')) { $pairs[$base] = $true; break }
+            }
+        }
+    }
+    if ($pairs.Count -eq 0) { continue }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        $m = [regex]::Match($t, '^if\s*\(\s*(\w+)Handle\s*!=\s*0\s*\)')
+        if (-not $m.Success) { continue }
+        $base = $m.Groups[1].Value
+        if (-not $pairs.ContainsKey($base)) { continue }
+        #
+        # 排除**清理函数内部**：Reset() 里 `if (handle != 0) FreeHandle(handle)`
+        # 是完全正确的 —— 在那里「有没有根」就等于「要不要放句柄」，
+        # 而裸指针正是这个函数自己要清掉的东西。用语义化判断反而多余。
+        #
+        # 要查的是**别的函数**（生产方）在判断「有没有」时用了哪个变量。
+        # 绗簩鐗堬細鍑芥暟澶存鍒欏啓鎴?^[\w\s*&:]+:: 锛岃€?Reset() 娌℃湁 :: 鍓嶇紑
+        #锛堝畠鏄?namespace 閲岀殑瑁稿嚱鏁板悕锛夛紝鎵€浠ヤ竴鐩村尮閰嶄笉涓婏紝
+        # $inFn 姘歌繙鏄?-1锛屾帓闄ょ瓑浜庢病鍋?鈥斺€?绗?21 娆°€屽瓨鍦?!= 鐢熸晥銆嶏紝
+        # 鍜岃鍒?AG 杩炵画涓夎疆鏄悓涓€涓敊锛氭垜鍦ㄧ寽妯″紡锛岃€屼笉鏄浠ｇ爜銆?        $inFn = -1
+        for ($up = $i; $up -ge 0 -and $up -ge ($i - 200); $up--) {
+            if ($lines[$up] -match '^\s*(void|bool|int|static|std::string)\b.*\b(\w+)\s*\([^;]*\)\s*$') { $inFn = $Matches[2]; break }
+        }
+        if ($inFn -eq 'Reset') { continue }
+        # 该基名同时以裸指针形式存在（说明有两个变量代表同一件事），
+        # 且有**显式声明**的语义化判断函数对应它。
+        #
+        # 这里用白名单而不是 `Is + 基名`：真实情况是
+        #   变量 openedKeyboard  ->  函数 IsOpen()
+        # 基名 `openedKeyboard` 要变成 `IsOpen()` 得去掉结尾的 `ed`，
+        # 这种变形**没法机械推导**。我第一版写 `Is' + $base`，
+        # 于是永远匹配不上、规则全程静默（第 20 次「存在 ≠ 生效」，
+        # 和规则 AG 那三版一模一样的错：我在猜约定，而不是读代码）。
+        if (-not $semanticGuards["$base"]) { continue }
+        $hits += [pscustomobject]@{
+            File = $f.Name
+            Line = $i + 1
+            Rule = 'AH: 这里用「Handle != 0」判断「有没有」，但同一状态还有裸指针 ' + $base + '，且文件里已有语义化的 ' + $semanticGuards[$base] + '()。两者可能不同步 —— 用后者（清理函数 Reset 内部除外）'
+            Text = $t
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），
