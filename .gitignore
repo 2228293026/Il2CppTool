@@ -105,3 +105,6 @@ Lib/
 
 # DSH 记忆库落盘位置（我的工作笔记，不是项目代码）
 .dsh-meow/
+
+# build.ps1 生成的版本头（版本号唯一出处是 VERSION.txt，见 docs/版本号.md）
+app/src/main/jni/Includes/Version.h

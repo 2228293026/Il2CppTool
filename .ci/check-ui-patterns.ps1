@@ -1523,6 +1523,49 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AF：版本号只有一个出处 ----
+#
+# 第 142 轮。这份代码里一度有**三个**互不相同的版本说法：
+#
+#     app/build.gradle   versionName "3.2"
+#     Main.cpp           窗口标题硬编码 "v0.9"
+#     SelfCheck.cpp      自检页硬编码 "v0.9"
+#     仓库里还放着      Tool_v0.9.zip
+#
+# 而自检页那两行的存在意义**恰恰是**「用户报『菜单没反应』时，
+# 让我一眼确认他跑的是哪个版本」。它自己报的是错的版本 ——
+# 于是用户如实抄来的报告里，最关键的那一栏是假的。
+#
+# 修法：版本号的唯一出处是仓库根目录的 VERSION.txt，
+# build.ps1 生成 app/src/main/jni/Includes/Version.h，源码只读那个头文件。
+#
+# 形状：.cpp / .h 里出现字面量形式的版本号（v0.9 / "0.9" 之类）
+foreach ($f in $files) {
+    if ($f.Extension -notin @('.cpp', '.h')) { continue }
+    if ($f.Name -eq 'Version.h') { continue }   # 生成物
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -match '^(//|\*|/\*)') { continue }
+        # 形如 "v0.9" / 'v0.9' / v0.9 | HitMargin
+        #
+        # 注意**不要**加「同一行出现 IL2CPPTOOL_VERSION 就放过」这种豁免：
+        # 真实的形状恰恰是 `OBFUSCATE("Il2CppTool v0.9") + IL2CPPTOOL_VERSION` ——
+        # 同一行里两者都有。加了豁免之后这条规则就漏掉了**唯一**的真实案例，
+        # 而手工注入验证时才发现（我第 142 轮自己踩的）。
+        #
+        # Version.h 是生成物，已经在上面按文件名排除了，不需要这层。
+        if ($t -match '\bv\d+\.\d+(\.\d+)?\b') {
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'AF: 源码里写死了版本号 —— 唯一出处是 VERSION.txt（由 build.ps1 生成 Version.h）。自检页报错版本比不报更糟'
+                Text = $t
+            }
+        }
+    }
+}
+
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

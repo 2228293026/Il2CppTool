@@ -925,6 +925,29 @@ Test-Rule 'AE static 不许缓存失败的解析' {
     return $true
 } $aeCheck 'app/src/main/jni/Tool/Keyboard.cpp'
 
+# ---- 40. 规则 AF：把「版本号写回源码」复现出来（第 142 轮）----
+$afCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AF 版本号不许写死在源码里' {
+    param($t)
+    # 用 [char]34 构造引号，而不是在正则里写那些引号。
+    # 引号要穿过「.ps1 -> 正则 -> 被改的 .cpp」两层，很容易被吃掉，
+    # 而症状是「注入找不到目标行、返回 false」—— 看着像自检坏了，
+    # 其实是模式写错了（第 141 轮规则 AE 的同一类）。
+    $q = [char]34
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k].Contains('Il2CppTool v' + $q + ')')) { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    $ls[$i] = $ls[$i].Replace('Il2CppTool v' + $q + ')', 'Il2CppTool v0.9' + $q + ')')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Main.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $afCheck 'app/src/main/jni/Main.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')

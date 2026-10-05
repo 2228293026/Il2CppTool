@@ -1,4 +1,4 @@
-# ================================================================
+﻿# ================================================================
 #  Il2CppTool - one-click build via NDK ndk-build
 #  (no Gradle / no Android SDK required)
 #
@@ -73,6 +73,45 @@ if ($DebugBuild) {
     $makeArgs += 'IL2CPPTOOL_DEBUG=1'
     Write-Host '[build] __DEBUG__ enabled (verbose D-level logging)'
 }
+
+# ---- 生成 Version.h（版本号的**唯一出处**是 VERSION.txt）----
+#
+# 第 142 轮加的。之前窗口标题和自检页都硬编码着 "v0.9"，而
+# app/build.gradle 里写的是 "3.2"，仓库里还躺着一个 Tool_v0.9.zip。
+# 自检页那行的存在意义**就是**「用户报问题时让我确认他跑的是哪个版本」，
+# 它自己报的是错的版本 —— 于是报告里最关键的那一栏是假的。
+#
+# 用一个生成的头文件而不是在 .cpp 里写死：
+#   · 版本号只有一处需要改（VERSION.txt）
+#   · 改完不重新编译就换不掉版本号 —— 那正是「多个说法」的成因
+#   · 顺带把 git 提交和构建日期也带上，比一个过期版本号有用得多
+$versionFile = Join-Path $PSScriptRoot 'VERSION.txt'
+if (-not (Test-Path $versionFile)) { throw "找不到 VERSION.txt（版本号的唯一出处）: $versionFile" }
+$toolVersion = (Get-Content $versionFile -Encoding UTF8 | Select-Object -First 1).Trim()
+if (-not $toolVersion) { throw 'VERSION.txt 第一行为空' }
+
+# 提交号：有 git 就带短哈希，没有（发布 tarball）就写 unknown
+$commit = 'unknown'
+try {
+    $head = (& git -C $PSScriptRoot rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $head) { $commit = $head.Trim() }
+} catch { }
+
+$versionHeader = Join-Path $PSScriptRoot 'app\src\main\jni\Includes\Version.h'
+# 用 -f 格式化而不是在双引号里写 \" ——
+# PowerShell 的转义是**反引号**，\" 只是两个普通字符（第 122 轮踩过：
+# 那一轮是反引号 + a 变成 BEL 字符，方向相反、症状一样：脚本解析失败）。
+# 写成字面量 '\' 放进单引号字符串里最省心。
+$headerBody = @(
+    '// 由 build.ps1 自动生成 —— **不要手改，也不要提交**（已在 .gitignore 里）。',
+    '// 改版本请改仓库根目录的 VERSION.txt，理由见 docs/版本号.md。',
+    '#pragma once',
+    '',
+    ('#define IL2CPPTOOL_VERSION "{0}"' -f $toolVersion),
+    ('#define IL2CPPTOOL_COMMIT "{0}"' -f $commit)
+) -join "`n"
+[IO.File]::WriteAllText($versionHeader, $headerBody + "`n", (New-Object Text.UTF8Encoding($false)))
+Write-Host "[build] version   : $toolVersion ($commit)"
 
 Push-Location (Join-Path $PSScriptRoot 'app\src\main')
 try {

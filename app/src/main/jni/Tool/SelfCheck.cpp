@@ -1,5 +1,6 @@
 #include "SelfCheck.h"
 #include "Includes/Utils.h"
+#include "Includes/Version.h" // for IL2CPPTOOL_VERSION / IL2CPPTOOL_COMMIT (generated)
 #include "ChangeLog.h"
 #include "Il2cpp/Il2cpp.h"
 #include "Includes/Logger.h"
@@ -441,9 +442,25 @@ std::vector<Result> Collect()
 
     // ---- 构建信息 ----
     // 出问题时能一眼确认跑的是哪个版本，省掉一轮来回。
+    //
+    // 第 142 轮把这里的 `v0.9` 去掉了。硬编码的版本号在这份代码里
+    // 已经是**第三个**说法：
+    //
+    //     app/build.gradle  versionName "3.2"
+    //     这里              "v0.9"
+    //     仓库里的旧包      Tool_v0.9.zip
+    //
+    // 而这一行存在的意义**恰恰是**「用户报问题时让我一眼确认版本」。
+    // 它自己报的是错的版本 —— 于是这份报告最关键的那一栏是假的。
+    //
+    // 现在从 build.ps1 生成的 Version.h 取（版本号唯一出处 VERSION.txt），
+    // 并且带上**提交号**：这是这份报告最该带的东西 ——
+    // 版本号会被人遗忘，提交号不会，而用户报问题时我真正需要的是
+    // 「他跑的是不是和我手上同一份代码」。
     {
-        char buf[128]{0};
-        snprintf(buf, sizeof(buf), "v0.9 / %s 构建", __DATE__);
+        char buf[160]{0};
+        snprintf(buf, sizeof(buf), "v%s (%s) 构建于 %s",
+                 IL2CPPTOOL_VERSION, IL2CPPTOOL_COMMIT, __DATE__);
         out.push_back(Info("构建", buf));
     }
     {
