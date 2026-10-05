@@ -1566,6 +1566,92 @@ foreach ($f in $files) {
     }
 }
 
+# ---- 模式 AG：空列表不许直接消失，要指路 ----
+#
+# 第 142 轮。`DrawWatches()` 第一行原来是：
+#
+#     if (g_watches.empty()) { return; }
+#
+# 空的时候整个关注值区域消失，面板里只剩一个空的折叠块。
+# 而关注值是工具的核心工作流之一（「盯着一个数值，随它变」）。
+# **一个不出现的功能等于不存在** —— 用户没理由知道它存在，
+# 也没理由知道该去哪儿加（添加入口藏在对象字段的右键菜单里，
+# 要先有对象、先展开字段，才知道可以右键）。
+#
+# 第 121 轮的教训是「把东西放在对的宿主上，否则功能消失」，
+# 这里是它的镜像：**宿主对了，但内容在不该消失的时候消失了**。
+#
+# ## 为什么用白名单，而不是「像不像 UI」的启发式
+#
+# 这一条我试了三版正则判据，每一版都错，而且是**同时**误报和漏报：
+#
+#   v1  `X.empty()` + `return`         -> 误报 13 处（bytes/classes/data…
+#                                         全是逻辑函数，空了就返回是对的）
+#   v2  「if 前后 30 行内有 ImGui::」   -> 误报 1 处、且漏掉真缺陷
+#   v3  「分支之后 30 行内有 ImGui::」  -> 同样误报 2 处
+#
+# v2/v3 的致命之处：`patched.empty()` 那几行**外面就套着 ImGui 代码**，
+# 而真正的缺陷（删掉关注值的引导块）分支体里恰好**没有** ImGui ——
+# 同一个条件既造成误报又造成漏报。
+#
+# 三版都在猜「这段代码是不是 UI」。而项目里已经有不靠猜的答案：
+# `.ci/check-hosts.ps1` 的函数白名单。列表区域就那么几个，
+# 显式列出来比启发式可靠 —— **判据宁可窄，不要每次重调**。
+#
+# 白名单是「用户可见的列表区域」：空时该显示引导，而不是消失。
+# 不包括：搜索结果（空 = 没匹配到，本身就是答案）、错误提示条
+# （空 = 没错误，正确地不占位）、lambda 里的失败分支。
+$emptyStateLists = @(
+    @{ Func = 'DrawWatches';     File = 'app/src/main/jni/Tool/ClassesTab.cpp' }
+)
+foreach ($f in $files) {
+    if ($f.Extension -ne '.cpp') { continue }
+    $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
+    $lines = Get-Content -Encoding UTF8 $f.FullName
+    for ($e = 0; $e -lt $emptyStateLists.Count; $e++) {
+        $spec = $emptyStateLists[$e]
+        if ($rel -ne $spec.File) { continue }
+        # 定位该函数体。
+        # 匹配函数**定义行** `void ClassesTab::DrawWatches()`，
+        # 而不是任何 `::DrawWatches(` —— 后者会匹配到**注释里的引用**和调用点，
+        # 扫描范围就从那里一路扫到文件末尾（第一版白名单一次报出 7 处）。
+        #
+        # `{` 在**下一行**（Allman 风格），所以只匹配到右括号为止。
+        $fnAt = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match ('^[\w\s\*&:]+::' + $spec.Func + '\s*\([^;]*\)\s*$')) { $fnAt = $i; break }
+        }
+        if ($fnAt -lt 0) { continue }
+        # 函数体范围：从开括号到配对的闭括号，别越界扫到别的函数
+        $depth = 0; $fnEnd = $lines.Count - 1
+        for ($i = $fnAt; $i -lt $lines.Count; $i++) {
+            $depth += ([regex]::Matches($lines[$i], '\{')).Count - ([regex]::Matches($lines[$i], '\}')).Count
+            if ($depth -eq 0 -and $i -gt $fnAt) { $fnEnd = $i; break }
+        }
+        for ($i = $fnAt; $i -le $fnEnd; $i++) {
+            $t = $lines[$i].Trim()
+            if ($t -notmatch '^if\s*\(\s*\w+\s*\.\s*empty\s*\(\s*\)\s*\)\s*$') { continue }
+            $j = $i + 1
+            while ($j -lt $lines.Count -and $lines[$j].Trim() -eq '') { $j++ }
+            if ($j -ge $lines.Count -or $lines[$j].Trim() -ne '{') { continue }
+            $depth = 0; $body = @()
+            for ($k = $j; $k -lt $lines.Count; $k++) {
+                $body += $lines[$k]
+                $depth += ([regex]::Matches($lines[$k], '\{')).Count - ([regex]::Matches($lines[$k], '\}')).Count
+                if ($depth -eq 0 -and $k -gt $j) { break }
+            }
+            $btext = $body -join ' '
+            if ($btext -notmatch '\breturn\b') { continue }
+            if ($btext -match 'TextDisabled|TextColored|TextWrapped') { continue }
+            $hits += [pscustomobject]@{
+                File = $f.Name
+                Line = $i + 1
+                Rule = 'AG: 列表为空时直接 return —— 该区域会**整块消失**。空状态应该指路（怎么用、入口在哪），而不是留白'
+                Text = $t
+            }
+        }
+    }
+}
 # ---- 模式 C：workflow 里 run:/shell: 的缩进不对 ----
 #
 # 上一轮我加这个检查时把 YAML 缩进写错了（2 空格而不是 6），

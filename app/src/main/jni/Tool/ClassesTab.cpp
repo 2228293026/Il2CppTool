@@ -484,14 +484,29 @@ void ClassesTab::ApplyFreezes()
 
 void ClassesTab::DrawWatches()
 {
-    if (g_watches.empty())
-    {
-        return;
-    }
     ImGui::Separator();
     // 右键复制是隐藏操作，得在表头说一句 —— 否则用户根本不会去试。
     // 「复制全部」也在表头说，因为按钮不带解释时没人会想到它的用处。
     ImGui::Text("关注值（每 200ms 自动刷新；右键某一行的值可复制）");
+
+    // 第 142 轮：空列表时**不再直接 return**。
+    //
+    // 原来第一行就是 `if (g_watches.empty()) return;` ——
+    // 空的时候整个区域消失，面板里是个空的折叠块。
+    // 而关注值是工具的核心工作流之一（「盯着一个数值，随它变」）。
+    // 一个**不出现**的功能等于不存在：用户没有理由知道它存在，
+    // 也不知道该去哪儿加。
+    //
+    // 添加入口藏在对象字段的**右键菜单**里，那是个需要先有对象、
+    // 先展开字段、才知道可以右键的地方。所以空状态该做的是**指路**，
+    // 而不是留白。
+    if (g_watches.empty())
+    {
+        ImGui::TextDisabled("还没有关注项");
+        ImGui::TextDisabled("在对象 tab 里右键任意字段 → 关注，之后它每 200ms 自动刷新，变了会变绿");
+        return;
+    }
+
     if (ImGui::SmallButton("全部清除"))
     {
         ClearWatches();

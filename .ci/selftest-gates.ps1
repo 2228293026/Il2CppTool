@@ -948,6 +948,36 @@ Test-Rule 'AF 版本号不许写死在源码里' {
     return $true
 } $afCheck 'app/src/main/jni/Main.cpp'
 
+# ---- 41. 规则 AG：空状态不许直接消失（第 142 轮）----
+#
+# 注入形状要和手工验证时**逐字一致**：把 `if (g_watches.empty())` 的
+# 分支体从「两行引导 + return」换成「只有 return」。
+#
+# 注意：不要把整个 if 块删掉 —— 那样注入后的代码里根本没有那个 if，
+# 规则当然抓不到。我前三次「规则失效」其实是注入形状错了，
+# 差点据此去改判据（第 143 轮）。
+$agCheck = {
+    Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
+}
+Test-Rule 'AG 空状态不许直接 return' {
+    param($t)
+    $ls = [System.Collections.ArrayList](($t -split "`r?`n"))
+    $i = -1
+    for ($k = 0; $k -lt $ls.Count; $k++) {
+        if ($ls[$k].Trim() -eq 'if (g_watches.empty())') { $i = $k; break }
+    }
+    if ($i -lt 0) { return $false }
+    # { / TextDisabled x2 / return / }  ->  { / return / }
+    if ($ls[$i + 5].Trim() -ne '}') { return $false }
+    $ls.RemoveAt($i + 3)
+    $ls.RemoveAt($i + 2)
+    $ls.RemoveAt($i + 2)
+    $ls.Insert($i + 2, '        return;')
+    [IO.File]::WriteAllText((Join-Path $root 'app/src/main/jni/Tool/ClassesTab.cpp'),
+        ($ls -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    return $true
+} $agCheck 'app/src/main/jni/Tool/ClassesTab.cpp'
+
 # ---- 13. 规则 I：把第 97 轮那个「加根失败还照样存指针」复现出来 ----
 $iCheck = {
     Run-Command 'powershell' @('-ExecutionPolicy', 'Bypass', '-File', '.\.ci\check-ui-patterns.ps1')
